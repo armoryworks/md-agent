@@ -64,7 +64,7 @@ npm run build     # tsc → dist/
 ## Usage
 
 Start a new run (interactive setup wizard — number of roles, each role's
-description, the goal, and the checkpoint interval):
+description, the goal, the checkpoint interval, and whether to allow sub-teams):
 
 ```bash
 npm run dev                      # via tsx, no build step
@@ -102,7 +102,7 @@ orchestrator, which decides how to propagate it). At a checkpoint you can:
 | Variable                  | Default      | Purpose |
 |---------------------------|--------------|---------|
 | `MD_AGENT_ORCH_MODEL`     | *(CLI default)* | Pin the orchestrator's model — a tier (`opus`/`sonnet`/`haiku`) or a concrete model id. Set `sonnet` to trade some judgment for lower burn. |
-| `MD_AGENT_TEAMS`          | off          | Opt-in **sub-teams**. When `1`/`true`/`on`, the orchestrator may send two roles into a 1:1 **huddle** (`TEAM: <name> members=a,b`): they iterate directly and only one consolidated result returns to the orchestrator — the back-and-forth never enters its context. Off by default. |
+| `MD_AGENT_TEAMS`          | off          | Pre-sets the **"allow sub-teams?"** setup-wizard prompt to "yes". Sub-teams are opt-in **per run** — the wizard asks at setup and the choice is stored in `state.json`. When allowed, the orchestrator may send two roles into a 1:1 **huddle** (`TEAM: <name> members=a,b`): they iterate directly and only one consolidated result returns to the orchestrator — the back-and-forth never enters its context. |
 | `MD_AGENT_TEAM_MAX_ROUNDS`| `12`         | Hard cap on huddle exchanges before the reporter is forced to summarize (runaway-loop backstop). Per-team override via `maxRounds=` in the `TEAM:` block. |
 | `MD_AGENT_NO_DASHBOARD`   | unset        | Disable the sticky top-of-console status panel (also auto-disabled when stdout isn't a TTY). |
 | `NO_COLOR`                | unset        | Disable ANSI color in the dashboard. |

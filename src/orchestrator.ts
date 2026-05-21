@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { spawn, ChildProcess } from "node:child_process";
 import readline from "node:readline";
-import { editor, number } from "@inquirer/prompts";
+import { confirm, editor, number } from "@inquirer/prompts";
 import { ClaudeSession } from "./claude.js";
 import {
   appendTranscript,
@@ -34,11 +34,11 @@ import {
 const DEFAULT_MAX_MINUTES = 10;
 
 /**
- * Whether the orchestrator may form sub-teams (1:1 huddles). Opt-in: when off,
- * the orchestrator isn't told about the TEAM: dispatch at all, so it never uses
- * it. Enable with MD_AGENT_TEAMS=1 (or true/on/yes).
+ * Default for the setup wizard's "allow sub-teams?" prompt. Sub-teams are opt-in
+ * per run (chosen at setup and stored in state); MD_AGENT_TEAMS=1 just pre-sets
+ * the prompt to "yes". When off, the orchestrator isn't told huddles exist.
  */
-const TEAMS_ENABLED = /^(1|true|on|yes)$/i.test(process.env.MD_AGENT_TEAMS ?? "");
+const TEAMS_DEFAULT = /^(1|true|on|yes)$/i.test(process.env.MD_AGENT_TEAMS ?? "");
 
 /**
  * Concrete model for the orchestrator session. The orchestrator is the
@@ -90,7 +90,7 @@ function buildOrchSystem(state: RunState): string {
     "- Roles report concise STATUS, not full deliverables; their detailed work lives in shared files. Coordinate on those summaries — never ask a role to echo a large artifact back through you.",
     "- Don't paste one role's output into another's message — summarize the relevant decision and point to the file.",
     "- The literal single-word message `exit` is sent to all roles when the user terminates the run.",
-    TEAMS_ENABLED
+    state.teams
       ? [
           "",
           "SUB-TEAMS (optional — use sparingly):",
@@ -148,6 +148,12 @@ export async function runOrchestrator(opts: { contextFile?: string }): Promise<v
     required: true,
   });
 
+  const teams = await confirm({
+    message:
+      "Allow the orchestrator to form sub-teams (send two roles into a 1:1 huddle)?",
+    default: TEAMS_DEFAULT,
+  });
+
   let contextContent: string | undefined;
   if (opts.contextFile) {
     const raw = await readFile(opts.contextFile, "utf8");
@@ -163,7 +169,7 @@ export async function runOrchestrator(opts: { contextFile?: string }): Promise<v
   // The orchestrator runs STATELESS: each turn it gets the ledger + new event,
   // so resident context stays bounded and cache expiry between slow role turns
   // becomes cheap rather than catastrophic.
-  const orchSystem = buildOrchSystem({ goal: goal!, roles, context: contextContent });
+  const orchSystem = buildOrchSystem({ goal: goal!, roles, context: contextContent, teams });
   const orch = new ClaudeSession({
     systemPrompt: orchSystem,
     model: resolveOrchModel(),
@@ -244,6 +250,7 @@ export async function runOrchestrator(opts: { contextFile?: string }): Promise<v
     roles,
     context: contextContent,
     maxMinutes: maxMinutes ?? DEFAULT_MAX_MINUTES,
+    teams,
   };
   await writeFile(path.join(runDir, "state.json"), JSON.stringify(state, null, 2), "utf8");
 
@@ -286,6 +293,7 @@ export async function runOrchestrator(opts: { contextFile?: string }): Promise<v
     children,
     checkpointMinutes: state.maxMinutes!,
     kickoff: "Begin the run.",
+    teamsEnabled: state.teams ?? false,
   });
 }
 
@@ -352,6 +360,7 @@ export async function resumeOrchestrator(
     kickoff:
       "The run is resuming after a pause. Re-orient using your memory of the run so far, " +
       "then continue coordinating toward the goal. If you were waiting on a role, re-issue the request.",
+    teamsEnabled: state.teams ?? false,
   });
 }
 
@@ -378,11 +387,13 @@ interface LoopCtx {
   children: ChildProcess[];
   checkpointMinutes: number;
   kickoff: string;
+  /** Whether the orchestrator may form sub-teams (per-run setup choice). */
+  teamsEnabled: boolean;
 }
 
 /** Shared event loop used by both fresh runs and resumes. */
 async function runLoop(ctx: LoopCtx): Promise<void> {
-  const { runDir, roles, transcript, orch, children, kickoff } = ctx;
+  const { runDir, roles, transcript, orch, children, kickoff, teamsEnabled } = ctx;
 
   // Serialize every orchestrator turn. Outbox watchers fire independently, and
   // each turn does a read-modify-write of the shared ledger — without this,
@@ -696,7 +707,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   async function dispatch(orchOutput: string): Promise<void> {
     // Sub-team dispatches run alongside (and instead of) TO: blocks.
     let startedTeam = false;
-    if (TEAMS_ENABLED) {
+    if (teamsEnabled) {
       const { specs, errors } = parseTeamBlocks(orchOutput);
       for (const e of errors) console.warn(`[orchestrator] ${e}`);
       for (const spec of specs) {
