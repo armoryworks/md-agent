@@ -1,9 +1,9 @@
 import path from "node:path";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { spawn, ChildProcess } from "node:child_process";
 import readline from "node:readline";
-import { editor, number } from "@inquirer/prompts";
+import { confirm, editor, number } from "@inquirer/prompts";
 import { ClaudeSession } from "./claude.js";
 import {
   appendTranscript,
@@ -15,6 +15,7 @@ import {
 import { parseMarkdown } from "./parse.js";
 import { chooseSelection, renderSelection } from "./select.js";
 import { Dashboard } from "./dashboard.js";
+import { parseTeamBlocks, runHuddle, type TeamIO, type TeamResult, type TeamSpec } from "./team.js";
 import {
   DEFAULT_TIER,
   MODEL_IDS,
@@ -31,6 +32,13 @@ import {
 } from "./persist.js";
 
 const DEFAULT_MAX_MINUTES = 10;
+
+/**
+ * Default for the setup wizard's "allow sub-teams?" prompt. Sub-teams are opt-in
+ * per run (chosen at setup and stored in state); MD_AGENT_TEAMS=1 just pre-sets
+ * the prompt to "yes". When off, the orchestrator isn't told huddles exist.
+ */
+const TEAMS_DEFAULT = /^(1|true|on|yes)$/i.test(process.env.MD_AGENT_TEAMS ?? "");
 
 /**
  * Concrete model for the orchestrator session. The orchestrator is the
@@ -82,6 +90,17 @@ function buildOrchSystem(state: RunState): string {
     "- Roles report concise STATUS, not full deliverables; their detailed work lives in shared files. Coordinate on those summaries — never ask a role to echo a large artifact back through you.",
     "- Don't paste one role's output into another's message — summarize the relevant decision and point to the file.",
     "- The literal single-word message `exit` is sent to all roles when the user terminates the run.",
+    state.teams
+      ? [
+          "",
+          "SUB-TEAMS (optional — use sparingly):",
+          "When two roles need to iterate tightly on a sub-problem (back-and-forth that would otherwise thrash through you one slow turn at a time), send them off as a huddle instead of a TO: block:",
+          "  TEAM: <team-name> members=<roleA>,<roleB> reporter=<roleA> maxRounds=<N>",
+          "  <the shared task brief for the two of them>",
+          "They talk to each other directly; you do NOT see the back-and-forth. You get ONE consolidated result back ([TEAM ... DONE/BLOCKED/CAPPED]) — fold that into your ledger like any other event.",
+          "Exactly TWO members. Use a huddle only when tight pairing genuinely helps; otherwise a normal TO: dispatch is cheaper. While a huddle runs, do not TO: its members — they're busy.",
+        ].join("\n")
+      : "",
   ]
     .filter(Boolean)
     .join("\n");
@@ -129,6 +148,12 @@ export async function runOrchestrator(opts: { contextFile?: string }): Promise<v
     required: true,
   });
 
+  const teams = await confirm({
+    message:
+      "Allow the orchestrator to form sub-teams (send two roles into a 1:1 huddle)?",
+    default: TEAMS_DEFAULT,
+  });
+
   let contextContent: string | undefined;
   if (opts.contextFile) {
     const raw = await readFile(opts.contextFile, "utf8");
@@ -144,7 +169,7 @@ export async function runOrchestrator(opts: { contextFile?: string }): Promise<v
   // The orchestrator runs STATELESS: each turn it gets the ledger + new event,
   // so resident context stays bounded and cache expiry between slow role turns
   // becomes cheap rather than catastrophic.
-  const orchSystem = buildOrchSystem({ goal: goal!, roles, context: contextContent });
+  const orchSystem = buildOrchSystem({ goal: goal!, roles, context: contextContent, teams });
   const orch = new ClaudeSession({
     systemPrompt: orchSystem,
     model: resolveOrchModel(),
@@ -225,6 +250,7 @@ export async function runOrchestrator(opts: { contextFile?: string }): Promise<v
     roles,
     context: contextContent,
     maxMinutes: maxMinutes ?? DEFAULT_MAX_MINUTES,
+    teams,
   };
   await writeFile(path.join(runDir, "state.json"), JSON.stringify(state, null, 2), "utf8");
 
@@ -267,6 +293,7 @@ export async function runOrchestrator(opts: { contextFile?: string }): Promise<v
     children,
     checkpointMinutes: state.maxMinutes!,
     kickoff: "Begin the run.",
+    teamsEnabled: state.teams ?? false,
   });
 }
 
@@ -333,6 +360,7 @@ export async function resumeOrchestrator(
     kickoff:
       "The run is resuming after a pause. Re-orient using your memory of the run so far, " +
       "then continue coordinating toward the goal. If you were waiting on a role, re-issue the request.",
+    teamsEnabled: state.teams ?? false,
   });
 }
 
@@ -359,11 +387,13 @@ interface LoopCtx {
   children: ChildProcess[];
   checkpointMinutes: number;
   kickoff: string;
+  /** Whether the orchestrator may form sub-teams (per-run setup choice). */
+  teamsEnabled: boolean;
 }
 
 /** Shared event loop used by both fresh runs and resumes. */
 async function runLoop(ctx: LoopCtx): Promise<void> {
-  const { runDir, roles, transcript, orch, children, kickoff } = ctx;
+  const { runDir, roles, transcript, orch, children, kickoff, teamsEnabled } = ctx;
 
   // Serialize every orchestrator turn. Outbox watchers fire independently, and
   // each turn does a read-modify-write of the shared ledger — without this,
@@ -420,6 +450,69 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     ].join("\n");
   }
 
+  // ---------- sub-teams (1:1 huddles) ----------
+  // A role "owned" by a team has its outbox routed to the huddle, not the
+  // orchestrator. pendingTeamReply holds the one-shot resolver the watcher fires
+  // when a member's reply arrives.
+  const teamOwner = new Map<string, string>();
+  const pendingTeamReply = new Map<string, (reply: string) => void>();
+
+  async function askMember(role: string, message: string): Promise<string> {
+    // Register the resolver BEFORE writing the inbox so a fast reply can't race
+    // ahead of it.
+    const reply = new Promise<string>((res) => pendingTeamReply.set(role, res));
+    dash.flow("orch", role);
+    await appendTranscript(transcript, `→ ${role} (team)`, message);
+    await safeWrite(path.join(runDir, "inbox", `${role}.txt`), message);
+    return reply;
+  }
+
+  async function appendChannel(team: string, who: string, msg: string): Promise<void> {
+    const dir = path.join(runDir, "teams", team);
+    await mkdir(dir, { recursive: true });
+    await appendFile(path.join(dir, "channel.md"), `\n## ${who}\n\n${msg.trim()}\n`, "utf8");
+  }
+
+  const teamIO: TeamIO = {
+    ask: askMember,
+    appendChannel,
+    isStopping: () => stopping,
+  };
+
+  async function startTeam(spec: TeamSpec): Promise<void> {
+    for (const m of spec.members) {
+      if (!roles.find((r) => r.name === m)) {
+        console.warn(`[orchestrator] team "${spec.name}": unknown member "${m}", skipping team`);
+        return;
+      }
+      if (teamOwner.has(m)) {
+        console.warn(`[orchestrator] team "${spec.name}": "${m}" is busy in team "${teamOwner.get(m)}", skipping`);
+        return;
+      }
+    }
+    for (const m of spec.members) teamOwner.set(m, spec.name);
+    dash.setStatus(`huddle ${spec.name}: ${spec.members.join(" ↔ ")}`);
+    console.log(`[orchestrator] huddle "${spec.name}" started: ${spec.members.join(" ↔ ")}`);
+    await appendTranscript(transcript, `TEAM START ${spec.name}`, `${spec.members.join(", ")} — ${spec.brief}`);
+
+    let result: TeamResult;
+    try {
+      result = await runHuddle(spec, teamIO);
+    } catch (e) {
+      result = { status: "aborted", report: `(error: ${(e as Error).message})` };
+    } finally {
+      for (const m of spec.members) teamOwner.delete(m);
+    }
+
+    await appendTranscript(transcript, `TEAM ${result.status.toUpperCase()} ${spec.name}`, result.report);
+    if (stopping) return;
+    // Fold the single consolidated result back into the orchestrator's ledger.
+    const event = `[TEAM ${spec.name} ${result.status.toUpperCase()}] (members: ${spec.members.join(", ")})\n${result.report}`;
+    const reply = await askOrch(event);
+    printOrchReply(reply);
+    await dispatch(reply);
+  }
+
   const dash = new Dashboard({
     runName: path.basename(runDir),
     roles: roles.map((r) => ({ name: r.name, model: r.model ?? "sonnet" })),
@@ -459,6 +552,26 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     watchFile(outbox, async (content) => {
       if (stopping) return;
       if (isSafeWord(content)) return; // role echoed safe word; nothing to do
+
+      // If this role is huddling, its reply belongs to the team runner, not the
+      // orchestrator — hand it to the waiting resolver and stop here.
+      const pending = pendingTeamReply.get(r.name);
+      if (pending) {
+        pendingTeamReply.delete(r.name);
+        await clearFile(outbox);
+        dash.flow(r.name, "orch");
+        await appendTranscript(transcript, `← ${r.name} (team)`, content);
+        printRoleReply(r.name, content);
+        pending(content);
+        return;
+      }
+      if (teamOwner.has(r.name)) {
+        // Owned by a team but no turn pending — unsolicited; drop so it never
+        // leaks into the orchestrator's context.
+        await clearFile(outbox);
+        return;
+      }
+
       dash.flow(r.name, "orch");
       await appendTranscript(transcript, `← ${r.name}`, content);
       await clearFile(outbox);
@@ -592,12 +705,23 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   }
 
   async function dispatch(orchOutput: string): Promise<void> {
+    // Sub-team dispatches run alongside (and instead of) TO: blocks.
+    let startedTeam = false;
+    if (teamsEnabled) {
+      const { specs, errors } = parseTeamBlocks(orchOutput);
+      for (const e of errors) console.warn(`[orchestrator] ${e}`);
+      for (const spec of specs) {
+        startedTeam = true;
+        void startTeam(spec); // runs async; result folds back in when done
+      }
+    }
+
     const blocks = parseDispatch(orchOutput);
     if (blocks.length === 0) {
-      if (lastHadLedger) {
-        // Legitimate: the orchestrator updated its memory and has nothing to
-        // dispatch this turn (e.g. waiting on in-flight roles). Not an error.
-        console.log("[orchestrator] ledger updated; no dispatch this turn");
+      if (lastHadLedger || startedTeam) {
+        // Legitimate: the orchestrator updated its memory and/or launched a
+        // huddle, and has nothing to dispatch directly this turn. Not an error.
+        console.log("[orchestrator] no direct dispatch this turn");
         return;
       }
       // Neither a ledger nor TO: blocks — the reply was malformed. Nudge once.
@@ -639,6 +763,12 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     const known = roles.find((r) => r.name === b.role);
     if (!known) {
       console.warn(`[orchestrator] unknown role "${b.role}", skipping`);
+      return;
+    }
+    if (teamOwner.has(b.role)) {
+      console.warn(
+        `[orchestrator] "${b.role}" is busy in huddle "${teamOwner.get(b.role)}"; skipping direct dispatch`
+      );
       return;
     }
     dash.flow("orch", b.role);

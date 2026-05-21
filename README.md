@@ -64,7 +64,7 @@ npm run build     # tsc → dist/
 ## Usage
 
 Start a new run (interactive setup wizard — number of roles, each role's
-description, the goal, and the checkpoint interval):
+description, the goal, the checkpoint interval, and whether to allow sub-teams):
 
 ```bash
 npm run dev                      # via tsx, no build step
@@ -102,6 +102,8 @@ orchestrator, which decides how to propagate it). At a checkpoint you can:
 | Variable                  | Default      | Purpose |
 |---------------------------|--------------|---------|
 | `MD_AGENT_ORCH_MODEL`     | *(CLI default)* | Pin the orchestrator's model — a tier (`opus`/`sonnet`/`haiku`) or a concrete model id. Set `sonnet` to trade some judgment for lower burn. |
+| `MD_AGENT_TEAMS`          | off          | Pre-sets the **"allow sub-teams?"** setup-wizard prompt to "yes". Sub-teams are opt-in **per run** — the wizard asks at setup and the choice is stored in `state.json`. When allowed, the orchestrator may send two roles into a 1:1 **huddle** (`TEAM: <name> members=a,b`): they iterate directly and only one consolidated result returns to the orchestrator — the back-and-forth never enters its context. |
+| `MD_AGENT_TEAM_MAX_ROUNDS`| `12`         | Hard cap on huddle exchanges before the reporter is forced to summarize (runaway-loop backstop). Per-team override via `maxRounds=` in the `TEAM:` block. |
 | `MD_AGENT_NO_DASHBOARD`   | unset        | Disable the sticky top-of-console status panel (also auto-disabled when stdout isn't a TTY). |
 | `NO_COLOR`                | unset        | Disable ANSI color in the dashboard. |
 
@@ -125,6 +127,7 @@ runs/<timestamp>-<name>/
 ├── transcript.md       # full conversation (orchestrator is sole writer)
 ├── inbox/<role>.txt     # orchestrator → role
 ├── outbox/<role>.txt    # role → orchestrator
+├── teams/<name>/channel.md  # huddle transcript (only when sub-teams are used)
 └── sessions/
     ├── <who>.txt        # persisted claude session id — roles only (orchestrator is stateless)
     └── <who>.cost.json  # accumulated token usage + cost
@@ -140,6 +143,7 @@ runs/<timestamp>-<name>/
 |------------------------|----------------|
 | `src/index.ts`         | CLI entry / arg parsing |
 | `src/orchestrator.ts`  | setup wizard, run loop, ledger turns, dispatch, checkpoints |
+| `src/team.ts`          | sub-team engine (1:1 huddle) — opt-in via `MD_AGENT_TEAMS` |
 | `src/role.ts`          | role child-process loop |
 | `src/claude.ts`        | `claude` session wrapper (spawn, session-id, usage capture) |
 | `src/ipc.ts`           | file-based inbox/outbox + transcript helpers |

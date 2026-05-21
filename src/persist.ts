@@ -37,6 +37,8 @@ export interface RunState {
   context?: string;
   /** Max minutes between synopsis checkpoints. Persisted so resume keeps the cadence. */
   maxMinutes?: number;
+  /** Whether the orchestrator may form sub-teams (1:1 huddles). Chosen at setup. */
+  teams?: boolean;
 }
 
 export async function readState(runDir: string): Promise<RunState> {
