@@ -16,33 +16,21 @@ import { parseMarkdown } from "./parse.js";
 import { chooseSelection, renderSelection } from "./select.js";
 import { Dashboard } from "./dashboard.js";
 import {
-  buildOrchHistory,
   DEFAULT_TIER,
   MODEL_IDS,
   type ModelTier,
   normalizeTier,
+  readLedger,
   readRunCost,
-  readSessionId,
   readState,
   recordUsage,
   type RoleSpec,
   type RunState,
   updateState,
-  writeSessionId,
+  writeLedger,
 } from "./persist.js";
 
 const DEFAULT_MAX_MINUTES = 10;
-
-/**
- * Compact the orchestrator's session once its context grows past this many
- * tokens (input + cache). Set MD_AGENT_COMPACT_TOKENS=0 to disable.
- */
-const COMPACT_TOKENS = (() => {
-  const v = process.env.MD_AGENT_COMPACT_TOKENS;
-  if (v == null) return 120_000;
-  const n = Number(v);
-  return Number.isFinite(n) && n >= 0 ? n : 120_000;
-})();
 
 /**
  * Concrete model for the orchestrator session. The orchestrator is the
@@ -67,19 +55,33 @@ function buildOrchSystem(state: RunState): string {
     ),
     state.context ? `\nShared context:\n${state.context}` : "",
     "",
-    "COORDINATION EFFICIENCY (your context is re-read on every turn — keep it lean):",
-    "- Dispatch focused, self-contained instructions. Do NOT paste one role's full output into another role's message — summarize the relevant fact or decision in a sentence or two and point to the shared file if detail is needed.",
-    "- Roles report concise STATUS, not full deliverables; their detailed work lives in shared files. Coordinate on those summaries — never ask a role to echo a large artifact back through you.",
-    "- Prefer having roles read/write shared files directly over relaying their contents in your messages.",
+    "HOW YOUR MEMORY WORKS — READ CAREFULLY:",
+    "You are STATELESS between turns. You do NOT remember previous turns. Each turn you are handed:",
+    "  (1) the current LEDGER — your entire externalized memory of the run, and",
+    "  (2) a single NEW EVENT (a role's report, a user message, or a nudge to continue).",
+    "Anything you need to remember for next turn MUST be written into the ledger you emit this turn. If it is not in the ledger, it is gone.",
     "",
-    "ROUTING PROTOCOL — STRICT:",
-    "Every single one of your responses (except the setup JSON) MUST consist entirely of one or more TO: blocks. Format:",
-    "  TO: <role-name>",
-    "  <message body to that role>",
-    "Multiple blocks per turn are allowed, separated by a line containing only ---.",
-    "Do NOT write prose, analysis, summaries, or explanations outside TO: blocks. The framework strips and discards anything outside TO: blocks.",
-    "If you have nothing to say to any role, emit nothing — but you must reply with at least one TO: block in normal operation.",
-    "When the user wants to terminate the run, the literal single-word message `exit` is sent to all roles.",
+    "EVERY turn (after the one-time setup JSON) you reply with TWO parts, in this order:",
+    "  1. A replacement ledger, wrapped exactly like this:",
+    "       <<<LEDGER",
+    "       ...your full updated ledger...",
+    "       LEDGER>>>",
+    "  2. Zero or more TO: blocks — the messages to dispatch to roles this turn:",
+    "       TO: <role-name>",
+    "       <message body>",
+    "     Separate multiple TO: blocks with a line containing only ---.",
+    "Zero TO: blocks is valid and normal — when you've only updated your memory and are waiting on in-flight roles, emit the ledger and no TO: blocks.",
+    "",
+    "LEDGER DISCIPLINE (this is what keeps the run cheap and coherent):",
+    "- Keep it COMPACT and rewrite it in full each turn. Target a page, not a transcript.",
+    "- Hold: the current plan/phase, one status line per role (idle / working on X / blocked on Y / done), open questions, key decisions, and POINTERS (file paths, KB ids) to where detail lives.",
+    "- NEVER paste raw content, full role outputs, code, or long logs into the ledger — write a one-line summary and a pointer to the file/KB entry instead. Detail is retrieved on demand, not carried.",
+    "- Prune resolved items aggressively. The ledger is working memory, not a log — the transcript and shared files are the permanent record.",
+    "",
+    "DISPATCH DISCIPLINE:",
+    "- Roles report concise STATUS, not full deliverables; their detailed work lives in shared files. Coordinate on those summaries — never ask a role to echo a large artifact back through you.",
+    "- Don't paste one role's output into another's message — summarize the relevant decision and point to the file.",
+    "- The literal single-word message `exit` is sent to all roles when the user terminates the run.",
   ]
     .filter(Boolean)
     .join("\n");
@@ -139,8 +141,15 @@ export async function runOrchestrator(opts: { contextFile?: string }): Promise<v
   }
 
   // -------- 2. Bootstrap orchestrator claude: name run + roles --------
+  // The orchestrator runs STATELESS: each turn it gets the ledger + new event,
+  // so resident context stays bounded and cache expiry between slow role turns
+  // becomes cheap rather than catastrophic.
   const orchSystem = buildOrchSystem({ goal: goal!, roles, context: contextContent });
-  const orch = new ClaudeSession({ systemPrompt: orchSystem, model: resolveOrchModel() });
+  const orch = new ClaudeSession({
+    systemPrompt: orchSystem,
+    model: resolveOrchModel(),
+    stateless: true,
+  });
 
   const unnamed = roles
     .map((r, i) => ({ ...r, i }))
@@ -219,8 +228,10 @@ export async function runOrchestrator(opts: { contextFile?: string }): Promise<v
   };
   await writeFile(path.join(runDir, "state.json"), JSON.stringify(state, null, 2), "utf8");
 
-  // Persist the orchestrator's session id so the run can be resumed later.
-  if (orch.id) await writeSessionId(runDir, "orchestrator", orch.id);
+  // The ledger is the orchestrator's externalized memory; it starts empty and
+  // the orchestrator populates it on its first turn. It is also what makes a
+  // run resumable — no session id to reattach.
+  await writeFile(path.join(runDir, "ledger.md"), "", "utf8");
 
   // Initialize empty inbox/outbox files
   for (const r of roles) {
@@ -250,7 +261,6 @@ export async function runOrchestrator(opts: { contextFile?: string }): Promise<v
   // -------- 5. Main loop --------
   await runLoop({
     runDir,
-    state,
     roles,
     transcript,
     orch,
@@ -287,41 +297,19 @@ export async function resumeOrchestrator(
   console.log(`\n[orchestrator] resuming run: ${runDir}`);
   console.log(`[orchestrator] roles: ${roles.map((r) => r.name).join(", ")}`);
 
-  // Restore the orchestrator session, or replay its coordination history.
-  let orchSystem = buildOrchSystem(state);
-  const storedOrch = await readSessionId(runDir, "orchestrator");
-  let orch: ClaudeSession;
-  if (storedOrch) {
-    console.log(`[orchestrator] resuming claude session ${storedOrch}`);
-    orch = new ClaudeSession({
-      systemPrompt: orchSystem,
-      resumeSessionId: storedOrch,
-      model: resolveOrchModel(),
-      onSessionId: (id) => void writeSessionId(runDir, "orchestrator", id),
-    });
+  // The orchestrator is stateless — its memory is the ledger on disk, so resume
+  // needs no session reattachment or transcript replay. It will read the
+  // existing ledger on its first turn and continue.
+  if (existsSync(path.join(runDir, "ledger.md"))) {
+    console.log("[orchestrator] ledger found — resuming from it");
   } else {
-    const history = buildOrchHistory(
-      await readFile(transcript, "utf8"),
-      roles.map((r) => r.name)
-    );
-    if (history) {
-      orchSystem +=
-        "\n\nThis run is resuming and your previous session could not be reattached. " +
-        "Here is the coordination history so far, oldest first. Treat it as your memory " +
-        "of what has already happened, then continue from where it leaves off.\n\n" +
-        "----- PRIOR COORDINATION -----\n" +
-        history +
-        "\n----- END PRIOR COORDINATION -----";
-      console.log("[orchestrator] no stored session; replaying transcript history");
-    } else {
-      console.log("[orchestrator] no stored session and no prior history; starting fresh");
-    }
-    orch = new ClaudeSession({
-      systemPrompt: orchSystem,
-      model: resolveOrchModel(),
-      onSessionId: (id) => void writeSessionId(runDir, "orchestrator", id),
-    });
+    console.log("[orchestrator] no ledger (pre-ledger run) — starting memory fresh");
   }
+  const orch = new ClaudeSession({
+    systemPrompt: buildOrchSystem(state),
+    model: resolveOrchModel(),
+    stateless: true,
+  });
 
   // Clear stale inbox/outbox so freshly spawned roles don't reprocess leftover
   // content (notably the `exit` sentinel written on a prior clean shutdown).
@@ -337,7 +325,6 @@ export async function resumeOrchestrator(
 
   await runLoop({
     runDir,
-    state,
     roles,
     transcript,
     orch,
@@ -366,7 +353,6 @@ function spawnRole(name: string, runDir: string, resume: boolean): ChildProcess 
 
 interface LoopCtx {
   runDir: string;
-  state: RunState;
   roles: RoleSpec[];
   transcript: string;
   orch: ClaudeSession;
@@ -377,83 +363,61 @@ interface LoopCtx {
 
 /** Shared event loop used by both fresh runs and resumes. */
 async function runLoop(ctx: LoopCtx): Promise<void> {
-  const { runDir, state, roles, transcript, children, kickoff } = ctx;
-  // Mutable: compaction swaps in a fresh session to cap context growth.
-  // Closures below reference this binding, so reassigning it is picked up.
-  let orch = ctx.orch;
+  const { runDir, roles, transcript, orch, children, kickoff } = ctx;
 
-  // Serialize every orchestrator turn. The outbox watchers fire independently,
-  // so without this two role replies could launch concurrent `claude --resume`
-  // processes against the same session id and corrupt its history. This also
-  // records token cost per turn and tracks context size for compaction.
+  // Serialize every orchestrator turn. Outbox watchers fire independently, and
+  // each turn does a read-modify-write of the shared ledger — without this,
+  // two role replies could interleave and clobber each other's ledger update.
+  // The whole critical section (read ledger → send → record cost → write
+  // ledger) runs inside the lock. Also tracks whether the last reply carried a
+  // ledger, so dispatch knows a no-TO-block turn is legitimate vs. malformed.
   let orchLock: Promise<unknown> = Promise.resolve();
-  let contextTokens = 0;
+  let lastHadLedger = false;
 
-  async function askOrch(rawPayload: string): Promise<string> {
-    const task = orchLock.then(() => orch.send(rawPayload));
+  /**
+   * Run one orchestrator turn. `eventText` is just the new event (a role
+   * report, user input, or a nudge); askOrch wraps it with the current ledger.
+   * The orchestrator replies with a replacement ledger + TO: blocks; we persist
+   * the ledger and return only the TO-block text for dispatch.
+   */
+  async function askOrch(eventText: string): Promise<string> {
+    const task = orchLock.then(async () => {
+      const ledger = await readLedger(runDir);
+      const reply = await orch.send(composeOrchPrompt(ledger, eventText));
+      const u = orch.lastUsage;
+      if (u) {
+        await recordUsage(runDir, "orchestrator", u);
+        try {
+          dash.setCost((await readRunCost(runDir)).costUsd);
+        } catch {
+          // Cost display is best-effort; never let it break the run.
+        }
+      }
+      const extracted = extractLedger(reply);
+      lastHadLedger = extracted.ledger !== null;
+      if (extracted.ledger !== null) await writeLedger(runDir, extracted.ledger);
+      return extracted.rest;
+    });
     orchLock = task.then(
       () => undefined,
       () => undefined
     );
-    const reply = await task;
-    const u = orch.lastUsage;
-    if (u) {
-      contextTokens = u.inputTokens + u.cacheReadTokens + u.cacheCreationTokens;
-      await recordUsage(runDir, "orchestrator", u);
-      try {
-        const total = await readRunCost(runDir);
-        dash.setCost(total.costUsd);
-      } catch {
-        // Cost display is best-effort; never let it break the run.
-      }
-    }
-    return reply;
+    return task;
   }
 
-  /**
-   * When the orchestrator's context grows past COMPACT_TOKENS, roll it into a
-   * fresh session seeded with a condensed memory (latest synopsis + recent
-   * coordination). Called at checkpoints, where the orchestrator is idle.
-   */
-  async function maybeCompact(synopsis: string): Promise<void> {
-    if (COMPACT_TOKENS === 0 || contextTokens < COMPACT_TOKENS) return;
-    // Drain any in-flight orchestrator turn (e.g. a role that replied during
-    // the checkpoint pause) so nothing is mid-send when we swap the session.
-    await orchLock;
-    const approxK = Math.round(contextTokens / 1000);
-    dash.setStatus(`compacting orchestrator context (~${approxK}k tok)`);
-    console.log(
-      `[orchestrator] context ~${contextTokens} tok ≥ ${COMPACT_TOKENS}; rolling session with condensed memory`
-    );
-    const history = buildOrchHistory(
-      await readFile(transcript, "utf8"),
-      roles.map((r) => r.name)
-    );
-    const sys =
-      buildOrchSystem(state) +
-      "\n\nThis session was COMPACTED to control context size. Below is a condensed memory of " +
-      "the run so far — your latest synopsis plus recent coordination, oldest first. Treat it as " +
-      "your working memory and continue from where it leaves off. Detailed work lives in the " +
-      "shared files referenced throughout.\n\n" +
-      "----- LATEST SYNOPSIS -----\n" +
-      synopsis.trim() +
-      "\n\n----- RECENT COORDINATION -----\n" +
-      history +
-      "\n----- END -----";
-    // No resumeSessionId → starts a fresh claude session; onSessionId persists
-    // the new id once its first turn runs. The old session id stays on disk
-    // until then, so a crash mid-roll resumes safely (just uncompacted).
-    orch = new ClaudeSession({
-      systemPrompt: sys,
-      model: resolveOrchModel(),
-      onSessionId: (id) => void writeSessionId(runDir, "orchestrator", id),
-    });
-    contextTokens = 0;
-    await appendTranscript(
-      transcript,
-      "ORCH COMPACTED",
-      `Context exceeded ${COMPACT_TOKENS} tok; session rolled with condensed memory.`
-    );
+  function composeOrchPrompt(ledger: string, eventText: string): string {
+    return [
+      "===== CURRENT LEDGER (your memory — all you know about this run) =====",
+      ledger.trim() || "(empty — this is the start of the run)",
+      "===== END LEDGER =====",
+      "",
+      "===== NEW EVENT =====",
+      eventText,
+      "===== END EVENT =====",
+      "",
+      `Roles you may dispatch to: ${roles.map((r) => r.name).join(", ")}.`,
+      "Reply with a full replacement ledger inside <<<LEDGER ... LEDGER>>>, then zero or more TO: blocks (separate multiple with a line containing only ---). Keep the ledger compact: status + pointers, never raw content.",
+    ].join("\n");
   }
 
   const dash = new Dashboard({
@@ -485,7 +449,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
 
   // Kick off: ask the orchestrator for the first (or resumed) dispatch.
   console.log("[orchestrator] requesting initial dispatch...");
-  const firstDispatch = await askOrch(buildOrchMessage(kickoff));
+  const firstDispatch = await askOrch(kickoff);
   printOrchReply(firstDispatch);
   await dispatch(firstDispatch);
 
@@ -499,7 +463,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
       await appendTranscript(transcript, `← ${r.name}`, content);
       await clearFile(outbox);
       printRoleReply(r.name, content);
-      const reply = await askOrch(buildOrchMessage(`[from ${r.name}]\n${content}`));
+      const reply = await askOrch(`[from ${r.name}]\n${content}`);
       printOrchReply(reply);
       await dispatch(reply);
     });
@@ -519,7 +483,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     }
     console.log(`[orchestrator] forwarding user interjection to orchestrator claude`);
     await appendTranscript(transcript, "USER", text);
-    const reply = await askOrch(buildOrchMessage(`[USER INTERJECTION] ${text}`));
+    const reply = await askOrch(`[USER INTERJECTION] ${text}`);
     printOrchReply(reply);
     await dispatch(reply);
   };
@@ -546,15 +510,10 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     setTimeout(async () => {
       if (stopping) return;
       dash.setStatus("CHECKPOINT — awaiting your input");
-      console.log(`\n[orchestrator] checkpoint — asking for synopsis...`);
-      const synopsis = await askOrch(
-        "Pause for a checkpoint. Provide a concise synopsis of progress so far and any relevant details for the user. Do not dispatch any TO: blocks in this response."
-      );
-      await appendTranscript(transcript, "SYNOPSIS", synopsis);
-      console.log(`\n----- SYNOPSIS -----\n${synopsis}\n--------------------`);
-
-      // Idle moment — the safest point to roll the session if it has grown large.
-      await maybeCompact(synopsis);
+      // The ledger IS the synopsis — show it directly instead of spending a
+      // model turn to regenerate one.
+      const ledger = (await readLedger(runDir)).trim() || "(ledger empty)";
+      console.log(`\n----- LEDGER (orchestrator memory) -----\n${ledger}\n----------------------------------------`);
       console.log("At this checkpoint you can:");
       console.log("  <feedback>     type feedback then Enter to continue");
       console.log("  (empty)        Enter alone to continue with no feedback");
@@ -590,7 +549,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
         await continueOrch();
       } else if (fb.length > 0) {
         await appendTranscript(transcript, "USER FEEDBACK", fb);
-        const reply = await askOrch(buildOrchMessage(`[USER FEEDBACK] ${fb}`));
+        const reply = await askOrch(`[USER FEEDBACK] ${fb}`);
         printOrchReply(reply);
         await dispatch(reply);
       } else {
@@ -609,23 +568,9 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
 
   // ---------- helpers ----------
   async function continueOrch(): Promise<void> {
-    const reply = await askOrch(buildOrchMessage("Continue."));
+    const reply = await askOrch("Continue — review the ledger and proceed toward the goal.");
     printOrchReply(reply);
     await dispatch(reply);
-  }
-
-  function buildOrchMessage(payload: string): string {
-    return [
-      payload,
-      "",
-      "---",
-      `(Reminder: Reply ONLY with one or more TO: blocks. Available roles: ${roles
-        .map((r) => r.name)
-        .join(", ")}. Format:`,
-      "TO: <role-name>",
-      "<message>",
-      "Separate multiple blocks with a line containing only ---. No prose outside TO: blocks.)",
-    ].join("\n");
   }
 
   function printOrchReply(text: string): void {
@@ -649,18 +594,27 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   async function dispatch(orchOutput: string): Promise<void> {
     const blocks = parseDispatch(orchOutput);
     if (blocks.length === 0) {
-      await appendTranscript(transcript, "ORCH internal (no TO: blocks)", orchOutput);
-      // Nudge the orchestrator to re-emit in protocol.
-      console.log("[orchestrator] re-prompting for TO: blocks...");
+      if (lastHadLedger) {
+        // Legitimate: the orchestrator updated its memory and has nothing to
+        // dispatch this turn (e.g. waiting on in-flight roles). Not an error.
+        console.log("[orchestrator] ledger updated; no dispatch this turn");
+        return;
+      }
+      // Neither a ledger nor TO: blocks — the reply was malformed. Nudge once.
+      await appendTranscript(transcript, "ORCH malformed (no ledger, no TO: blocks)", orchOutput);
+      console.log("[orchestrator] re-prompting for protocol-shaped reply...");
       const retry = await askOrch(
-        buildOrchMessage(
-          "Your previous reply contained no TO: blocks. Re-emit your intended action as TO: blocks only."
-        )
+        "Your previous reply had neither a <<<LEDGER ... LEDGER>>> block nor any TO: blocks. " +
+          "Re-emit your intended action: a replacement ledger followed by any TO: blocks."
       );
       const retryBlocks = parseDispatch(retry);
       if (retryBlocks.length === 0) {
-        console.warn("[orchestrator] retry also produced no TO: blocks; pausing.");
-        await appendTranscript(transcript, "ORCH retry failed", retry);
+        if (lastHadLedger) {
+          console.log("[orchestrator] ledger updated on retry; no dispatch this turn");
+        } else {
+          console.warn("[orchestrator] retry still malformed; pausing until next event.");
+          await appendTranscript(transcript, "ORCH retry failed", retry);
+        }
         return;
       }
       console.log(`[orchestrator] retry produced ${retryBlocks.length} block(s)`);
@@ -668,6 +622,17 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
       return;
     }
     for (const b of blocks) await sendToRole(b);
+  }
+
+  /**
+   * Pull the orchestrator's replacement ledger out of a reply. Returns the
+   * ledger body (or null if absent) and the remaining text (the TO: blocks).
+   */
+  function extractLedger(reply: string): { ledger: string | null; rest: string } {
+    const m = /<<<LEDGER\r?\n([\s\S]*?)\r?\nLEDGER>>>/.exec(reply);
+    if (!m) return { ledger: null, rest: reply };
+    const rest = (reply.slice(0, m.index) + reply.slice(m.index + m[0].length)).trim();
+    return { ledger: m[1], rest };
   }
 
   async function sendToRole(b: { role: string; body: string }): Promise<void> {

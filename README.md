@@ -23,16 +23,27 @@ plain files on disk, so a run is fully inspectable and resumable.
         └───────────┴───────────┴───────────┘
 ```
 
-- The **orchestrator** replies only in `TO: <role>` blocks. Each block is written
-  to that role's `inbox/<role>.txt`.
-- Each **role** is a child process watching its inbox. It runs its own `claude`
-  session and writes the reply to `outbox/<role>.txt`.
-- The orchestrator watches every outbox, feeds replies back into its own session,
-  and decides what to dispatch next.
+- The **orchestrator** is **stateless**: it has no growing conversation. Each turn
+  it is handed its **ledger** (`ledger.md` — its externalized memory) plus one new
+  event, and it replies with an updated ledger + zero or more `TO: <role>` blocks.
+  Each block is written to that role's `inbox/<role>.txt`.
+- Each **role** is a child process watching its inbox. It runs its own (stateful)
+  `claude` session and writes the reply to `outbox/<role>.txt`.
+- The orchestrator watches every outbox; each reply becomes the next event it
+  folds into the ledger and acts on.
 - Every message is appended to a single `transcript.md` (the orchestrator is the
   sole writer, so the transcript is the one source of truth).
-- On a timer, the run **checkpoints**: the orchestrator produces a synopsis and
-  hands control back to you for feedback, interval changes, or exit.
+- On a timer, the run **checkpoints**: it shows you the current ledger and hands
+  control back for feedback, interval changes, or exit.
+
+**Why the ledger?** Feeding every role reply into a growing orchestrator
+conversation makes per-turn cost climb with the run — and worse, when a child
+agent takes minutes to reply, the orchestrator's prompt cache expires, so the
+*entire* growing context is re-read at full price on the next turn. Keeping the
+orchestrator's resident context to `system + ledger + this event` makes it
+**bounded by design**: a cold cache is cheap because there's little to re-read.
+The ledger holds status and pointers; details live in shared files and are
+retrieved only when needed.
 
 Each participant's `claude` session id is persisted under `sessions/`, so a run
 can be paused and resumed without losing context.
@@ -90,8 +101,7 @@ orchestrator, which decides how to propagate it). At a checkpoint you can:
 
 | Variable                  | Default      | Purpose |
 |---------------------------|--------------|---------|
-| `MD_AGENT_COMPACT_TOKENS` | `120000`     | When the orchestrator's context (input + cache tokens) grows past this, it is **compacted** at the next checkpoint — rolled into a fresh session seeded with the latest synopsis + condensed recent coordination. Caps context growth (the dominant cost on long runs). Set `0` to disable. |
-| `MD_AGENT_ORCH_MODEL`     | *(CLI default)* | Pin the orchestrator's model — a tier (`opus`/`sonnet`/`haiku`) or a concrete model id. The orchestrator is the highest-context seat; set `sonnet` to trade some judgment for lower burn. |
+| `MD_AGENT_ORCH_MODEL`     | *(CLI default)* | Pin the orchestrator's model — a tier (`opus`/`sonnet`/`haiku`) or a concrete model id. Set `sonnet` to trade some judgment for lower burn. |
 | `MD_AGENT_NO_DASHBOARD`   | unset        | Disable the sticky top-of-console status panel (also auto-disabled when stdout isn't a TTY). |
 | `NO_COLOR`                | unset        | Disable ANSI color in the dashboard. |
 
@@ -111,11 +121,12 @@ console.
 ```
 runs/<timestamp>-<name>/
 ├── state.json          # goal, roles, models, checkpoint interval
+├── ledger.md           # orchestrator's memory (stateless across turns; resume reads this)
 ├── transcript.md       # full conversation (orchestrator is sole writer)
 ├── inbox/<role>.txt     # orchestrator → role
 ├── outbox/<role>.txt    # role → orchestrator
 └── sessions/
-    ├── <who>.txt        # persisted claude session id (for resume)
+    ├── <who>.txt        # persisted claude session id — roles only (orchestrator is stateless)
     └── <who>.cost.json  # accumulated token usage + cost
 ```
 
@@ -128,7 +139,7 @@ runs/<timestamp>-<name>/
 | File                   | Responsibility |
 |------------------------|----------------|
 | `src/index.ts`         | CLI entry / arg parsing |
-| `src/orchestrator.ts`  | setup wizard, run loop, dispatch, checkpoints, compaction |
+| `src/orchestrator.ts`  | setup wizard, run loop, ledger turns, dispatch, checkpoints |
 | `src/role.ts`          | role child-process loop |
 | `src/claude.ts`        | `claude` session wrapper (spawn, session-id, usage capture) |
 | `src/ipc.ts`           | file-based inbox/outbox + transcript helpers |

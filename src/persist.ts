@@ -167,6 +167,28 @@ export async function readRunCost(runDir: string): Promise<CostRecord> {
   return total;
 }
 
+// -------- orchestrator ledger (the orchestrator's externalized memory) --------
+// The orchestrator runs stateless: each turn it is handed this ledger + the new
+// event, and it emits a replacement ledger. The ledger holds the run's working
+// state — plan, per-role status, open questions, decisions, and POINTERS to
+// files/KB for detail — never raw content. This caps the orchestrator's
+// resident context so token cost doesn't grow with the conversation.
+
+export function ledgerPath(runDir: string): string {
+  return path.join(runDir, "ledger.md");
+}
+
+export async function readLedger(runDir: string): Promise<string> {
+  const f = ledgerPath(runDir);
+  if (!existsSync(f)) return "";
+  return readFile(f, "utf8");
+}
+
+export async function writeLedger(runDir: string, content: string): Promise<void> {
+  await mkdir(runDir, { recursive: true });
+  await writeFile(ledgerPath(runDir), content.trim() + "\n", "utf8");
+}
+
 // -------- transcript replay (fallback when no session id is stored) --------
 
 export interface TurnBlock {

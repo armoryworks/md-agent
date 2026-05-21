@@ -13,6 +13,7 @@ export class ClaudeSession {
   private onSessionId: ((id: string) => void) | null;
   private model: string | null;
   private lastUsageData: Usage | null = null;
+  private readonly stateless: boolean;
 
   constructor(
     opts: {
@@ -23,12 +24,21 @@ export class ClaudeSession {
       onSessionId?: (id: string) => void;
       /** Concrete claude model id to run this session on (passed as --model). */
       model?: string;
+      /**
+       * Never carry conversation state between turns. Every `send()` is a fresh,
+       * independent call: the system prompt is prepended each time and no
+       * `--resume` is used. Use this when the caller supplies the full context
+       * (e.g. a maintained ledger) on every turn, so resident tokens stay
+       * bounded instead of growing with the conversation.
+       */
+      stateless?: boolean;
     } = {}
   ) {
     this.systemPrompt = opts.systemPrompt ?? null;
     this.sessionId = opts.resumeSessionId ?? null;
     this.onSessionId = opts.onSessionId ?? null;
     this.model = opts.model ?? null;
+    this.stateless = opts.stateless ?? false;
   }
 
   get id(): string | null {
@@ -78,7 +88,7 @@ export class ClaudeSession {
           if (!line) continue;
           try {
             const msg = JSON.parse(line);
-            if (typeof msg.session_id === "string" && !this.sessionId) {
+            if (typeof msg.session_id === "string" && !this.sessionId && !this.stateless) {
               this.sessionId = msg.session_id;
               this.onSessionId?.(msg.session_id);
             }
