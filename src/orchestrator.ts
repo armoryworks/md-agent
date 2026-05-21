@@ -325,14 +325,26 @@ export async function resumeOrchestrator(
   const state = await readState(runDir);
   const roles = state.roles;
   const transcript = path.join(runDir, "transcript.md");
-  let checkpointMinutes = state.maxMinutes ?? DEFAULT_MAX_MINUTES;
+  const storedMinutes = state.maxMinutes ?? DEFAULT_MAX_MINUTES;
+  let checkpointMinutes = storedMinutes;
   if (opts.minutes != null) {
+    // Explicit --minutes flag wins; skip the prompt.
     checkpointMinutes = Math.max(1, Math.min(24 * 60, Math.floor(opts.minutes)));
-    await updateState(runDir, { maxMinutes: checkpointMinutes });
-    console.log(
-      `[orchestrator] checkpoint interval set to ${checkpointMinutes} min on resume (persisted)`
-    );
+  } else {
+    // No flag — ask, defaulting to the run's stored interval.
+    const answer = await number({
+      message: "Minutes between checkpoints for this resumed run?",
+      default: storedMinutes,
+      min: 1,
+      max: 24 * 60,
+      required: true,
+    });
+    checkpointMinutes = answer ?? storedMinutes;
   }
+  if (checkpointMinutes !== storedMinutes || opts.minutes != null) {
+    await updateState(runDir, { maxMinutes: checkpointMinutes });
+  }
+  console.log(`[orchestrator] checkpoint interval: ${checkpointMinutes} min (persisted)`);
 
   console.log(`\n[orchestrator] resuming run: ${runDir}`);
   console.log(`[orchestrator] roles: ${roles.map((r) => r.name).join(", ")}`);

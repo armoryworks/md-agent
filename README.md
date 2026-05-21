@@ -85,9 +85,13 @@ npm run dev -- --context ./brief.md
 Resume a previous run:
 
 ```bash
-npm run dev -- --resume runs/2026-05-21_00-28-34-my-run
-npm run dev -- --resume runs/<dir> --minutes 15    # also change the checkpoint cadence
+npm run dev -- --resume runs/2026-05-21_00-28-34-my-run         # prompts for the checkpoint interval (defaults to the run's stored value)
+npm run dev -- --resume runs/<dir> --minutes 15                 # skip the prompt; set it directly (also --minutes=15)
 ```
+
+On resume you're asked for the checkpoint interval (pre-filled with the run's
+stored value); passing `--minutes` skips the prompt. Either way the choice is
+persisted to `state.json`.
 
 During a run you can type a line at any time to interject (it goes to the
 orchestrator, which decides how to propagate it). At a checkpoint you can:
