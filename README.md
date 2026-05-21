@@ -33,8 +33,11 @@ plain files on disk, so a run is fully inspectable and resumable.
   folds into the ledger and acts on.
 - Every message is appended to a single `transcript.md` (the orchestrator is the
   sole writer, so the transcript is the one source of truth).
-- On a timer, the run **checkpoints**: it shows you the current ledger and hands
-  control back for feedback, interval changes, or exit.
+- On a timer, the run **checkpoints**: it writes the current ledger to the
+  transcript (a durable footprint) and hands control back for feedback, interval
+  changes, or exit. If no one responds within a grace window it auto-continues
+  and arms the next checkpoint, so the cadence stays a reliable heartbeat instead
+  of stalling.
 
 **Why the ledger?** Feeding every role reply into a growing orchestrator
 conversation makes per-turn cost climb with the run — and worse, when a child
@@ -93,6 +96,7 @@ orchestrator, which decides how to propagate it). At a checkpoint you can:
 |--------------|-------------------------------------------------------|
 | *(text)*     | feedback to the orchestrator, then continue           |
 | *(empty)*    | continue with no feedback                             |
+| *(no input)* | after the grace window, auto-continues (heartbeat stays alive) |
 | `extend N`   | run N more minutes before the **next** checkpoint only|
 | `interval N` | change the recurring checkpoint interval to N minutes |
 | `exit`       | stop the run cleanly                                  |
@@ -102,6 +106,7 @@ orchestrator, which decides how to propagate it). At a checkpoint you can:
 | Variable                  | Default      | Purpose |
 |---------------------------|--------------|---------|
 | `MD_AGENT_ORCH_MODEL`     | *(CLI default)* | Pin the orchestrator's model — a tier (`opus`/`sonnet`/`haiku`) or a concrete model id. Set `sonnet` to trade some judgment for lower burn. |
+| `MD_AGENT_CHECKPOINT_GRACE`| `120`        | Seconds a checkpoint waits for your input before auto-continuing and arming the next one. `0` = wait indefinitely (block until you respond — the old behavior). |
 | `MD_AGENT_TEAMS`          | off          | Pre-sets the **"allow sub-teams?"** setup-wizard prompt to "yes". Sub-teams are opt-in **per run** — the wizard asks at setup and the choice is stored in `state.json`. When allowed, the orchestrator may send two roles into a 1:1 **huddle** (`TEAM: <name> members=a,b`): they iterate directly and only one consolidated result returns to the orchestrator — the back-and-forth never enters its context. |
 | `MD_AGENT_TEAM_MAX_ROUNDS`| `12`         | Hard cap on huddle exchanges before the reporter is forced to summarize (runaway-loop backstop). Per-team override via `maxRounds=` in the `TEAM:` block. |
 | `MD_AGENT_NO_DASHBOARD`   | unset        | Disable the sticky top-of-console status panel (also auto-disabled when stdout isn't a TTY). |

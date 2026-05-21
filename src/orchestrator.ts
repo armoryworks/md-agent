@@ -34,6 +34,19 @@ import {
 const DEFAULT_MAX_MINUTES = 10;
 
 /**
+ * How long a checkpoint waits for your input before auto-continuing and arming
+ * the next one. Keeps the checkpoint a reliable heartbeat instead of stalling
+ * the whole cadence when no one is watching. Set MD_AGENT_CHECKPOINT_GRACE=0 to
+ * restore the old behavior (block indefinitely until you respond).
+ */
+const CHECKPOINT_GRACE_MS = (() => {
+  const v = process.env.MD_AGENT_CHECKPOINT_GRACE;
+  if (v == null) return 120_000;
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? n * 1000 : 120_000;
+})();
+
+/**
  * Default for the setup wizard's "allow sub-teams?" prompt. Sub-teams are opt-in
  * per run (chosen at setup and stored in state); MD_AGENT_TEAMS=1 just pre-sets
  * the prompt to "yes". When off, the orchestrator isn't told huddles exist.
@@ -602,15 +615,23 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   };
   rl.on("line", onInterjection);
 
-  // Wait for exactly one line from the user, with interjections paused.
-  const waitOneLine = (): Promise<string> => {
+  // Wait for one line from the user (interjections paused). Resolves to the line,
+  // or null if `timeoutMs` elapses first. timeoutMs <= 0 means wait indefinitely.
+  const waitForInput = (timeoutMs: number): Promise<string | null> => {
     interjectionsPaused = true;
-    return new Promise<string>((res) => {
-      const handler = (l: string) => {
-        rl.off("line", handler);
-        res(l);
+    return new Promise<string | null>((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let settled = false;
+      const settle = (val: string | null) => {
+        if (settled) return;
+        settled = true;
+        rl.off("line", onLine);
+        if (timer) clearTimeout(timer);
+        resolve(val);
       };
-      rl.on("line", handler);
+      const onLine = (l: string) => settle(l);
+      rl.on("line", onLine);
+      if (timeoutMs > 0) timer = setTimeout(() => settle(null), timeoutMs);
     }).finally(() => {
       interjectionsPaused = false;
     });
@@ -622,25 +643,42 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   const scheduleCheckpoint = (overrideMs?: number) => {
     setTimeout(async () => {
       if (stopping) return;
-      dash.setStatus("CHECKPOINT — awaiting your input");
       // The ledger IS the synopsis — show it directly instead of spending a
-      // model turn to regenerate one.
+      // model turn to regenerate one. Also write it to the transcript so every
+      // checkpoint leaves a durable, timestamped footprint (point-in-time state)
+      // even when you don't respond — otherwise checkpoints are invisible.
       const ledger = (await readLedger(runDir)).trim() || "(ledger empty)";
+      await appendTranscript(transcript, "CHECKPOINT", ledger);
+
+      const graceSec = Math.round(CHECKPOINT_GRACE_MS / 1000);
+      const graceNote = CHECKPOINT_GRACE_MS > 0 ? ` (auto-continues in ${graceSec}s)` : "";
+      dash.setStatus(`CHECKPOINT — feedback now${graceNote}`);
       console.log(`\n----- LEDGER (orchestrator memory) -----\n${ledger}\n----------------------------------------`);
-      console.log("At this checkpoint you can:");
+      console.log(`At this checkpoint you can${graceNote ? " (or just wait)" : ""}:`);
       console.log("  <feedback>     type feedback then Enter to continue");
       console.log("  (empty)        Enter alone to continue with no feedback");
       console.log(`  extend N       run N more minutes before the NEXT checkpoint only`);
       console.log(`  interval N     change the recurring checkpoint interval to N minutes`);
       console.log("  exit           stop the run");
 
-      const userLine = await waitOneLine();
+      const userLine = await waitForInput(CHECKPOINT_GRACE_MS);
+      if (userLine === null) {
+        // No one's watching — keep the heartbeat alive and re-arm, but don't
+        // inject a "Continue" nudge (the orchestrator is already driven by role
+        // replies; an unprompted poke would just burn a turn / invent work).
+        dash.setStatus("running");
+        console.log(`[orchestrator] checkpoint auto-continued (no input within ${graceSec}s)`);
+        await appendTranscript(transcript, "CHECKPOINT AUTO-CONTINUED", `No input within ${graceSec}s.`);
+        scheduleCheckpoint();
+        return;
+      }
       const fb = userLine.trim();
 
       if (isSafeWord(fb)) {
         await stopAll("user typed exit at checkpoint");
         return;
       }
+      dash.setStatus("running");
 
       let nextOverrideMs: number | undefined;
       const cmd = parseCheckpointCommand(fb);
