@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Run artifacts — transcripts contain conversation history and may include
+# credentials, secrets, and project-internal findings. NEVER publish these.
+runs/
+
+# Project-internal context that is not part of the md-agent tool itself.
+# (These were inputs/outputs of a specific engagement, not tooling docs.)
+docs/ba/
+docs/domain/
+
+# Environment / secrets
+.env
+.env.*
+*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

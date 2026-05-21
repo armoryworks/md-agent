@@ -1,0 +1,45 @@
+{
+  "name": "md-agent",
+  "version": "1.0.0",
+  "description": "Orchestrate a team of Claude Code agents against a single goal via file-based IPC.",
+  "main": "dist/index.js",
+  "bin": {
+    "md-agent": "dist/index.js"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "agents",
+    "orchestration",
+    "multi-agent",
+    "cli"
+  ],
+  "author": "ArmoryWorks",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/armoryworks/md-agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/armoryworks/md-agent/issues"
+  },
+  "homepage": "https://github.com/armoryworks/md-agent#readme",
+  "type": "module",
+  "dependencies": {
+    "@inquirer/prompts": "^8.4.3",
+    "chokidar": "^5.0.0",
+    "cross-spawn": "^7.0.6",
+    "gray-matter": "^4.0.3"
+  },
+  "devDependencies": {
+    "@types/cross-spawn": "^6.0.6",
+    "@types/node": "^25.9.1",
+    "tsx": "^4.22.3",
+    "typescript": "^6.0.3"
+  }
+}
