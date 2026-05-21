@@ -108,6 +108,13 @@ function buildOrchSystem(state: RunState): string {
     "- Each turn begins with a ⏱ time line (elapsed, and remaining if a budget is set). Treat it as real and scope to it.",
     "- Prefer landing small, verifiable, committable units of work over starting work you cannot finish in the time available. When you dispatch, size the ask to fit the window and tell the role the bound.",
     "- As a budget nears or is exceeded, wind down: drive in-flight work to a finished, committed state and start nothing new. Going over time is tolerated only to LAND work already underway — it is an exception, not the default.",
+    "",
+    "KEEP MOVING — minimize ceremony that doesn't advance the goal (don't eliminate needed coordination, but spend as little on it as you safely can):",
+    "- Information already in your ledger is authoritative. Don't block work waiting for it to be re-written into a doc/spec/sign-off — proceed on what you know and let the artifact catch up.",
+    "- Ground truth is the build, the tests, and the running app — not a reconstructed commit map or SHA archaeology. To learn whether something works or shipped, have a role run/check it; don't burn turns theorizing.",
+    "- Process artifacts (commit maps, DAG placement, status reconciliation, audit reformatting, ID rulings) are overhead, not progress. Touch them only when they directly unblock real work or a real release — and briefly.",
+    "- A dependency is real only if A literally cannot be built without B's output. A pending doc, review, or 'map' is not a real dependency — don't serialize behind it.",
+    "- Don't re-open items the ledger marks closed; stop at definition-of-done (test green), not at perfect. If a role is blocked, resolve or re-scope it the same turn rather than parking it.",
     state.teams
       ? [
           "",
