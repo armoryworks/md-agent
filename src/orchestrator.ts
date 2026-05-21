@@ -103,6 +103,11 @@ function buildOrchSystem(state: RunState): string {
     "- Roles report concise STATUS, not full deliverables; their detailed work lives in shared files. Coordinate on those summaries — never ask a role to echo a large artifact back through you.",
     "- Don't paste one role's output into another's message — summarize the relevant decision and point to the file.",
     "- The literal single-word message `exit` is sent to all roles when the user terminates the run.",
+    "",
+    "TIME & SCOPING:",
+    "- Each turn begins with a ⏱ time line (elapsed, and remaining if a budget is set). Treat it as real and scope to it.",
+    "- Prefer landing small, verifiable, committable units of work over starting work you cannot finish in the time available. When you dispatch, size the ask to fit the window and tell the role the bound.",
+    "- As a budget nears or is exceeded, wind down: drive in-flight work to a finished, committed state and start nothing new. Going over time is tolerated only to LAND work already underway — it is an exception, not the default.",
     state.teams
       ? [
           "",
@@ -165,6 +170,13 @@ export async function runOrchestrator(opts: { contextFile?: string }): Promise<v
     message:
       "Allow the orchestrator to form sub-teams (send two roles into a 1:1 huddle)?",
     default: TEAMS_DEFAULT,
+  });
+
+  const budgetMinutes = await number({
+    message: "Soft time budget in minutes (blank = none; over-runs tolerated to land in-flight work)?",
+    min: 1,
+    max: 24 * 60,
+    required: false,
   });
 
   let contextContent: string | undefined;
@@ -264,6 +276,7 @@ export async function runOrchestrator(opts: { contextFile?: string }): Promise<v
     context: contextContent,
     maxMinutes: maxMinutes ?? DEFAULT_MAX_MINUTES,
     teams,
+    budgetMinutes: budgetMinutes ?? undefined,
   };
   await writeFile(path.join(runDir, "state.json"), JSON.stringify(state, null, 2), "utf8");
 
@@ -307,6 +320,7 @@ export async function runOrchestrator(opts: { contextFile?: string }): Promise<v
     checkpointMinutes: state.maxMinutes!,
     kickoff: "Begin the run.",
     teamsEnabled: state.teams ?? false,
+    budgetMinutes: state.budgetMinutes,
   });
 }
 
@@ -345,6 +359,19 @@ export async function resumeOrchestrator(
     await updateState(runDir, { maxMinutes: checkpointMinutes });
   }
   console.log(`[orchestrator] checkpoint interval: ${checkpointMinutes} min (persisted)`);
+
+  // Soft time budget for THIS session (resets per resume — "give it a 15-min run").
+  const resumeBudgetMinutes = await number({
+    message: "Soft time budget for this session in minutes (blank = none; over-runs tolerated to land in-flight work)?",
+    default: state.budgetMinutes,
+    min: 1,
+    max: 24 * 60,
+    required: false,
+  });
+  await updateState(runDir, { budgetMinutes: resumeBudgetMinutes ?? undefined });
+  console.log(
+    `[orchestrator] time budget: ${resumeBudgetMinutes != null ? resumeBudgetMinutes + " min" : "none"}`
+  );
 
   console.log(`\n[orchestrator] resuming run: ${runDir}`);
   console.log(`[orchestrator] roles: ${roles.map((r) => r.name).join(", ")}`);
@@ -386,6 +413,7 @@ export async function resumeOrchestrator(
       "The run is resuming after a pause. Re-orient using your memory of the run so far, " +
       "then continue coordinating toward the goal. If you were waiting on a role, re-issue the request.",
     teamsEnabled: state.teams ?? false,
+    budgetMinutes: resumeBudgetMinutes,
   });
 }
 
@@ -414,11 +442,28 @@ interface LoopCtx {
   kickoff: string;
   /** Whether the orchestrator may form sub-teams (per-run setup choice). */
   teamsEnabled: boolean;
+  /** Soft time budget in minutes for this session; undefined = elapsed-only. */
+  budgetMinutes?: number;
 }
 
 /** Shared event loop used by both fresh runs and resumes. */
 async function runLoop(ctx: LoopCtx): Promise<void> {
-  const { runDir, roles, transcript, orch, children, kickoff, teamsEnabled } = ctx;
+  const { runDir, roles, transcript, orch, children, kickoff, teamsEnabled, budgetMinutes } = ctx;
+
+  // Session clock — drives the ⏱ time signal injected into every orchestrator
+  // turn so the (stateless) orchestrator can scope work to the time available.
+  const sessionStart = Date.now();
+  function timeStatus(): string {
+    const elapsed = Math.round((Date.now() - sessionStart) / 60000);
+    if (budgetMinutes == null) {
+      return `⏱ ~${elapsed} min into this session.`;
+    }
+    const remaining = budgetMinutes - elapsed;
+    if (remaining >= 0) {
+      return `⏱ ~${elapsed} min in, ~${remaining} min left of a ~${budgetMinutes} min budget — scope work to finish and commit within it.`;
+    }
+    return `⏱ ~${elapsed} min in, OVER the ~${budgetMinutes} min budget by ~${-remaining} min — WIND DOWN: drive in-flight work to a committed state and start nothing new (over-runs are tolerated only to land work already underway).`;
+  }
 
   // Serialize every orchestrator turn. Outbox watchers fire independently, and
   // each turn does a read-modify-write of the shared ledger — without this,
@@ -462,6 +507,8 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
 
   function composeOrchPrompt(ledger: string, eventText: string): string {
     return [
+      timeStatus(),
+      "",
       "===== CURRENT LEDGER (your memory — all you know about this run) =====",
       ledger.trim() || "(empty — this is the start of the run)",
       "===== END LEDGER =====",

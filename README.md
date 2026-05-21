@@ -67,7 +67,8 @@ npm run build     # tsc → dist/
 ## Usage
 
 Start a new run (interactive setup wizard — number of roles, each role's
-description, the goal, the checkpoint interval, and whether to allow sub-teams):
+description, the goal, the checkpoint interval, whether to allow sub-teams, and
+an optional soft time budget):
 
 ```bash
 npm run dev                      # via tsx, no build step
@@ -92,6 +93,18 @@ npm run dev -- --resume runs/<dir> --minutes 15                 # skip the promp
 On resume you're asked for the checkpoint interval (pre-filled with the run's
 stored value); passing `--minutes` skips the prompt. Either way the choice is
 persisted to `state.json`.
+
+### Time budget (scoping)
+
+Setup and resume also ask for an optional **soft time budget** (minutes). When
+set, every orchestrator turn is prefixed with a live `⏱` line — elapsed and
+remaining — and the orchestrator is instructed (system prompt) to scope work to
+fit: prefer landing small, committable units over starting work it can't finish,
+and **wind down** as the budget nears. The budget is **soft** — once exceeded the
+signal flips to "wind down, start nothing new," but the run does **not** hard-stop;
+over-runs are tolerated to land in-flight work. The budget is per-session (resets
+on resume — "give it a 15-minute run"). Blank = no budget (the `⏱` line then shows
+elapsed only).
 
 During a run you can type a line at any time to interject (it goes to the
 orchestrator, which decides how to propagate it). At a checkpoint you can:

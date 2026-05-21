@@ -39,6 +39,13 @@ export interface RunState {
   maxMinutes?: number;
   /** Whether the orchestrator may form sub-teams (1:1 huddles). Chosen at setup. */
   teams?: boolean;
+  /**
+   * Soft time budget for a run/session, in minutes. Drives the live time signal
+   * injected into the orchestrator each turn (elapsed / remaining) and the
+   * wind-down nudge once exceeded. Soft by design — over-runs are tolerated to
+   * land in-flight work, never a hard stop. Undefined = no budget (elapsed only).
+   */
+  budgetMinutes?: number;
 }
 
 export async function readState(runDir: string): Promise<RunState> {
