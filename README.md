@@ -94,6 +94,48 @@ On resume you're asked for the checkpoint interval (pre-filled with the run's
 stored value); passing `--minutes` skips the prompt. Either way the choice is
 persisted to `state.json`.
 
+Launch a run from a config file instead of the wizard (the console UI still
+runs — this only replaces the setup questions):
+
+```bash
+npm run dev -- --launch ./my-run.json
+```
+
+The config is a `LaunchConfig` (see `src/persist.ts`): `goal`, `roles`
+(`{name?, description, model?}`), and optional `name`, `context` (path to a doc
+included whole), `inbox` (path to a handshake doc prepended as context),
+`maxMinutes`, `teams`, `budgetMinutes`, `autoComplete`, `kickoff`, `runDir`.
+Anything omitted (run name, per-role name/model) is filled by the one-time
+bootstrap turn; supply them all and that LLM call is **skipped**, so the run
+starts instantly.
+
+`autoComplete` lets the orchestrator **end the run itself** — once the goal is
+met, every role is idle, and all work is committed it emits `[[PHASE-COMPLETE]]`
+and the run tears down cleanly instead of idling until the budget/a checkpoint.
+Off by default for the interactive wizard (the run stays alive for more work);
+journey phases default it **on** so a finished phase advances the journey
+without a human typing `exit`.
+
+### Journeys (templated multi-phase runs)
+
+Define an entire campaign up front and let each phase hand off to the next:
+
+```bash
+npm run dev -- --journey ./journey.json
+```
+
+A `journey.json` is `{ "name": "...", "phases": [ ... ] }` where each phase is a
+launch config plus an `id` and optional `pauseBefore`. Phases run **in sequence,
+each as its own child orchestrator** (full console UI, independently resumable).
+When a phase finishes, md-agent reads that phase's ledger and authors a **parting
+handshake** — what it produced, surprises, and suggested role adjustments — into
+the next phase's folder (`phases/<id>/INBOX.md`), which that phase reads as
+context on launch. A handshake may target **multiple downstream phases** when the
+outcome materially changes a later one. Before each non-first phase (unless
+`pauseBefore: false`) the driver pauses so you can read the handshake and edit the
+manifest live, then `Enter` to launch, `skip`, or `exit`. A worked example lives
+in `E:/dev/forge-journey/`.
+
 ### Time budget (scoping)
 
 Setup and resume also ask for an optional **soft time budget** (minutes). When
@@ -123,6 +165,7 @@ orchestrator, which decides how to propagate it). At a checkpoint you can:
 | Variable                  | Default      | Purpose |
 |---------------------------|--------------|---------|
 | `MD_AGENT_ORCH_MODEL`     | *(CLI default)* | Pin the orchestrator's model — a tier (`opus`/`sonnet`/`haiku`) or a concrete model id. Set `sonnet` to trade some judgment for lower burn. |
+| `MD_AGENT_HANDSHAKE_MODEL`| *(orch model, then CLI default)* | Model for the short between-phase handshake turn in a `--journey` run. Falls back to `MD_AGENT_ORCH_MODEL`, then the CLI default. |
 | `MD_AGENT_CHECKPOINT_GRACE`| `120`        | Seconds a checkpoint waits for your input before auto-continuing and arming the next one. `0` = wait indefinitely (block until you respond — the old behavior). |
 | `MD_AGENT_TEAMS`          | off          | Pre-sets the **"allow sub-teams?"** setup-wizard prompt to "yes". Sub-teams are opt-in **per run** — the wizard asks at setup and the choice is stored in `state.json`. When allowed, the orchestrator may send two roles into a 1:1 **huddle** (`TEAM: <name> members=a,b`): they iterate directly and only one consolidated result returns to the orchestrator — the back-and-forth never enters its context. |
 | `MD_AGENT_TEAM_MAX_ROUNDS`| `12`         | Hard cap on huddle exchanges before the reporter is forced to summarize (runaway-loop backstop). Per-team override via `maxRounds=` in the `TEAM:` block. |

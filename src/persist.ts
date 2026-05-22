@@ -46,6 +46,41 @@ export interface RunState {
    * land in-flight work, never a hard stop. Undefined = no budget (elapsed only).
    */
   budgetMinutes?: number;
+  /**
+   * When true, the orchestrator may END the run itself — emitting
+   * `[[PHASE-COMPLETE]]` once the goal is met, every role is idle, and all work
+   * is committed — instead of idling until a checkpoint or the budget. Journey
+   * phases default this ON so a finished phase hands off immediately; the
+   * interactive wizard leaves it off (the run stays alive for more work).
+   */
+  autoComplete?: boolean;
+}
+
+/**
+ * A fully-specified run that can be launched WITHOUT the interactive wizard
+ * (`--launch <file.json>`). The console UI still runs — this only replaces the
+ * setup questions. Anything optional that's omitted (run name, per-role
+ * name/model) is filled by the one-time orchestrator bootstrap turn; supply
+ * them all and that LLM call is skipped, so the run starts instantly.
+ */
+export interface LaunchConfig {
+  /** kebab run name; doubles as the journey phase id. Omitted → orchestrator invents one. */
+  name?: string;
+  goal: string;
+  roles: RoleSpec[];
+  /** Path (relative to the config file) to a context markdown doc — included whole. */
+  context?: string;
+  /** Path (relative to the config file) to a handshake/inbox doc — prepended as context. */
+  inbox?: string;
+  maxMinutes?: number;
+  teams?: boolean;
+  budgetMinutes?: number;
+  /** Let the orchestrator end the run itself when the goal is met (see RunState.autoComplete). */
+  autoComplete?: boolean;
+  /** First event handed to the orchestrator (defaults to "Begin the run."). */
+  kickoff?: string;
+  /** Explicit run directory; otherwise a timestamped dir under runs/. */
+  runDir?: string;
 }
 
 export async function readState(runDir: string): Promise<RunState> {

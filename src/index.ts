@@ -1,6 +1,7 @@
 import path from "node:path";
 import { parseArgs } from "node:util";
-import { resumeOrchestrator, runOrchestrator } from "./orchestrator.js";
+import { resumeOrchestrator, runFromConfig, runOrchestrator } from "./orchestrator.js";
+import { runJourney } from "./journey.js";
 import { runRole } from "./role.js";
 
 const { values } = parseArgs({
@@ -14,6 +15,10 @@ const { values } = parseArgs({
     resumed: { type: "boolean" },
     // Override + persist the checkpoint interval (minutes) when resuming.
     minutes: { type: "string" },
+    // Launch a single run from a JSON config, no wizard (UI still runs).
+    launch: { type: "string" },
+    // Run a templated multi-phase journey manifest with inter-phase handshakes.
+    journey: { type: "string" },
     // Disable the sticky top-of-console roles panel.
     "no-dashboard": { type: "boolean" },
   },
@@ -30,6 +35,10 @@ if (values.role) {
     process.exit(1);
   }
   await runRole(values.role, values.run, { resume: !!values.resumed });
+} else if (values.journey) {
+  await runJourney(path.resolve(values.journey));
+} else if (values.launch) {
+  await runFromConfig(path.resolve(values.launch));
 } else if (values.resume) {
   let minutes: number | undefined;
   if (values.minutes != null) {
