@@ -638,8 +638,13 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
       // done ends the run cleanly (same teardown as `exit`) instead of idling —
       // in a journey this triggers the handshake and advances to the next phase.
       if (autoComplete) {
-        const done = /\[\[PHASE-COMPLETE\]\]\s*(.*)/i.exec(extracted.rest);
-        if (done) {
+        // Only a DELIBERATE completion signal counts: the sentinel must START a
+        // line in the dispatch area AND the turn must carry no TO: blocks (a real
+        // completion dispatches nothing). This rejects false-positives where the
+        // orchestrator merely quotes or negates the sentinel while reasoning
+        // (e.g. "I will NOT emit [[PHASE-COMPLETE]] yet").
+        const done = /^[ \t]*\[\[PHASE-COMPLETE\]\][ \t]*(.*)$/im.exec(extracted.rest);
+        if (done && parseDispatch(extracted.rest).length === 0) {
           const reason = done[1].trim() || "goal achieved";
           console.log(`[orchestrator] phase complete — ${reason}`);
           await appendTranscript(transcript, "PHASE COMPLETE", reason);
@@ -930,16 +935,13 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   });
 
   // ---------- role-liveness watchdog (armed once all helpers exist) ----------
+  // Recovers a role whose PROCESS has died (crash) — re-spawn + re-issue. It does
+  // NOT act on a role that is alive but quiet: long inventory turns write files,
+  // not the outbox, so outbox-silence is normal work, not a hang. Killing a busy
+  // role destroys in-progress work (observed: a productive role re-spawned at 25
+  // min, derailing the run). A genuinely hung-but-alive role is rare and shows up
+  // as stalled filesystem activity — handle that by interjecting, not on a timer.
   const WATCHDOG_INTERVAL_MS = 60_000;
-  // How long a role may have an outstanding dispatch with NO outbox write before
-  // it's treated as hung. Generous by default so a legitimately long work cycle
-  // isn't killed mid-task; tune with MD_AGENT_ROLE_STALL (seconds). A crashed
-  // process is recovered immediately regardless (via its exit event).
-  const ROLE_STALL_MS = (() => {
-    const v = process.env.MD_AGENT_ROLE_STALL;
-    const n = v == null ? NaN : Number(v);
-    return Number.isFinite(n) && n > 0 ? n * 1000 : 25 * 60_000; // default 25 min
-  })();
 
   function armChildExit(name: string, child: ChildProcess): void {
     child.on("exit", () => {
@@ -1001,14 +1003,11 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
 
   watchdog = setInterval(() => {
     if (stopping) return;
-    const now = Date.now();
-    for (const [name, since] of pendingSince) {
+    // Backstop the exit-event recovery: re-spawn a role whose process is gone
+    // but slipped past its exit listener. Alive-but-quiet roles are left alone.
+    for (const name of pendingSince.keys()) {
       if (recovering.has(name) || teamOwner.has(name)) continue;
-      if (!(aliveByRole.get(name) ?? true)) {
-        void recoverRole(name, "its process is gone");
-      } else if (now - since > ROLE_STALL_MS) {
-        void recoverRole(name, "it went silent (no outbox)");
-      }
+      if (!(aliveByRole.get(name) ?? true)) void recoverRole(name, "its process is gone");
     }
   }, WATCHDOG_INTERVAL_MS);
 
