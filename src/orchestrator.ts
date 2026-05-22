@@ -1038,6 +1038,10 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   }
 
   async function dispatch(orchOutput: string): Promise<void> {
+    // The run is winding down (e.g. after [[PHASE-COMPLETE]] triggered stopAll):
+    // don't dispatch — and never hit the malformed-retry path, which would race
+    // the in-flight process.exit and could crash teardown.
+    if (stopping) return;
     // Sub-team dispatches run alongside (and instead of) TO: blocks.
     let startedTeam = false;
     if (teamsEnabled) {
