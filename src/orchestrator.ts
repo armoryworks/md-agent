@@ -1,5 +1,5 @@
 import path from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { spawn, ChildProcess } from "node:child_process";
 import readline from "node:readline";
@@ -935,13 +935,27 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   });
 
   // ---------- role-liveness watchdog (armed once all helpers exist) ----------
-  // Recovers a role whose PROCESS has died (crash) — re-spawn + re-issue. It does
-  // NOT act on a role that is alive but quiet: long inventory turns write files,
-  // not the outbox, so outbox-silence is normal work, not a hang. Killing a busy
-  // role destroys in-progress work (observed: a productive role re-spawned at 25
-  // min, derailing the run). A genuinely hung-but-alive role is rare and shows up
-  // as stalled filesystem activity — handle that by interjecting, not on a timer.
+  // Recovers a role that is dead OR hung, without false-killing a busy one:
+  //  - DEAD: the child process exited (crash) → re-spawn + re-issue.
+  //  - HUNG: alive but its claude turn produced NO stream output for
+  //    HEARTBEAT_STALL. The session beats a heartbeat file on every output chunk,
+  //    so a working turn beats every few seconds while a stuck one (e.g. a
+  //    Playwright call that never returns) goes silent. Outbox-silence is NOT the
+  //    signal — a long, productive turn is outbox-silent yet still beating, and
+  //    killing it on that basis derailed an earlier run.
   const WATCHDOG_INTERVAL_MS = 60_000;
+  const HEARTBEAT_STALL_MS = (() => {
+    const v = process.env.MD_AGENT_HEARTBEAT_STALL;
+    const n = v == null ? NaN : Number(v);
+    return Number.isFinite(n) && n > 0 ? n * 1000 : 6 * 60_000; // default 6 min
+  })();
+  const heartbeatMtime = (name: string): number => {
+    try {
+      return statSync(path.join(runDir, "sessions", `${name}.heartbeat`)).mtimeMs;
+    } catch {
+      return 0;
+    }
+  };
 
   function armChildExit(name: string, child: ChildProcess): void {
     child.on("exit", () => {
@@ -1003,11 +1017,20 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
 
   watchdog = setInterval(() => {
     if (stopping) return;
-    // Backstop the exit-event recovery: re-spawn a role whose process is gone
-    // but slipped past its exit listener. Alive-but-quiet roles are left alone.
-    for (const name of pendingSince.keys()) {
+    const now = Date.now();
+    for (const [name, since] of pendingSince) {
       if (recovering.has(name) || teamOwner.has(name)) continue;
-      if (!(aliveByRole.get(name) ?? true)) void recoverRole(name, "its process is gone");
+      if (!(aliveByRole.get(name) ?? true)) {
+        void recoverRole(name, "its process is gone");
+        continue;
+      }
+      // Alive: hung iff no stream output for HEARTBEAT_STALL. Floor the activity
+      // clock at the dispatch time so a just-dispatched role gets startup grace.
+      const lastActivity = Math.max(since, heartbeatMtime(name));
+      if (now - lastActivity > HEARTBEAT_STALL_MS) {
+        const mins = Math.round((now - lastActivity) / 60000);
+        void recoverRole(name, `produced no output for ~${mins} min (hung)`);
+      }
     }
   }, WATCHDOG_INTERVAL_MS);
 

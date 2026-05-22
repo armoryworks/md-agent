@@ -1,4 +1,5 @@
 import spawn from "cross-spawn";
+import fs from "node:fs";
 import type { Usage } from "./persist.js";
 
 /**
@@ -14,6 +15,8 @@ export class ClaudeSession {
   private model: string | null;
   private lastUsageData: Usage | null = null;
   private readonly stateless: boolean;
+  private readonly heartbeatPath: string | null;
+  private lastBeat = 0;
 
   constructor(
     opts: {
@@ -32,6 +35,12 @@ export class ClaudeSession {
        * bounded instead of growing with the conversation.
        */
       stateless?: boolean;
+      /**
+       * If set, the session "beats" this file (updates its mtime) on every chunk
+       * of stream output, so a watchdog can tell a working turn (recent beats)
+       * from a hung one (stale). Throttled internally.
+       */
+      heartbeatPath?: string;
     } = {}
   ) {
     this.systemPrompt = opts.systemPrompt ?? null;
@@ -39,6 +48,20 @@ export class ClaudeSession {
     this.onSessionId = opts.onSessionId ?? null;
     this.model = opts.model ?? null;
     this.stateless = opts.stateless ?? false;
+    this.heartbeatPath = opts.heartbeatPath ?? null;
+  }
+
+  /** Touch the heartbeat file (throttled) to signal this turn is alive + producing. */
+  private beat(): void {
+    if (!this.heartbeatPath) return;
+    const now = Date.now();
+    if (now - this.lastBeat < 1500) return;
+    this.lastBeat = now;
+    try {
+      fs.writeFileSync(this.heartbeatPath, String(now));
+    } catch {
+      // best-effort liveness signal; never break a turn over it
+    }
   }
 
   get id(): string | null {
@@ -55,6 +78,7 @@ export class ClaudeSession {
    * Captures session_id on first turn and reuses it on subsequent turns.
    */
   async send(prompt: string): Promise<string> {
+    this.beat(); // mark the turn started (covers the gap before first output)
     const args = ["-p", "--output-format", "stream-json", "--verbose"];
     if (this.model) {
       args.push("--model", this.model);
@@ -80,6 +104,7 @@ export class ClaudeSession {
       let assistantText = "";
 
       child.stdout!.on("data", (chunk: Buffer) => {
+        this.beat(); // stream output = the turn is actively working
         stdoutBuf += chunk.toString("utf8");
         let nl: number;
         while ((nl = stdoutBuf.indexOf("\n")) !== -1) {

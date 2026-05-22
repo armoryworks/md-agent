@@ -78,6 +78,7 @@ export async function runRole(
     resumeSessionId,
     onSessionId: (id) => void writeSessionId(runDir, roleName, id),
     model,
+    heartbeatPath: path.join(runDir, "sessions", `${roleName}.heartbeat`),
   });
 
   let busy = false;
