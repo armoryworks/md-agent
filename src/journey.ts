@@ -123,6 +123,22 @@ export async function runJourney(manifestPath: string): Promise<void> {
     await spawnPhase(cfgPath);
     console.log(`\n[journey] phase ${phase.id} ended.\n`);
 
+    // Crash guard: an empty ledger means the orchestrator never took a turn — the
+    // phase crashed at startup (commonly the claude CLI being unavailable or
+    // rate-limited). Do NOT advance, or the remaining phases cascade through as
+    // instant no-ops. Halt so the run can be resumed once the cause clears.
+    const ledgerFile = path.join(runDir, "ledger.md");
+    const ledgerLen = existsSync(ledgerFile) ? (await readFile(ledgerFile, "utf8")).trim().length : 0;
+    if (ledgerLen === 0) {
+      console.error(
+        `\n[journey] HALT: phase "${phase.id}" produced no ledger — its orchestrator never ran ` +
+          `(startup crash, often claude unavailable/rate-limited). Stopping instead of cascading ` +
+          `through the remaining phases as no-ops. Re-run the journey (or a from-<id> manifest) ` +
+          `once the cause clears.\n`
+      );
+      return;
+    }
+
     if (i < total - 1) {
       await writeHandshakes(dir, journey, i, runDir);
     }
