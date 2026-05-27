@@ -735,6 +735,9 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   // Escalation tiering (P1c): index into the `escalation` ladder; -1 = roles at
   // their configured tier (no rung climbed yet).
   let escalationIndex = -1;
+  // P3 Step 1: cumulative orchestrator cache accounting (hit-ratio measurement).
+  let orchCacheRead = 0;
+  let orchCacheable = 0;
 
   // ---------- role-liveness watchdog (state; logic armed lower down) ----------
   // A role child that crashes or hangs without writing its outbox would strand
@@ -771,6 +774,16 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
         const u = orch.lastUsage;
         if (u) {
           await recordUsage(runDir, "orchestrator", u);
+          // P3 Step 1: the orchestrator's cache-hit ratio. The system prompt is the
+          // only large static prefix; warm turns read it from cache, cold turns
+          // (sparse cadence > the ~5-min TTL) re-pay for it. This is the data that
+          // gates whether P3 Step 2 (explicit SDK caching) is worth the complexity.
+          const cacheable = u.cacheReadTokens + u.cacheCreationTokens + u.inputTokens;
+          const hitPct = cacheable > 0 ? Math.round((u.cacheReadTokens / cacheable) * 100) : 0;
+          orchCacheRead += u.cacheReadTokens;
+          orchCacheable += cacheable;
+          const cumPct = orchCacheable > 0 ? Math.round((orchCacheRead / orchCacheable) * 100) : 0;
+          console.log(`[orchestrator] turn $${u.costUsd.toFixed(4)} · cache ${hitPct}% hit (cum ${cumPct}%)`);
           try {
             dash.setCost((await readRunCost(runDir)).costUsd);
           } catch {
