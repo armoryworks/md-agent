@@ -1,6 +1,10 @@
 # Proposal: deterministic verification gate, payload choke-point, caching measurement, and `--from` finish-off
 
-_Status: draft · 2026-05-26 · author: design discussion_
+_Status: 2026-05-27 · **P0, P1b shipped to main**; P1, P1c, P2, P3 (Step 1 + opt-in
+Step 2), P4, and the multi-provider adapter (Gemini, configuration-based) **built on
+branch `feat/proposal-buildout`** — build-clean, smoke-passing, per-feature commits.
+Pending live validation: the Gemini success-JSON shape and the opt-in SDK transport
+(both built defensively, neither exercised against a live authed call yet)._
 
 Pulls the genuinely additive ideas out of the "C# hub/spoke" sketch and adapts
 them to md-agent **as it actually is** (Node/TS, one stateless orchestrator +

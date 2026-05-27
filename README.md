@@ -102,12 +102,25 @@ npm run dev -- --launch ./my-run.json
 ```
 
 The config is a `LaunchConfig` (see `src/persist.ts`): `goal`, `roles`
-(`{name?, description, model?}`), and optional `name`, `context` (path to a doc
-included whole), `inbox` (path to a handshake doc prepended as context),
-`maxMinutes`, `teams`, `budgetMinutes`, `autoComplete`, `kickoff`, `runDir`.
-Anything omitted (run name, per-role name/model) is filled by the one-time
-bootstrap turn; supply them all and that LLM call is **skipped**, so the run
-starts instantly.
+(`{name?, description, model?, provider?}`), and optional `name`, `context` (path
+to a doc included whole), `inbox` (path to a handshake doc prepended as context),
+`maxMinutes`, `teams`, `budgetMinutes`, `autoComplete`, `kickoff`, `runDir`,
+`verify`, `escalation`. Anything omitted (run name, per-role name/model) is filled
+by the one-time bootstrap turn; supply them all and that LLM call is **skipped**,
+so the run starts instantly.
+
+- **`roles[].provider`** — `"claude"` (default) or `"gemini"`. Configuration-based,
+  no autodetection. The orchestrator is always `claude`. Gemini seats are stateless
+  (no cross-turn session) — good for cheap/mechanical/self-contained role work. The
+  tier (`model`) maps per provider (claude opus/sonnet/haiku, gemini pro/flash/flash-lite).
+- **`verify`** (`{cmd, cwd?, maxFailures?, timeoutSec?}`) — deterministic completion
+  gate + circuit breaker. The orchestrator's `[[PHASE-COMPLETE]]` is honored only when
+  `cmd` exits 0; a non-zero exit feeds the output back to fix, and after `maxFailures`
+  (default 2) consecutive fails the run HALTs rather than looping. The LLM fixes; the
+  gate decides "done".
+- **`escalation`** (`ModelTier[]`, requires `verify`) — on repeated verify failure,
+  climb this tier ladder (re-spawning roles fresh on the stronger tier with the
+  failure context) before the circuit breaker HALTs.
 
 `autoComplete` lets the orchestrator **end the run itself** — once the goal is
 met, every role is idle, and all work is committed it emits `[[PHASE-COMPLETE]]`
@@ -183,6 +196,12 @@ orchestrator, which decides how to propagate it). At a checkpoint you can:
 | `MD_AGENT_HEARTBEAT_STALL` | `360`        | Seconds a role's claude turn may produce **no stream output** before the watchdog treats it as hung and re-spawns it (resuming its session) + re-issues the work. The session beats a heartbeat on every output chunk, so a busy turn stays fresh; only a genuinely stuck turn (e.g. a tool call that never returns) goes silent this long. A dead (crashed) role is recovered immediately via its exit event regardless. |
 | `MD_AGENT_TEAMS`          | off          | Pre-sets the **"allow sub-teams?"** setup-wizard prompt to "yes". Sub-teams are opt-in **per run** — the wizard asks at setup and the choice is stored in `state.json`. When allowed, the orchestrator may send two roles into a 1:1 **huddle** (`TEAM: <name> members=a,b`): they iterate directly and only one consolidated result returns to the orchestrator — the back-and-forth never enters its context. |
 | `MD_AGENT_TEAM_MAX_ROUNDS`| `12`         | Hard cap on huddle exchanges before the reporter is forced to summarize (runaway-loop backstop). Per-team override via `maxRounds=` in the `TEAM:` block. |
+| `MD_AGENT_ORCH_STALL`     | `600`        | Seconds the orchestrator may sit idle with **no role work pending and no turn** before the progress watchdog nudges it (and, after `MD_AGENT_ORCH_MAX_NUDGES`, HALTs). Catches the orchestrator-side deadlock the role watchdog can't see. |
+| `MD_AGENT_ORCH_HANG`      | `360`        | Seconds the orchestrator's own claude turn may produce no output before it's treated as hung mid-turn → HALT (no self-recovery, which would re-enter the stuck path). |
+| `MD_AGENT_ORCH_MAX_NUDGES`| `2`          | Consecutive progress-watchdog nudges with no advance before the run HALTs. |
+| `MD_AGENT_SKIP_PREFLIGHT` | unset        | Skip the launch-time agent readiness probe (P4). Set for offline / fast-iteration runs. |
+| `MD_AGENT_MAX_EVENT_CHARS`| `16000`      | Choke-point (P2): a role reply longer than this is spilled to `runs/<dir>/spill/<role>-<ts>.md` and the orchestrator gets a head excerpt + pointer. `0` disables. |
+| `MD_AGENT_ORCH_SDK`       | off          | Opt in (P3 Step 2) to back the **orchestrator** with the Anthropic SDK (`cache_control` on the static system prefix) instead of the `claude` CLI. Requires `ANTHROPIC_API_KEY`. Only worth it once the per-turn cache-hit log shows the CLI orchestrator running cold. |
 | `MD_AGENT_NO_DASHBOARD`   | unset        | Disable the sticky top-of-console status panel (also auto-disabled when stdout isn't a TTY). |
 | `NO_COLOR`                | unset        | Disable ANSI color in the dashboard. |
 
