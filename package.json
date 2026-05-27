@@ -10,7 +10,8 @@
     "dev": "tsx src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "tsx smoke-team.ts"
+    "test": "tsx smoke-team.ts",
+    "smoke:gemini": "tsx smoke-gemini.ts"
   },
   "keywords": [
     "claude",
