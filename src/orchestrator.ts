@@ -52,6 +52,20 @@ const CHECKPOINT_GRACE_MS = (() => {
 })();
 
 /**
+ * P2 — control-plane payload choke-point. A role reply longer than this many chars
+ * is spilled to a file and the orchestrator gets a head excerpt + pointer instead,
+ * so a misbehaving role can't blow up the orchestrator's resident context. The
+ * ≤250-word reporting discipline keeps normal replies well under this, so the
+ * default (16 KB) only catches pathological blobs. MD_AGENT_MAX_EVENT_CHARS=0 disables.
+ */
+const MAX_EVENT_CHARS = (() => {
+  const v = process.env.MD_AGENT_MAX_EVENT_CHARS;
+  if (v == null) return 16000;
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? n : 16000;
+})();
+
+/**
  * Default for the setup wizard's "allow sub-teams?" prompt. Sub-teams are opt-in
  * per run (chosen at setup and stored in state); MD_AGENT_TEAMS=1 just pre-sets
  * the prompt to "yes". When off, the orchestrator isn't told huddles exist.
@@ -1092,10 +1106,14 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
       dash.flow(r.name, "orch");
       pendingSince.delete(r.name); // role replied — clear its outstanding dispatch
       orchStallNudges = 0; // a role reply is progress — reset the stall escalation
-      await appendTranscript(transcript, `← ${r.name}`, content);
+      await appendTranscript(transcript, `← ${r.name}`, content); // full reply → permanent record
       await clearFile(outbox);
       printRoleReply(r.name, content);
-      const reply = await askOrch(`[from ${r.name}]\n${content}`);
+      // P2: choke-point. The transcript keeps the full reply, but a pathologically
+      // large one is spilled to a file and the orchestrator gets a head excerpt +
+      // pointer, so a misbehaving role can't blow up its resident context.
+      const event = await chokeEvent(r.name, content);
+      const reply = await askOrch(event);
       printOrchReply(reply);
       await dispatch(reply);
     });
@@ -1441,6 +1459,29 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
 
   function printRoleReply(roleName: string, content: string): void {
     console.log(`\n[← ${roleName}]\n${content}\n`);
+  }
+
+  /**
+   * P2 choke-point: build the event handed to the orchestrator for a role reply.
+   * Normal replies pass through verbatim; one over MAX_EVENT_CHARS is spilled to
+   * runs/<dir>/spill/<role>-<ts>.md and replaced with a head excerpt + pointer.
+   */
+  async function chokeEvent(roleName: string, content: string): Promise<string> {
+    if (MAX_EVENT_CHARS <= 0 || content.length <= MAX_EVENT_CHARS) {
+      return `[from ${roleName}]\n${content}`;
+    }
+    const spillDir = path.join(runDir, "spill");
+    await mkdir(spillDir, { recursive: true });
+    const spillFile = path.join(spillDir, `${roleName}-${Date.now()}.md`);
+    await writeFile(spillFile, content, "utf8");
+    const rel = path.relative(runDir, spillFile).split(path.sep).join("/");
+    console.warn(`[orchestrator] role "${roleName}" reply was ${content.length} chars — spilled to ${rel} (over MAX_EVENT_CHARS=${MAX_EVENT_CHARS})`);
+    return (
+      `[from ${roleName}] (reply was ${content.length} chars — over the ${MAX_EVENT_CHARS}-char limit; ` +
+      `full text spilled to ${rel}. Head excerpt:)\n` +
+      content.slice(0, 800) +
+      `\n…[truncated — read ${rel} for the rest, or ask ${roleName} for a tighter status]`
+    );
   }
 
   async function dispatch(orchOutput: string): Promise<void> {
