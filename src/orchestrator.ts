@@ -572,6 +572,13 @@ interface LoopCtx {
 async function runLoop(ctx: LoopCtx): Promise<void> {
   const { runDir, roles, transcript, orch, children, kickoff, teamsEnabled, budgetMinutes, autoComplete } = ctx;
 
+  // Give the orchestrator's own claude session a heartbeat file so the watchdog
+  // can tell a working turn (recent stream output) from one hung mid-turn. Roles
+  // get theirs at spawn; the orchestrator's run dir only exists by now, so set it
+  // here rather than at construction (the bootstrap turn ran before the run dir).
+  const orchHeartbeatFile = path.join(runDir, "sessions", "orchestrator.heartbeat");
+  orch.setHeartbeatPath(orchHeartbeatFile);
+
   // Session clock — drives the ⏱ time signal injected into every orchestrator
   // turn so the (stateless) orchestrator can scope work to the time available.
   const sessionStart = Date.now();
@@ -595,6 +602,15 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   // ledger, so dispatch knows a no-TO-block turn is legitimate vs. malformed.
   let orchLock: Promise<unknown> = Promise.resolve();
   let lastHadLedger = false;
+  // Orchestrator-progress watchdog state (logic armed with the role watchdog below).
+  // The orchestrator only advances when something calls askOrch (a role reply, user
+  // input, a team result, a checkpoint WITH input, or a watchdog nudge) — the
+  // checkpoint auto-continue deliberately does not. So a turn that ends with no
+  // dispatch and no role pending leaves nothing to re-invoke it: a silent deadlock.
+  // These track the orchestrator's own liveness so the watchdog can break it.
+  let orchBusy = false; // an askOrch turn is currently in flight
+  let lastOrchTurnAt = Date.now(); // ms of the last completed orchestrator turn
+  let orchStallNudges = 0; // consecutive progress nudges that produced no real progress
 
   // ---------- role-liveness watchdog (state; logic armed lower down) ----------
   // A role child that crashes or hangs without writing its outbox would strand
@@ -620,39 +636,48 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
    */
   async function askOrch(eventText: string): Promise<string> {
     const task = orchLock.then(async () => {
-      const ledger = await readLedger(runDir);
-      const reply = await orch.send(composeOrchPrompt(ledger, eventText));
-      const u = orch.lastUsage;
-      if (u) {
-        await recordUsage(runDir, "orchestrator", u);
-        try {
-          dash.setCost((await readRunCost(runDir)).costUsd);
-        } catch {
-          // Cost display is best-effort; never let it break the run.
+      orchBusy = true;
+      const endTurn = () => {
+        orchBusy = false;
+        lastOrchTurnAt = Date.now(); // a completed turn resets the idle clock
+      };
+      try {
+        const ledger = await readLedger(runDir);
+        const reply = await orch.send(composeOrchPrompt(ledger, eventText));
+        const u = orch.lastUsage;
+        if (u) {
+          await recordUsage(runDir, "orchestrator", u);
+          try {
+            dash.setCost((await readRunCost(runDir)).costUsd);
+          } catch {
+            // Cost display is best-effort; never let it break the run.
+          }
         }
-      }
-      const extracted = extractLedger(reply);
-      lastHadLedger = extracted.ledger !== null;
-      if (extracted.ledger !== null) await writeLedger(runDir, extracted.ledger);
-      // Self-termination: when allowed, an orchestrator that declares the goal
-      // done ends the run cleanly (same teardown as `exit`) instead of idling —
-      // in a journey this triggers the handshake and advances to the next phase.
-      if (autoComplete) {
-        // Only a DELIBERATE completion signal counts: the sentinel must START a
-        // line in the dispatch area AND the turn must carry no TO: blocks (a real
-        // completion dispatches nothing). This rejects false-positives where the
-        // orchestrator merely quotes or negates the sentinel while reasoning
-        // (e.g. "I will NOT emit [[PHASE-COMPLETE]] yet").
-        const done = /^[ \t]*\[\[PHASE-COMPLETE\]\][ \t]*(.*)$/im.exec(extracted.rest);
-        if (done && parseDispatch(extracted.rest).length === 0) {
-          const reason = done[1].trim() || "goal achieved";
-          console.log(`[orchestrator] phase complete — ${reason}`);
-          await appendTranscript(transcript, "PHASE COMPLETE", reason);
-          void stopAll(`phase complete: ${reason}`);
-          return ""; // winding down — nothing to dispatch this turn
+        const extracted = extractLedger(reply);
+        lastHadLedger = extracted.ledger !== null;
+        if (extracted.ledger !== null) await writeLedger(runDir, extracted.ledger);
+        // Self-termination: when allowed, an orchestrator that declares the goal
+        // done ends the run cleanly (same teardown as `exit`) instead of idling —
+        // in a journey this triggers the handshake and advances to the next phase.
+        if (autoComplete) {
+          // Only a DELIBERATE completion signal counts: the sentinel must START a
+          // line in the dispatch area AND the turn must carry no TO: blocks (a real
+          // completion dispatches nothing). This rejects false-positives where the
+          // orchestrator merely quotes or negates the sentinel while reasoning
+          // (e.g. "I will NOT emit [[PHASE-COMPLETE]] yet").
+          const done = /^[ \t]*\[\[PHASE-COMPLETE\]\][ \t]*(.*)$/im.exec(extracted.rest);
+          if (done && parseDispatch(extracted.rest).length === 0) {
+            const reason = done[1].trim() || "goal achieved";
+            console.log(`[orchestrator] phase complete — ${reason}`);
+            await appendTranscript(transcript, "PHASE COMPLETE", reason);
+            void stopAll(`phase complete: ${reason}`);
+            return ""; // winding down — nothing to dispatch this turn
+          }
         }
+        return extracted.rest;
+      } finally {
+        endTurn();
       }
-      return extracted.rest;
     });
     orchLock = task.then(
       () => undefined,
@@ -803,6 +828,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
 
       dash.flow(r.name, "orch");
       pendingSince.delete(r.name); // role replied — clear its outstanding dispatch
+      orchStallNudges = 0; // a role reply is progress — reset the stall escalation
       await appendTranscript(transcript, `← ${r.name}`, content);
       await clearFile(outbox);
       printRoleReply(r.name, content);
@@ -949,6 +975,22 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     const n = v == null ? NaN : Number(v);
     return Number.isFinite(n) && n > 0 ? n * 1000 : 6 * 60_000; // default 6 min
   })();
+  // ---- orchestrator-progress watchdog knobs (used by the orchestrator branch) ----
+  // Idle deadlock: no orchestrator turn for this long while no role work is pending.
+  const ORCH_STALL_MS = (() => {
+    const n = Number(process.env.MD_AGENT_ORCH_STALL);
+    return Number.isFinite(n) && n > 0 ? n * 1000 : 10 * 60_000; // default 10 min
+  })();
+  // Mid-turn hang: the orchestrator's own claude turn emits no output for this long.
+  const ORCH_HANG_MS = (() => {
+    const n = Number(process.env.MD_AGENT_ORCH_HANG);
+    return Number.isFinite(n) && n > 0 ? n * 1000 : 6 * 60_000; // default 6 min
+  })();
+  // Consecutive idle-deadlock nudges that fail to advance before the run HALTs.
+  const ORCH_MAX_NUDGES = (() => {
+    const n = Number(process.env.MD_AGENT_ORCH_MAX_NUDGES);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 2;
+  })();
   const heartbeatMtime = (name: string): number => {
     try {
       return statSync(path.join(runDir, "sessions", `${name}.heartbeat`)).mtimeMs;
@@ -1013,6 +1055,47 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     }
   }
 
+  // Force a stalled-but-idle orchestrator to take a turn: finalize if the goal is
+  // met, else dispatch the next step. A turn that dispatches or completes resets
+  // the nudge counter (see sendToRole / the outbox watcher); repeated no-progress
+  // nudges escalate to haltRun.
+  async function nudgeOrch(idleMs: number): Promise<void> {
+    if (stopping) return;
+    const mins = Math.round(idleMs / 60000);
+    console.warn(
+      `[watchdog] orchestrator idle ~${mins} min with no role work — nudging (#${orchStallNudges})`
+    );
+    dash.setStatus("watchdog: nudging orchestrator");
+    await appendTranscript(
+      transcript,
+      "WATCHDOG orchestrator",
+      `idle ~${mins} min, no outstanding role work — nudge #${orchStallNudges}`
+    );
+    const reply = await askOrch(
+      `[SYSTEM/progress-watchdog] No role work is outstanding and you have not taken a turn for ~${mins} min. ` +
+        `If the goal is met and all work is committed/written, FINALIZE now: emit your final ledger and, on its own line, [[PHASE-COMPLETE]] — with no TO: blocks. ` +
+        `Otherwise dispatch the next concrete step as a TO: block this turn.`
+    );
+    printOrchReply(reply);
+    await dispatch(reply);
+  }
+
+  // Deterministic circuit breaker: stop the run and leave a HALT marker the journey
+  // driver checks (so it stops instead of advancing). Recovery via another
+  // orchestrator turn is deliberately NOT attempted — if the orchestrator is the
+  // thing that's stuck, re-entering it would stall the same way.
+  async function haltRun(reason: string): Promise<void> {
+    if (stopping) return;
+    console.error(`\n[watchdog] HALT — ${reason}\n`);
+    await appendTranscript(transcript, "WATCHDOG HALT", reason);
+    try {
+      await writeFile(path.join(runDir, "HALT.txt"), reason + "\n", "utf8");
+    } catch {
+      // best-effort marker; stopAll still tears the run down
+    }
+    await stopAll(`halt: ${reason}`);
+  }
+
   for (const r of roles) armChildExit(r.name, childByRole.get(r.name)!);
 
   watchdog = setInterval(() => {
@@ -1030,6 +1113,43 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
       if (now - lastActivity > HEARTBEAT_STALL_MS) {
         const mins = Math.round((now - lastActivity) / 60000);
         void recoverRole(name, `produced no output for ~${mins} min (hung)`);
+      }
+    }
+
+    // ---- orchestrator / phase-progress watchdog ----
+    // The loop above only covers roles with outstanding work; nothing else watches
+    // the ORCHESTRATOR itself. Two failure modes to catch (the role watchdog and a
+    // checkpoint can't):
+    // Only for self-completing runs (journey phases). A non-autoComplete interactive
+    // run is *meant* to idle waiting for the user — nudging/halting that is wrong.
+    if (!autoComplete) return;
+    if (recovering.size > 0) return; // a role recovery is already driving askOrch
+    if (orchBusy) {
+      // A turn is in flight; only a genuine mid-turn hang is actionable. The session
+      // beats orchestrator.heartbeat on every chunk, so prolonged silence = stuck.
+      // Don't self-recover (that re-enters the stuck path) — HALT and surface it.
+      const beat = heartbeatMtime("orchestrator");
+      if (beat > 0 && now - beat > ORCH_HANG_MS) {
+        const mins = Math.round((now - beat) / 60000);
+        void haltRun(`orchestrator turn produced no output for ~${mins} min (hung mid-turn)`);
+      }
+      return;
+    }
+    // Idle: no turn in flight. If there's also no outstanding role work and no active
+    // huddle, nothing will re-invoke the orchestrator (the checkpoint auto-continue
+    // deliberately doesn't) — a silent deadlock. Force it forward, then escalate.
+    if (pendingSince.size === 0 && teamOwner.size === 0) {
+      const idle = now - lastOrchTurnAt;
+      if (idle > ORCH_STALL_MS) {
+        if (orchStallNudges < ORCH_MAX_NUDGES) {
+          orchStallNudges++;
+          void nudgeOrch(idle);
+        } else {
+          const mins = Math.round(idle / 60000);
+          void haltRun(
+            `no progress after ${ORCH_MAX_NUDGES} nudge(s) (~${mins} min idle, no role work, no completion)`
+          );
+        }
       }
     }
   }, WATCHDOG_INTERVAL_MS);
@@ -1134,6 +1254,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     await appendTranscript(transcript, `→ ${b.role}`, b.body);
     await safeWrite(path.join(runDir, "inbox", `${b.role}.txt`), b.body);
     pendingSince.set(b.role, Date.now()); // mark outstanding for the liveness watchdog
+    orchStallNudges = 0; // a real dispatch is progress — reset the stall escalation
   }
 }
 

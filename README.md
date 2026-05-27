@@ -136,6 +136,19 @@ outcome materially changes a later one. Before each non-first phase (unless
 manifest live, then `Enter` to launch, `skip`, or `exit`. A worked example lives
 in `E:/dev/forge-journey/`.
 
+**Resuming a journey:** `--from <phase-id>` starts at that phase and skips the ones
+before it (e.g. after a crash, a HALT, or a partial prior run):
+
+```bash
+npm run dev -- --journey ./journey.json --from 05-some-phase
+```
+
+Caveat: `--from` only inherits upstream **context** if those earlier phases
+**actually ran before** — their handshakes live in `phases/<id>/INBOX.md` and
+persist. Using `--from` to skip into a phase on a journey whose earlier phases never
+ran means the resumed phase starts with **no upstream handshake**. (`--from` has no
+effect without `--journey`.)
+
 ### Time budget (scoping)
 
 Setup and resume also ask for an optional **soft time budget** (minutes). When

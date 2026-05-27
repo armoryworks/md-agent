@@ -51,7 +51,7 @@ export interface Journey {
  * Before each non-first phase it pauses so you can read the handshake and edit
  * the manifest / phase folder; the launch picks up your edits live.
  */
-export async function runJourney(manifestPath: string): Promise<void> {
+export async function runJourney(manifestPath: string, opts: { from?: string } = {}): Promise<void> {
   const manifestAbs = path.resolve(manifestPath);
   const dir = path.dirname(manifestAbs);
 
@@ -80,7 +80,27 @@ export async function runJourney(manifestPath: string): Promise<void> {
     await mkdir(path.join(dir, "phases", p.id), { recursive: true });
   }
 
-  for (let i = 0; i < total; i++) {
+  // --from <phase-id>: resume past already-completed phases (e.g. after a crash
+  // or a partial prior run) instead of re-treading them. Handshakes the skipped
+  // phases wrote into phases/<id>/INBOX.md persist (dir is the manifest dir), so
+  // the resumed phase still inherits its upstream context.
+  let startIndex = 0;
+  if (opts.from) {
+    startIndex = journey.phases.findIndex((p) => p.id === opts.from);
+    if (startIndex < 0) {
+      throw new Error(
+        `--from "${opts.from}" not found. Phase ids: ${journey.phases.map((p) => p.id).join(", ")}`,
+      );
+    }
+    if (startIndex > 0) {
+      console.log(
+        `[journey] resuming from "${opts.from}" — skipping ${startIndex} completed phase(s): ` +
+          `${journey.phases.slice(0, startIndex).map((p) => p.id).join(", ")}\n`,
+      );
+    }
+  }
+
+  for (let i = startIndex; i < total; i++) {
     journey = await readManifest(); // live re-read so manifest edits take effect
     let phase = journey.phases[i];
 
@@ -133,8 +153,21 @@ export async function runJourney(manifestPath: string): Promise<void> {
       console.error(
         `\n[journey] HALT: phase "${phase.id}" produced no ledger — its orchestrator never ran ` +
           `(startup crash, often claude unavailable/rate-limited). Stopping instead of cascading ` +
-          `through the remaining phases as no-ops. Re-run the journey (or a from-<id> manifest) ` +
-          `once the cause clears.\n`
+          `through the remaining phases as no-ops. Re-run with ` +
+          `--journey <manifest> --from ${phase.id} once the cause clears.\n`
+      );
+      return;
+    }
+
+    // Progress-watchdog HALT: the orchestrator left a HALT marker (a phase that
+    // stalled or hung and couldn't self-advance). Stop the journey rather than
+    // advancing past unfinished work — resume the phase with --from once addressed.
+    const haltFile = path.join(runDir, "HALT.txt");
+    if (existsSync(haltFile)) {
+      const why = (await readFile(haltFile, "utf8")).trim();
+      console.error(
+        `\n[journey] HALT: phase "${phase.id}" stopped by the progress watchdog — ${why}\n` +
+          `  Address it, then resume with --journey <manifest> --from ${phase.id}.\n`
       );
       return;
     }

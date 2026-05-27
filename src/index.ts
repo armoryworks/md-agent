@@ -19,6 +19,8 @@ const { values } = parseArgs({
     launch: { type: "string" },
     // Run a templated multi-phase journey manifest with inter-phase handshakes.
     journey: { type: "string" },
+    // Resume a journey at a given phase id, skipping already-completed phases.
+    from: { type: "string" },
     // Disable the sticky top-of-console roles panel.
     "no-dashboard": { type: "boolean" },
   },
@@ -29,6 +31,11 @@ if (values["no-dashboard"]) {
   process.env.MD_AGENT_NO_DASHBOARD = "1";
 }
 
+// --from only resolves inside a --journey run; passed anywhere else it's a no-op.
+if (values.from && !values.journey) {
+  console.warn(`[md-agent] --from "${values.from}" has no effect without --journey; ignoring.`);
+}
+
 if (values.role) {
   if (!values.run) {
     console.error("Error: --role requires --run <run-dir>");
@@ -36,7 +43,7 @@ if (values.role) {
   }
   await runRole(values.role, values.run, { resume: !!values.resumed });
 } else if (values.journey) {
-  await runJourney(path.resolve(values.journey));
+  await runJourney(path.resolve(values.journey), { from: values.from });
 } else if (values.launch) {
   await runFromConfig(path.resolve(values.launch));
 } else if (values.resume) {

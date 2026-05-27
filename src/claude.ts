@@ -15,7 +15,7 @@ export class ClaudeSession {
   private model: string | null;
   private lastUsageData: Usage | null = null;
   private readonly stateless: boolean;
-  private readonly heartbeatPath: string | null;
+  private heartbeatPath: string | null;
   private lastBeat = 0;
 
   constructor(
@@ -64,6 +64,11 @@ export class ClaudeSession {
     }
   }
 
+  /** Set/override the heartbeat file after construction (e.g. once the run dir exists). */
+  setHeartbeatPath(p: string): void {
+    this.heartbeatPath = p;
+  }
+
   get id(): string | null {
     return this.sessionId;
   }
@@ -102,10 +107,13 @@ export class ClaudeSession {
       let stdoutBuf = "";
       let stderrBuf = "";
       let assistantText = "";
+      let rawStdout = ""; // full stdout, kept so a non-zero exit can surface the real error
 
       child.stdout!.on("data", (chunk: Buffer) => {
         this.beat(); // stream output = the turn is actively working
-        stdoutBuf += chunk.toString("utf8");
+        const text = chunk.toString("utf8");
+        rawStdout += text;
+        stdoutBuf += text;
         let nl: number;
         while ((nl = stdoutBuf.indexOf("\n")) !== -1) {
           const line = stdoutBuf.slice(0, nl).trim();
@@ -152,7 +160,22 @@ export class ClaudeSession {
         if (code === 0) {
           resolve(assistantText.trim());
         } else {
-          reject(new Error(`claude exited ${code}: ${stderrBuf}`));
+          // The claude CLI in stream-json mode writes its error to STDOUT, and
+          // the line-parser above silently drops non-JSON lines — so stderr is
+          // usually empty on failure. Surface both raw streams (tailed) so the
+          // actual cause (bad model, auth, usage limit, arg error) is visible.
+          const tail = (s: string) => {
+            const t = s.trim();
+            return t.length > 1500 ? "…" + t.slice(-1500) : t || "(empty)";
+          };
+          reject(
+            new Error(
+              `claude exited ${code}\n` +
+                `  args: ${args.join(" ")}\n` +
+                `  stderr: ${tail(stderrBuf)}\n` +
+                `  stdout: ${tail(rawStdout)}`,
+            ),
+          );
         }
       });
 
