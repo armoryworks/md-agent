@@ -18,10 +18,13 @@ import { Dashboard } from "./dashboard.js";
 import { parseTeamBlocks, runHuddle, type TeamIO, type TeamResult, type TeamSpec } from "./team.js";
 import {
   DEFAULT_TIER,
+  GEMINI_MODEL_IDS,
   type LaunchConfig,
   MODEL_IDS,
   type ModelTier,
+  normalizeProvider,
   normalizeTier,
+  type Provider,
   readLedger,
   readRunCost,
   readState,
@@ -64,6 +67,94 @@ function resolveOrchModel(): string | undefined {
   const m = process.env.MD_AGENT_ORCH_MODEL?.trim();
   if (!m) return undefined;
   return m in MODEL_IDS ? MODEL_IDS[m as ModelTier] : m;
+}
+
+/**
+ * P4 — launch-time readiness probe. Spawn the agent CLI with a trivial prompt and a
+ * short timeout; success = present + authed + responsive (not rate-limited). Returns
+ * a reason on failure. Configuration-based: callers only probe the providers the run
+ * is configured to use — there is no system scan.
+ */
+function probeProvider(p: Provider): Promise<{ ok: boolean; detail: string }> {
+  const cmd = p === "gemini" ? "gemini" : "claude";
+  const args =
+    p === "gemini"
+      ? ["-p", "reply with: ok", "-o", "json", "-y", "--skip-trust", "-m", GEMINI_MODEL_IDS.haiku]
+      : ["-p", "reply with: ok", "--output-format", "json"];
+  const timeoutMs = 60_000;
+  return new Promise((resolve) => {
+    let out = "";
+    let err = "";
+    let child: ChildProcess;
+    try {
+      child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    } catch (e) {
+      resolve({ ok: false, detail: `could not spawn "${cmd}": ${(e as Error).message}` });
+      return;
+    }
+    const tail = (s: string) => {
+      const t = s.trim().replace(/\s+/g, " ");
+      return t.length > 300 ? "…" + t.slice(-300) : t;
+    };
+    const timer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        // already gone
+      }
+      resolve({ ok: false, detail: `no response within ${timeoutMs / 1000}s (timeout / rate limit?)` });
+    }, timeoutMs);
+    child.stdout?.on("data", (b: Buffer) => (out += b.toString("utf8")));
+    child.stderr?.on("data", (b: Buffer) => (err += b.toString("utf8")));
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      resolve({ ok: false, detail: `"${cmd}" not found or failed to start (${(e as NodeJS.ErrnoException).code ?? e.message})` });
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      // gemini -o json can emit an error object; treat that as a failure regardless of code.
+      if (p === "gemini" && /"error"\s*:/.test(out)) {
+        resolve({ ok: false, detail: tail(out) || tail(err) });
+        return;
+      }
+      if (code === 0) {
+        resolve({ ok: true, detail: "" });
+        return;
+      }
+      resolve({ ok: false, detail: tail(err) || tail(out) || `exit ${code}` });
+    });
+  });
+}
+
+/**
+ * Probe every agent CLI the run will use (orchestrator's claude + any role
+ * providers), failing fast with a readable reason rather than an empty-ledger crash
+ * mid-run. Skip with MD_AGENT_SKIP_PREFLIGHT=1 (offline / fast iteration).
+ */
+async function preflightAgents(providers: Set<Provider>): Promise<void> {
+  if (/^(1|true|on|yes)$/i.test(process.env.MD_AGENT_SKIP_PREFLIGHT ?? "")) {
+    console.log("[preflight] skipped (MD_AGENT_SKIP_PREFLIGHT)");
+    return;
+  }
+  for (const p of providers) {
+    process.stdout.write(`[preflight] probing ${p}… `);
+    const { ok, detail } = await probeProvider(p);
+    if (!ok) {
+      console.log("FAIL");
+      throw new Error(
+        `[preflight] agent "${p}" is not ready — ${detail}\n` +
+          `Fix it (auth / install / rate limit) or set MD_AGENT_SKIP_PREFLIGHT=1 to bypass.`
+      );
+    }
+    console.log("ok");
+  }
+}
+
+/** Collect the distinct providers a run uses: the orchestrator (claude) + role providers. */
+function runProviders(roles: RoleSpec[]): Set<Provider> {
+  const set = new Set<Provider>(["claude"]); // orchestrator is pinned to claude
+  for (const r of roles) set.add(normalizeProvider(r.provider));
+  return set;
 }
 
 /** Build the orchestrator's system prompt from the run's goal/roles/context. */
@@ -254,6 +345,9 @@ export interface RunSetup {
  */
 export async function launchRun(setup: RunSetup): Promise<void> {
   const roles = setup.roles.map((r) => ({ ...r }));
+  // P4: fail fast if a configured agent isn't authed/responsive — before the
+  // bootstrap turn, the run dir, or any role spawn.
+  await preflightAgents(runProviders(roles));
   const orchSystem = buildOrchSystem({
     goal: setup.goal,
     roles,
@@ -524,6 +618,9 @@ export async function resumeOrchestrator(
   }
 
   await appendTranscript(transcript, "RUN RESUMED", `Resumed from ${runDir}`);
+
+  // P4: probe agents before re-spawning roles (resume is a common post-rate-limit path).
+  await preflightAgents(runProviders(roles));
 
   const children = roles.map((r) => spawnRole(r.name, runDir, true));
 
