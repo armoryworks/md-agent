@@ -17,11 +17,15 @@ The four pillars of the source sketch mapped onto md-agent:
 | 3. Deterministic supervisor / circuit breaker | **Real gap** | **P1** — verification gate + failure cap |
 | 4. Provider prompt caching | Complementary half md-agent leaves on the table | **P3** — measure first, then decide |
 
-Plus two additions that are **not** from the C# sketch:
+Plus three additions that are **not** from the C# sketch:
 - **P0** — finish the `--from` work already in the working tree.
 - **P1b** — an **orchestrator / phase-progress watchdog** for an orchestrator-side
   stall found in the phase-38 gating run. Most urgent of all of these: it can
   silently stall the catch-up run the same way.
+- **P4** — a **launch-time agent preflight** (fail-fast readiness probe), from the
+  multi-provider/Gemini-delegation thread but deliberately scoped down: no
+  autodetection, no provider registry — just verify the agent a run already uses
+  is actually authed and responsive before it commits.
 
 A second augmentation batch (Aider search/replace, semantic routing, escalation
 tiering, YAML minification) was also evaluated. Only **escalation tiering** earned
@@ -344,6 +348,56 @@ shows a cold cache is actually costing money.
 
 ---
 
+## P4 — Launch-time agent preflight (fail-fast readiness probe)
+
+_Scoped down from the "alternate-agent detection" discussion: **no autodetection,
+no capability/provider registry, no fallback ladder** — just verify the agent(s)
+a run is **already configured to use** are actually ready, before it commits._
+
+**Problem.** md-agent assumes the `claude` CLI is "installed and authenticated"
+but never checks. When that assumption breaks at runtime — token/rate-limit
+exhaustion (the phase-35 crash), or an unauthenticated/untrusted CLI (the whole
+Gemini auth + workspace-trust saga) — it surfaces as an **empty-ledger crash
+mid-run**. The journey crash-guard catches it only *after* spawning a doomed phase
+and reports "no ledger," not "your CLI isn't authed." At initial launch there's no
+check at all.
+
+**Design — a trivial readiness probe of the configured agent(s).** Before a run
+commits, probe each provider/model the run will actually use (today: `claude`;
+later: whatever a role's `provider` field names — but **only those**, never a
+system scan):
+- **Present** — the CLI resolves on PATH.
+- **Responsive + authed** — a trivial round-trip succeeds (e.g. `claude -p "ok"`
+  with a short timeout). One cheap turn confirms auth + not-rate-limited at once.
+  Reuse the `claude.ts` non-zero-exit error surfacing so the message is the real
+  cause (auth / rate limit / bad model), not a generic failure.
+- **Fail fast** — on failure, abort the launch (or, in a journey, HALT *before*
+  the phase) with an actionable message —
+  `"claude present but the test call failed: <tailed error> — check auth / rate limit"`
+  — instead of an empty-ledger crash.
+
+**Where it hooks.**
+- `launchRun` (`src/orchestrator.ts`): probe the orchestrator's provider/model
+  (and each role's, once multi-provider) before spawning roles / entering the loop.
+- Journey driver (`src/journey.ts`): a per-phase probe right before `spawnPhase`.
+  This is the high-value placement — it turns the mid-journey rate-limit case
+  (phase 35) into a clean pre-phase HALT (`"agent not responsive — resume with
+  --from <phase> once it clears"`) *instead of* spawning a phase that dies with an
+  empty ledger. Strictly better than, and complementary to, the existing
+  empty-ledger crash-guard.
+
+**Explicitly out of scope** (deferred to keep this minimal): scanning the system
+for alternate agents; capability-based seat resolution; provider fallback ladders.
+The probe only checks the agent(s) the run is already configured to use. The larger
+"capability-resolved, auth-probed, fallback-laddered provider registry" can be
+revisited once the `GeminiSession` adapter exists and there's more than one agent
+to resolve between.
+
+**Cost / escape hatch.** One trivial probe per provider per launch (and per phase,
+if enabled) — cheap. Add `MD_AGENT_SKIP_PREFLIGHT=1` for offline / fast-iteration runs.
+
+---
+
 ## Considered & declined (second augmentation batch)
 
 - **Worker "Aider-style" search/replace blocks.** Premise — a worker emits a whole
@@ -372,9 +426,10 @@ shows a cold cache is actually costing money.
 1. **P0** — commit `--from` + the `claude.ts` error-surfacing fix, rebuild `dist/`, fix HALT message, document the `--from` caveat. (small)
 2. **P1b** — orchestrator / phase-progress watchdog. **Do this before the catch-up run** — it just cost ~50 min and a 16-phase run can hit it repeatedly. Contained: same watchdog block + an orchestrator heartbeat. (small–medium)
 3. **P1** — verification gate + circuit breaker. (the headline; medium)
-4. **P1c** — escalation tiering (extends P1; verifiable roles only). (small–medium)
-5. **P3 Step 1** — surface cache-hit ratio (one dashboard line). (small)
-6. **P2** — payload choke-point. (small safety rail)
-7. **P3 Step 2** — SDK orchestrator caching, *only if* Step 1 shows a cold cache. (larger; data-gated)
+4. **P4** — launch-time agent preflight (fail-fast readiness probe). Small, provider-agnostic; would've caught both the token-exhaustion crash and the Gemini auth/trust saga at launch. (small)
+5. **P1c** — escalation tiering (extends P1; verifiable roles only). (small–medium)
+6. **P3 Step 1** — surface cache-hit ratio (one dashboard line). (small)
+7. **P2** — payload choke-point. (small safety rail)
+8. **P3 Step 2** — SDK orchestrator caching, *only if* Step 1 shows a cold cache. (larger; data-gated)
 
 P0 + P1b are the "before you launch the catch-up" bundle; commit them together.
