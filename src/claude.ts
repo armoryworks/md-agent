@@ -3,12 +3,28 @@ import fs from "node:fs";
 import type { Usage } from "./persist.js";
 
 /**
+ * The provider-agnostic seat interface the orchestrator and roles drive. Both
+ * ClaudeSession and GeminiSession implement it, so the run loop never cares which
+ * agent CLI is behind a seat (configuration-based; see RoleSpec.provider).
+ */
+export interface AgentSession {
+  /** Send one turn; resolve with the assistant's text reply. */
+  send(prompt: string): Promise<string>;
+  /** Token usage + cost of the most recent send(), or null before any turn. */
+  readonly lastUsage: Usage | null;
+  /** Persisted session id when the provider supports resume; else null. */
+  readonly id: string | null;
+  /** Point the liveness heartbeat at a file (set once the run dir exists). */
+  setHeartbeatPath(p: string): void;
+}
+
+/**
  * A persistent (session-resumed) claude conversation.
  * First call starts a new session and prepends the system prompt to the
  * user's first message; subsequent calls use --resume <session-id> so the
  * session keeps that context.
  */
-export class ClaudeSession {
+export class ClaudeSession implements AgentSession {
   private sessionId: string | null = null;
   private systemPrompt: string | null;
   private onSessionId: ((id: string) => void) | null;

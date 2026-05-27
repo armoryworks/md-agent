@@ -1,6 +1,7 @@
 import path from "node:path";
 import { readFile } from "node:fs/promises";
-import { ClaudeSession } from "./claude.js";
+import { ClaudeSession, type AgentSession } from "./claude.js";
+import { GeminiSession } from "./gemini.js";
 import {
   clearFile,
   isSafeWord,
@@ -10,10 +11,11 @@ import {
 } from "./ipc.js";
 import {
   buildRoleHistory,
+  normalizeProvider,
   readSessionId,
   readState,
   recordUsage,
-  resolveModel,
+  resolveModelFor,
   writeSessionId,
 } from "./persist.js";
 
@@ -46,40 +48,49 @@ export async function runRole(
     .filter(Boolean)
     .join("\n");
 
-  // Resume strategy: reattach to the stored claude session if we have one;
-  // otherwise replay this role's prior turns from the transcript as context.
-  let resumeSessionId: string | undefined;
-  if (opts.resume) {
-    const stored = await readSessionId(runDir, roleName);
-    if (stored) {
-      resumeSessionId = stored;
-      console.log(`[role:${roleName}] resuming claude session ${stored}`);
-    } else {
-      const history = buildRoleHistory(await readFile(transcript, "utf8"), roleName);
-      if (history) {
-        systemPrompt +=
-          "\n\nThis run is resuming and your previous session could not be reattached. " +
-          "Here is the prior conversation between you and the orchestrator, oldest first. " +
-          "Treat it as your memory of what has already happened, then continue from where it leaves off.\n\n" +
-          "----- PRIOR CONVERSATION -----\n" +
-          history +
-          "\n----- END PRIOR CONVERSATION -----";
-        console.log(`[role:${roleName}] no stored session; replaying transcript history`);
+  const provider = normalizeProvider(me.provider);
+  const model = resolveModelFor(provider, me.model);
+  const heartbeatPath = path.join(runDir, "sessions", `${roleName}.heartbeat`);
+  console.log(`[role:${roleName}] provider: ${provider}, model: ${model}`);
+
+  let session: AgentSession;
+  if (provider === "gemini") {
+    // Gemini is stateless (v1): no session reattach; the system prompt is re-sent
+    // each turn. A resumed gemini role simply starts fresh from its mandate.
+    session = new GeminiSession({ systemPrompt, model, heartbeatPath });
+  } else {
+    // claude — stateful: reattach to the stored session if we have one, otherwise
+    // replay this role's prior turns from the transcript as context.
+    let resumeSessionId: string | undefined;
+    if (opts.resume) {
+      const stored = await readSessionId(runDir, roleName);
+      if (stored) {
+        resumeSessionId = stored;
+        console.log(`[role:${roleName}] resuming claude session ${stored}`);
       } else {
-        console.log(`[role:${roleName}] no stored session and no prior history; starting fresh`);
+        const history = buildRoleHistory(await readFile(transcript, "utf8"), roleName);
+        if (history) {
+          systemPrompt +=
+            "\n\nThis run is resuming and your previous session could not be reattached. " +
+            "Here is the prior conversation between you and the orchestrator, oldest first. " +
+            "Treat it as your memory of what has already happened, then continue from where it leaves off.\n\n" +
+            "----- PRIOR CONVERSATION -----\n" +
+            history +
+            "\n----- END PRIOR CONVERSATION -----";
+          console.log(`[role:${roleName}] no stored session; replaying transcript history`);
+        } else {
+          console.log(`[role:${roleName}] no stored session and no prior history; starting fresh`);
+        }
       }
     }
+    session = new ClaudeSession({
+      systemPrompt,
+      resumeSessionId,
+      onSessionId: (id) => void writeSessionId(runDir, roleName, id),
+      model,
+      heartbeatPath,
+    });
   }
-
-  const model = resolveModel(me.model);
-  console.log(`[role:${roleName}] model: ${model}`);
-  const session = new ClaudeSession({
-    systemPrompt,
-    resumeSessionId,
-    onSessionId: (id) => void writeSessionId(runDir, roleName, id),
-    model,
-    heartbeatPath: path.join(runDir, "sessions", `${roleName}.heartbeat`),
-  });
 
   let busy = false;
   let stopped = false;
