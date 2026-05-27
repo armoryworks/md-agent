@@ -331,6 +331,8 @@ export interface RunSetup {
   runDir?: string;
   /** Deterministic completion gate + circuit breaker (P1). */
   verify?: VerifySpec;
+  /** Escalation tiering ladder (P1c); requires verify. */
+  escalation?: ModelTier[];
 }
 
 /**
@@ -450,6 +452,7 @@ export async function launchRun(setup: RunSetup): Promise<void> {
     budgetMinutes: setup.budgetMinutes,
     autoComplete: setup.autoComplete,
     verify: setup.verify,
+    escalation: setup.escalation,
   };
   await writeFile(path.join(runDir, "state.json"), JSON.stringify(state, null, 2), "utf8");
 
@@ -495,6 +498,7 @@ export async function launchRun(setup: RunSetup): Promise<void> {
     budgetMinutes: state.budgetMinutes,
     autoComplete: state.autoComplete ?? false,
     verify: state.verify,
+    escalation: state.escalation,
   });
 }
 
@@ -540,6 +544,7 @@ export async function runFromConfig(configPath: string): Promise<void> {
     kickoff: cfg.kickoff,
     runDir: cfg.runDir,
     verify: cfg.verify,
+    escalation: cfg.escalation,
   });
 }
 
@@ -638,6 +643,7 @@ export async function resumeOrchestrator(
     budgetMinutes: resumeBudgetMinutes,
     autoComplete: state.autoComplete ?? false,
     verify: state.verify,
+    escalation: state.escalation,
   });
 }
 
@@ -672,11 +678,13 @@ interface LoopCtx {
   autoComplete: boolean;
   /** Deterministic completion gate + circuit breaker (P1); undefined = no gate. */
   verify?: VerifySpec;
+  /** Escalation tiering ladder (P1c); requires verify. */
+  escalation?: ModelTier[];
 }
 
 /** Shared event loop used by both fresh runs and resumes. */
 async function runLoop(ctx: LoopCtx): Promise<void> {
-  const { runDir, roles, transcript, orch, children, kickoff, teamsEnabled, budgetMinutes, autoComplete, verify } = ctx;
+  const { runDir, roles, transcript, orch, children, kickoff, teamsEnabled, budgetMinutes, autoComplete, verify, escalation } = ctx;
 
   // Give the orchestrator's own claude session a heartbeat file so the watchdog
   // can tell a working turn (recent stream output) from one hung mid-turn. Roles
@@ -724,6 +732,9 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   // circuit-breaker counter.
   let verifying = false;
   let verifyFailures = 0;
+  // Escalation tiering (P1c): index into the `escalation` ladder; -1 = roles at
+  // their configured tier (no rung climbed yet).
+  let escalationIndex = -1;
 
   // ---------- role-liveness watchdog (state; logic armed lower down) ----------
   // A role child that crashes or hangs without writing its outbox would strand
@@ -839,6 +850,33 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   }
 
   /**
+   * Escalation tiering (P1c): bump every role to `tier` and re-spawn them FRESH, so
+   * the upgraded team retries the failing work with a stronger model. Each role keeps
+   * its provider; the tier resolves per provider at role startup.
+   */
+  async function escalateRolesTo(tier: ModelTier): Promise<void> {
+    for (const r of roles) r.model = tier;
+    await updateState(runDir, { roles });
+    for (const r of roles) {
+      const old = childByRole.get(r.name);
+      if (old && old.exitCode === null && !old.killed) {
+        try {
+          old.kill();
+        } catch {
+          // already gone
+        }
+      }
+      await clearFile(path.join(runDir, "inbox", `${r.name}.txt`));
+      await clearFile(path.join(runDir, "outbox", `${r.name}.txt`));
+      pendingSince.delete(r.name);
+      const child = spawnRole(r.name, runDir, false); // fresh session on the new tier
+      childByRole.set(r.name, child);
+      aliveByRole.set(r.name, true);
+      armChildExit(r.name, child);
+    }
+  }
+
+  /**
    * Gate a requested completion on the deterministic verify command (P1). On pass,
    * the run completes (same teardown as un-gated). On fail, feed the output back so
    * the agents fix it; after `maxFailures` consecutive fails, HALT (circuit breaker).
@@ -867,8 +905,26 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     console.warn(`[verify] FAIL (${verifyFailures}/${max} tolerated) — exit non-zero`);
     await appendTranscript(transcript, `VERIFY FAIL ${verifyFailures}`, result.tail);
     if (verifyFailures > max) {
+      // Escalation tiering (P1c): before HALTing, climb the tier ladder once —
+      // upgrade the whole team and retry. HALT only when the ladder is exhausted.
+      if (escalation && escalation.length > 0 && escalationIndex < escalation.length - 1) {
+        escalationIndex++;
+        const tier = escalation[escalationIndex];
+        console.warn(`[verify] escalating roles → ${tier} (rung ${escalationIndex + 1}/${escalation.length}) and retrying`);
+        await appendTranscript(transcript, "ESCALATION", `verify failed ${verifyFailures}× — roles upgraded to ${tier}; retrying`);
+        await escalateRolesTo(tier);
+        verifyFailures = 0;
+        const reply = await askOrch(
+          `[SYSTEM/escalation] \`${verify.cmd}\` still failing after ${max} attempts. The team has been upgraded to model tier "${tier}" (fresh sessions) — re-attempt the failing work, then it will be re-verified. Last output:\n${result.tail}`
+        );
+        printOrchReply(reply);
+        await dispatch(reply);
+        return;
+      }
       await haltRun(
-        `verification failed ${verifyFailures}× (> ${max} tolerated; cmd: ${verify.cmd}) — last output:\n${result.tail}`
+        `verification failed ${verifyFailures}× (> ${max} tolerated; cmd: ${verify.cmd})` +
+          `${escalation && escalation.length ? ` — escalation ladder [${escalation.join(" → ")}] exhausted` : ""}` +
+          ` — last output:\n${result.tail}`
       );
       return;
     }

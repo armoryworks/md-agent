@@ -102,6 +102,15 @@ export interface RunState {
   autoComplete?: boolean;
   /** Deterministic completion gate + circuit breaker (P1). Undefined = no gate. */
   verify?: VerifySpec;
+  /**
+   * Escalation tiering (P1c) — requires `verify`. An ordered model-tier ladder the
+   * circuit breaker climbs on repeated verify failure: instead of HALTing at
+   * `verify.maxFailures`, bump every role to the next tier (fresh, stronger
+   * sessions) and retry with the failure context; HALT only once the ladder is
+   * exhausted. e.g. ["sonnet","opus"]. Each role keeps its provider; tiers map per
+   * provider (claude haiku/sonnet/opus, gemini flash-lite/flash/pro).
+   */
+  escalation?: ModelTier[];
 }
 
 /**
@@ -131,6 +140,8 @@ export interface LaunchConfig {
   runDir?: string;
   /** Deterministic completion gate + circuit breaker (P1). */
   verify?: VerifySpec;
+  /** Escalation tiering ladder (P1c); requires verify. See RunState.escalation. */
+  escalation?: ModelTier[];
 }
 
 export async function readState(runDir: string): Promise<RunState> {

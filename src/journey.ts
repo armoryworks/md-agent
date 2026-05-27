@@ -38,6 +38,8 @@ export interface JourneyPhase {
   autoComplete?: boolean;
   /** Deterministic completion gate + circuit breaker (P1) for this phase. */
   verify?: VerifySpec;
+  /** Escalation tiering ladder (P1c); requires verify. See RunState.escalation. */
+  escalation?: ModelTier[];
 }
 
 /** A templated multi-phase run, authored up front before phase 0 executes. */
@@ -138,6 +140,7 @@ export async function runJourney(manifestPath: string, opts: { from?: string } =
       // a human typing `exit` at every phase end. Opt out per phase with false.
       autoComplete: phase.autoComplete ?? true,
       verify: phase.verify,
+      escalation: phase.escalation,
       runDir,
     };
     const cfgPath = path.join(dir, ".phase.launch.json");
