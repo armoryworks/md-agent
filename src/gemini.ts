@@ -68,16 +68,30 @@ export class GeminiSession implements AgentSession {
     this.beat();
     // Stateless: prepend the system prompt every turn (there is no resumed context).
     const fullPrompt = this.systemPrompt ? `${this.systemPrompt}\n\n---\n\n${prompt}` : prompt;
-    const args = ["-p", fullPrompt, "-o", "json", "-y", "--skip-trust"];
+    // Deliver the prompt on STDIN, not as a -p arg. A multiline arg gets mangled by
+    // the Windows gemini.ps1/.cmd shim (newlines split the command, dropping the rest
+    // of the prompt AND trailing flags like -o json). gemini appends the -p value to
+    // stdin input, so `-p ""` + stdin = the full prompt; flags stay newline-free args.
+    const args = ["-p", "", "-o", "json", "-y", "--skip-trust"];
     if (this.model) args.push("-m", this.model);
+    const timeoutMs = 5 * 60_000;
 
     return new Promise<string>((resolve, reject) => {
-      const child = spawn("gemini", args, { stdio: ["ignore", "pipe", "pipe"] });
+      const child = spawn("gemini", args, { stdio: ["pipe", "pipe", "pipe"] });
       let out = "";
       let err = "";
       // `gemini -o json` emits its result at the END (not streamed), so beat on a
       // timer while the call runs to keep the liveness watchdog satisfied.
       const beatTimer = setInterval(() => this.beat(), 3000);
+      const timer = setTimeout(() => {
+        try {
+          child.kill();
+        } catch {
+          // already gone
+        }
+        clearInterval(beatTimer);
+        reject(new Error(`gemini timed out after ${timeoutMs / 1000}s`));
+      }, timeoutMs);
       child.stdout!.on("data", (b: Buffer) => {
         this.beat();
         out += b.toString("utf8");
@@ -87,10 +101,12 @@ export class GeminiSession implements AgentSession {
       });
       child.on("error", (e) => {
         clearInterval(beatTimer);
+        clearTimeout(timer);
         reject(e);
       });
       child.on("exit", (code) => {
         clearInterval(beatTimer);
+        clearTimeout(timer);
         const obj = this.parseJson(out);
         if (obj && typeof obj.session_id === "string") this.sessionId = obj.session_id;
         if (obj && obj.error) {
@@ -119,6 +135,8 @@ export class GeminiSession implements AgentSession {
         this.lastUsageData = this.extractUsage(obj);
         resolve(this.extractText(obj, out).trim());
       });
+      child.stdin!.write(fullPrompt);
+      child.stdin!.end();
     });
   }
 
@@ -144,7 +162,12 @@ export class GeminiSession implements AgentSession {
     return raw.trim();
   }
 
-  /** Best-effort token usage from `stats`; cost is not computed for Gemini in v1. */
+  /**
+   * Best-effort token usage from `stats.models.<model>.tokens`
+   * ({ input, prompt, candidates, total, cached, … }); cost is not computed for
+   * Gemini in v1. `candidates` is sometimes 0 even on a reply, so fall back to
+   * total - input for output.
+   */
   private extractUsage(obj: Record<string, any> | null): Usage {
     const zero: Usage = {
       inputTokens: 0,
@@ -153,17 +176,20 @@ export class GeminiSession implements AgentSession {
       cacheCreationTokens: 0,
       costUsd: 0,
     };
-    const stats = obj?.stats;
-    if (!stats) return zero;
+    const models = obj?.stats?.models;
+    if (!models) return zero;
     let input = 0;
     let output = 0;
-    const models = stats.models ?? stats.model ?? {};
+    let cached = 0;
     for (const k of Object.keys(models)) {
-      const m = (models as Record<string, any>)[k];
-      const t = m?.tokens ?? m ?? {};
-      input += Number(t?.prompt ?? t?.input ?? t?.inputTokens ?? 0) || 0;
-      output += Number(t?.candidates ?? t?.output ?? t?.outputTokens ?? 0) || 0;
+      const t = (models as Record<string, any>)[k]?.tokens ?? {};
+      const inp = Number(t.input ?? t.prompt ?? 0) || 0;
+      const cand = Number(t.candidates ?? t.output ?? 0) || 0;
+      const total = Number(t.total ?? 0) || 0;
+      input += inp;
+      output += cand > 0 ? cand : Math.max(0, total - inp);
+      cached += Number(t.cached ?? 0) || 0;
     }
-    return { ...zero, inputTokens: input, outputTokens: output };
+    return { ...zero, inputTokens: input, outputTokens: output, cacheReadTokens: cached };
   }
 }
