@@ -4,7 +4,8 @@ import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { spawn, ChildProcess } from "node:child_process";
 import readline from "node:readline";
 import { confirm, editor, number } from "@inquirer/prompts";
-import { ClaudeSession } from "./claude.js";
+import { ClaudeSession, type AgentSession } from "./claude.js";
+import { AnthropicSdkSession } from "./anthropic-sdk.js";
 import {
   appendTranscript,
   clearFile,
@@ -169,6 +170,21 @@ function runProviders(roles: RoleSpec[]): Set<Provider> {
   const set = new Set<Provider>(["claude"]); // orchestrator is pinned to claude
   for (const r of roles) set.add(normalizeProvider(r.provider));
   return set;
+}
+
+/**
+ * Build the orchestrator session. Default: the stateless `claude` CLI. Opt in to the
+ * Anthropic SDK transport with cache_control on the static system prefix (P3 Step 2)
+ * via MD_AGENT_ORCH_SDK=1 — only worth enabling once Step 1's cache-hit metric shows
+ * the CLI orchestrator is running cold. Requires ANTHROPIC_API_KEY when enabled.
+ */
+function createOrchSession(systemPrompt: string): AgentSession {
+  if (/^(1|true|on|yes)$/i.test(process.env.MD_AGENT_ORCH_SDK ?? "")) {
+    const model = resolveOrchModel() ?? MODEL_IDS.sonnet;
+    console.log(`[orchestrator] SDK transport (P3 Step 2; cache_control) on model ${model}`);
+    return new AnthropicSdkSession({ systemPrompt, model });
+  }
+  return new ClaudeSession({ systemPrompt, model: resolveOrchModel(), stateless: true });
 }
 
 /** Build the orchestrator's system prompt from the run's goal/roles/context. */
@@ -374,11 +390,7 @@ export async function launchRun(setup: RunSetup): Promise<void> {
   // The orchestrator runs STATELESS: each turn it gets the ledger + new event,
   // so resident context stays bounded and cache expiry between slow role turns
   // becomes cheap rather than catastrophic.
-  const orch = new ClaudeSession({
-    systemPrompt: orchSystem,
-    model: resolveOrchModel(),
-    stateless: true,
-  });
+  const orch = createOrchSession(orchSystem);
 
   let runName = setup.runName ? slug(setup.runName) : "";
   const needBootstrap =
@@ -622,11 +634,7 @@ export async function resumeOrchestrator(
   } else {
     console.log("[orchestrator] no ledger (pre-ledger run) — starting memory fresh");
   }
-  const orch = new ClaudeSession({
-    systemPrompt: buildOrchSystem(state),
-    model: resolveOrchModel(),
-    stateless: true,
-  });
+  const orch = createOrchSession(buildOrchSystem(state));
 
   // Clear stale inbox/outbox so freshly spawned roles don't reprocess leftover
   // content (notably the `exit` sentinel written on a prior clean shutdown).
@@ -680,7 +688,7 @@ interface LoopCtx {
   runDir: string;
   roles: RoleSpec[];
   transcript: string;
-  orch: ClaudeSession;
+  orch: AgentSession;
   children: ChildProcess[];
   checkpointMinutes: number;
   kickoff: string;
