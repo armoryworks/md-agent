@@ -29,6 +29,7 @@ import {
   type RoleSpec,
   type RunState,
   updateState,
+  type VerifySpec,
   writeLedger,
 } from "./persist.js";
 
@@ -237,6 +238,8 @@ export interface RunSetup {
   kickoff?: string;
   /** Explicit run directory (journey phases pin this); else timestamped under runs/. */
   runDir?: string;
+  /** Deterministic completion gate + circuit breaker (P1). */
+  verify?: VerifySpec;
 }
 
 /**
@@ -352,6 +355,7 @@ export async function launchRun(setup: RunSetup): Promise<void> {
     teams: setup.teams,
     budgetMinutes: setup.budgetMinutes,
     autoComplete: setup.autoComplete,
+    verify: setup.verify,
   };
   await writeFile(path.join(runDir, "state.json"), JSON.stringify(state, null, 2), "utf8");
 
@@ -396,6 +400,7 @@ export async function launchRun(setup: RunSetup): Promise<void> {
     teamsEnabled: state.teams ?? false,
     budgetMinutes: state.budgetMinutes,
     autoComplete: state.autoComplete ?? false,
+    verify: state.verify,
   });
 }
 
@@ -440,6 +445,7 @@ export async function runFromConfig(configPath: string): Promise<void> {
     runName: cfg.name,
     kickoff: cfg.kickoff,
     runDir: cfg.runDir,
+    verify: cfg.verify,
   });
 }
 
@@ -534,6 +540,7 @@ export async function resumeOrchestrator(
     teamsEnabled: state.teams ?? false,
     budgetMinutes: resumeBudgetMinutes,
     autoComplete: state.autoComplete ?? false,
+    verify: state.verify,
   });
 }
 
@@ -566,11 +573,13 @@ interface LoopCtx {
   budgetMinutes?: number;
   /** Allow the orchestrator to self-terminate via [[PHASE-COMPLETE]] when the goal is met. */
   autoComplete: boolean;
+  /** Deterministic completion gate + circuit breaker (P1); undefined = no gate. */
+  verify?: VerifySpec;
 }
 
 /** Shared event loop used by both fresh runs and resumes. */
 async function runLoop(ctx: LoopCtx): Promise<void> {
-  const { runDir, roles, transcript, orch, children, kickoff, teamsEnabled, budgetMinutes, autoComplete } = ctx;
+  const { runDir, roles, transcript, orch, children, kickoff, teamsEnabled, budgetMinutes, autoComplete, verify } = ctx;
 
   // Give the orchestrator's own claude session a heartbeat file so the watchdog
   // can tell a working turn (recent stream output) from one hung mid-turn. Roles
@@ -611,6 +620,13 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   let orchBusy = false; // an askOrch turn is currently in flight
   let lastOrchTurnAt = Date.now(); // ms of the last completed orchestrator turn
   let orchStallNudges = 0; // consecutive progress nudges that produced no real progress
+
+  // Verification gate (P1) state. `verifying` means a verify command is running
+  // after a requested completion — treated like a busy turn by the watchdog so a
+  // slow build isn't mistaken for an idle deadlock. `verifyFailures` is the
+  // circuit-breaker counter.
+  let verifying = false;
+  let verifyFailures = 0;
 
   // ---------- role-liveness watchdog (state; logic armed lower down) ----------
   // A role child that crashes or hangs without writing its outbox would strand
@@ -668,6 +684,14 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
           const done = /^[ \t]*\[\[PHASE-COMPLETE\]\][ \t]*(.*)$/im.exec(extracted.rest);
           if (done && parseDispatch(extracted.rest).length === 0) {
             const reason = done[1].trim() || "goal achieved";
+            if (verify) {
+              // Gate the completion on the deterministic check. Run it OUTSIDE this
+              // locked turn (it can take minutes): blocking the lock would stall all
+              // other turns and look like a hung orchestrator turn to the watchdog.
+              console.log(`[orchestrator] completion requested — verifying before finishing`);
+              void handleGatedCompletion(reason);
+              return ""; // verify decides what happens next
+            }
             console.log(`[orchestrator] phase complete — ${reason}`);
             await appendTranscript(transcript, "PHASE COMPLETE", reason);
             void stopAll(`phase complete: ${reason}`);
@@ -684,6 +708,79 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
       () => undefined
     );
     return task;
+  }
+
+  /** Run the verify command (P1) off the orchestrator lock; resolves pass + tailed output. */
+  function runVerify(spec: VerifySpec): Promise<{ ok: boolean; tail: string }> {
+    const timeoutSec = spec.timeoutSec ?? 600;
+    return new Promise((resolve) => {
+      let out = "";
+      const cap = (b: Buffer) => {
+        out += b.toString("utf8");
+        if (out.length > 8000) out = out.slice(-8000); // keep a bounded tail
+      };
+      const child = spawn(spec.cmd, { shell: true, cwd: spec.cwd ?? process.cwd() });
+      child.stdout?.on("data", cap);
+      child.stderr?.on("data", cap);
+      const timer = setTimeout(() => {
+        try {
+          child.kill();
+        } catch {
+          // already gone
+        }
+        resolve({ ok: false, tail: `(timed out after ${timeoutSec}s)\n` + out.slice(-1500) });
+      }, timeoutSec * 1000);
+      child.on("exit", (code) => {
+        clearTimeout(timer);
+        resolve({ ok: code === 0, tail: out.slice(-1500) || "(no output)" });
+      });
+      child.on("error", (e) => {
+        clearTimeout(timer);
+        resolve({ ok: false, tail: `(could not run verify cmd: ${(e as Error).message})` });
+      });
+    });
+  }
+
+  /**
+   * Gate a requested completion on the deterministic verify command (P1). On pass,
+   * the run completes (same teardown as un-gated). On fail, feed the output back so
+   * the agents fix it; after `maxFailures` consecutive fails, HALT (circuit breaker).
+   * The LLM does the fixing — this decides "done" and breaks the loop deterministically.
+   */
+  async function handleGatedCompletion(reason: string): Promise<void> {
+    if (!verify || stopping || verifying) return;
+    verifying = true;
+    dash.setStatus(`verifying: ${verify.cmd}`);
+    console.log(`[verify] running: ${verify.cmd}`);
+    let result: { ok: boolean; tail: string };
+    try {
+      result = await runVerify(verify);
+    } finally {
+      verifying = false;
+    }
+    if (stopping) return;
+    if (result.ok) {
+      console.log(`[verify] PASS — completing`);
+      await appendTranscript(transcript, "VERIFY PASS", `${verify.cmd}\n\n${reason}`);
+      void stopAll(`phase complete (verified): ${reason}`);
+      return;
+    }
+    verifyFailures++;
+    const max = verify.maxFailures ?? 2;
+    console.warn(`[verify] FAIL (${verifyFailures}/${max} tolerated) — exit non-zero`);
+    await appendTranscript(transcript, `VERIFY FAIL ${verifyFailures}`, result.tail);
+    if (verifyFailures > max) {
+      await haltRun(
+        `verification failed ${verifyFailures}× (> ${max} tolerated; cmd: ${verify.cmd}) — last output:\n${result.tail}`
+      );
+      return;
+    }
+    const reply = await askOrch(
+      `[SYSTEM/verify] Completion BLOCKED — \`${verify.cmd}\` exited non-zero (attempt ${verifyFailures}/${max}). ` +
+        `Do NOT emit [[PHASE-COMPLETE]] again until it passes — fix the cause first, then it will be re-checked. Output tail:\n${result.tail}`
+    );
+    printOrchReply(reply);
+    await dispatch(reply);
   }
 
   function composeOrchPrompt(ledger: string, eventText: string): string {
@@ -1123,6 +1220,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     // Only for self-completing runs (journey phases). A non-autoComplete interactive
     // run is *meant* to idle waiting for the user — nudging/halting that is wrong.
     if (!autoComplete) return;
+    if (verifying) return; // a verify command is running (P1) — not an idle deadlock
     if (recovering.size > 0) return; // a role recovery is already driving askOrch
     if (orchBusy) {
       // A turn is in flight; only a genuine mid-turn hang is actionable. The session

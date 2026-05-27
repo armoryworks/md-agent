@@ -24,11 +24,57 @@ export function resolveModel(tier?: string): string {
   return MODEL_IDS[normalizeTier(tier)];
 }
 
+/**
+ * Backing agent CLI for a seat. Configuration-based (set per role / via env) —
+ * md-agent never auto-detects what's installed. "claude" is the default and the
+ * only fully-featured provider (stateful sessions); "gemini" is a stateless
+ * provider (see GeminiSession).
+ */
+export type Provider = "claude" | "gemini";
+export const DEFAULT_PROVIDER: Provider = "claude";
+
+export function normalizeProvider(p?: string): Provider {
+  return p === "gemini" ? "gemini" : "claude";
+}
+
+/** Concrete gemini model ids per tier — the cheap/mid/strong rungs. */
+export const GEMINI_MODEL_IDS: Record<ModelTier, string> = {
+  opus: "gemini-2.5-pro",
+  sonnet: "gemini-2.5-flash",
+  haiku: "gemini-2.5-flash-lite",
+};
+
+/** Resolve (provider, tier) to a concrete model id for that provider. */
+export function resolveModelFor(provider: Provider, tier?: string): string {
+  const t = normalizeTier(tier);
+  return provider === "gemini" ? GEMINI_MODEL_IDS[t] : MODEL_IDS[t];
+}
+
 export interface RoleSpec {
   name: string;
   description: string;
   /** Model tier the orchestrator selected for this role. */
   model?: ModelTier;
+  /** Backing agent CLI for this role. Default "claude". Configuration-based. */
+  provider?: Provider;
+}
+
+/**
+ * A deterministic completion gate (P1). When set on a run/phase, the orchestrator's
+ * `[[PHASE-COMPLETE]]` is not honored until `cmd` exits 0; a non-zero exit feeds the
+ * output back so the agents fix it, and after `maxFailures` consecutive failures the
+ * run HALTs (circuit breaker) rather than looping. LLM does the fixing; this decides
+ * "done" and breaks the loop deterministically.
+ */
+export interface VerifySpec {
+  /** Shell command; exit 0 = pass. e.g. "npm test", "dotnet build". */
+  cmd: string;
+  /** Working dir for the command (the target repo, NOT the run dir). Default: process.cwd(). */
+  cwd?: string;
+  /** Consecutive failures tolerated before the run HALTs. Default 2. */
+  maxFailures?: number;
+  /** Seconds before the verify command is killed and counted as a failure. Default 600. */
+  timeoutSec?: number;
 }
 
 export interface RunState {
@@ -54,6 +100,8 @@ export interface RunState {
    * interactive wizard leaves it off (the run stays alive for more work).
    */
   autoComplete?: boolean;
+  /** Deterministic completion gate + circuit breaker (P1). Undefined = no gate. */
+  verify?: VerifySpec;
 }
 
 /**
@@ -81,6 +129,8 @@ export interface LaunchConfig {
   kickoff?: string;
   /** Explicit run directory; otherwise a timestamped dir under runs/. */
   runDir?: string;
+  /** Deterministic completion gate + circuit breaker (P1). */
+  verify?: VerifySpec;
 }
 
 export async function readState(runDir: string): Promise<RunState> {
