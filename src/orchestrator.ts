@@ -2,6 +2,7 @@ import path from "node:path";
 import { existsSync, statSync } from "node:fs";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { spawn, ChildProcess } from "node:child_process";
+import crossSpawn from "cross-spawn";
 import readline from "node:readline";
 import { confirm, editor, number } from "@inquirer/prompts";
 import { ClaudeSession, type AgentSession } from "./claude.js";
@@ -102,7 +103,9 @@ function probeProvider(p: Provider): Promise<{ ok: boolean; detail: string }> {
     let err = "";
     let child: ChildProcess;
     try {
-      child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+      // cross-spawn (not node's spawn) so the agent CLI resolves on Windows,
+      // where it's a `claude.cmd`/`gemini.cmd` shim that bare spawn won't find.
+      child = crossSpawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
     } catch (e) {
       resolve({ ok: false, detail: `could not spawn "${cmd}": ${(e as Error).message}` });
       return;
