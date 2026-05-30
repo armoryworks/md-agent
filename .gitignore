@@ -12,6 +12,7 @@ runs/
 # (These were inputs/outputs of a specific engagement, not tooling docs.)
 docs/ba/
 docs/domain/
+docs/writing/
 
 # Environment / secrets
 .env
