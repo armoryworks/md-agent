@@ -1,6 +1,6 @@
 {
   "name": "@armoryworks/md-agent",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Orchestrate a team of Claude Code agents against a single goal via file-based IPC.",
   "main": "dist/index.js",
   "bin": {

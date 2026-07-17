@@ -4,7 +4,7 @@ import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { spawn, ChildProcess } from "node:child_process";
 import crossSpawn from "cross-spawn";
 import readline from "node:readline";
-import { confirm, editor, number } from "@inquirer/prompts";
+import { confirm, input, number } from "@inquirer/prompts";
 import { ClaudeSession, type AgentSession } from "./claude.js";
 import {
   appendTranscript,
@@ -325,10 +325,12 @@ export async function runOrchestrator(opts: {
 
   const roles: RoleSpec[] = [];
   for (let i = 1; i <= n!; i++) {
-    const desc = await editor({
-      message: `Describe role ${i} (optionally start with "Name: description")`,
-      waitForUserInput: false,
-      validate: (v) => v.trim().length > 0 || "Required",
+    // Plain inline prompts — an editor() here silently dropped users into
+    // $EDITOR (vim, empty buffer, no instructions), which is a wall for anyone
+    // who doesn't live in vim. Long answers just wrap; predictability wins.
+    const desc = await input({
+      message: `Role ${i} — describe it (optionally "name: description"):`,
+      validate: (v) => v.trim().length > 0 || "Required — e.g. \"backend: owns the API and DB migrations\"",
     });
     const m = /^([A-Za-z][\w-]*)\s*:\s*([\s\S]+)$/.exec(desc.trim());
     if (m) {
@@ -338,9 +340,8 @@ export async function runOrchestrator(opts: {
     }
   }
 
-  const goal = await editor({
+  const goal = await input({
     message: "What is the overall goal?",
-    waitForUserInput: false,
     validate: (v) => v.trim().length > 0 || "Required",
   });
 
