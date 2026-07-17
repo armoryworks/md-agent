@@ -1,6 +1,8 @@
+#!/usr/bin/env node
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { resumeOrchestrator, runFromConfig, runOrchestrator } from "./orchestrator.js";
+import { runHomeSafe } from "./home.js";
 import { runJourney } from "./journey.js";
 import { runRole } from "./role.js";
 
@@ -57,6 +59,11 @@ if (values.role) {
     minutes = n;
   }
   await resumeOrchestrator(path.resolve(values.resume), { minutes });
-} else {
+} else if (values.context) {
+  // --context jumps straight into the wizard with a seed doc (back-compat).
   await runOrchestrator({ contextFile: values.context });
+} else {
+  // Bare `md-agent`: the home screen — discover prior runs, resume, combine,
+  // shelve, or start fresh. All flags above remain for scripting.
+  await runHomeSafe();
 }

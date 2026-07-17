@@ -24,9 +24,15 @@ plain files on disk, so a run is fully inspectable and resumable.
 ```
 
 - The **orchestrator** is **stateless**: it has no growing conversation. Each turn
-  it is handed its **ledger** (`ledger.md` — its externalized memory) plus one new
-  event, and it replies with an updated ledger + zero or more `TO: <role>` blocks.
-  Each block is written to that role's `inbox/<role>.txt`.
+  it is handed its **ledger** (`ledger.md` — its externalized memory) plus the new
+  event(s), and it replies with an updated ledger + zero or more `TO: <role>` blocks.
+  Each block is written to that role's `inbox/<role>.txt`. Events that arrive while
+  a turn is in flight (e.g. several roles finishing at once) are **coalesced into a
+  single next turn** — one ledger in, one ledger out — instead of paying a full
+  turn per event; the orchestrator also plans against the joint state rather than
+  arrival order. Multiple `TO:` blocks for the same role merge into one message,
+  and an unconsumed inbox is appended to, never overwritten, so dispatches can't
+  be silently lost.
 - Each **role** is a child process watching its inbox. It runs its own (stateful)
   `claude` session and writes the reply to `outbox/<role>.txt`.
 - The orchestrator watches every outbox; each reply becomes the next event it
@@ -66,15 +72,32 @@ npm run build     # tsc → dist/
 
 ## Usage
 
-Start a new run (interactive setup wizard — number of roles, each role's
-description, the goal, the checkpoint interval, whether to allow sub-teams, and
-an optional soft time budget):
+Just run it:
 
 ```bash
-npm run dev                      # via tsx, no build step
-# or, after `npm run build`:
-node dist/index.js
+md-agent                         # after npm install -g (or npx md-agent)
+npm run dev                      # from a checkout, via tsx
 ```
+
+A bare `md-agent` opens the **home screen**: it scans `./runs` for prior work
+and presents it — standalone runs and journeys (grouped with their phases),
+each with its goal, spend, recency, and a `[HALTED]` flag where the watchdog
+stopped one. From there:
+
+- **Resume a run** — pick up where it left off (roles reattach to their sessions).
+- **Start something new** — the setup wizard (roles, goal, checkpoint interval,
+  sub-teams, soft time budget).
+- **Combine past runs into a new run** — select one or more prior runs; a new
+  run is seeded with their goals + final ledgers + pointers to their artifacts,
+  and the wizard takes it from there.
+- **Mark runs complete** — shelve finished work. Completed runs disappear from
+  every home-screen menu but nothing is deleted: the screen prints where each
+  run's outputs live (`transcript.md`, `ledger.md`, cost files, huddle logs)
+  and how to restore it — delete the `"completedAt"` line from that run's
+  `state.json`. Completing a journey shelves all its phase runs and reminds you
+  how to resume mid-journey later (`--journey <manifest> --from <phase-id>`).
+
+Everything below remains available as flags for scripting and automation.
 
 Seed the run with a context document (you'll be prompted to select sections or
 code blocks from it):
@@ -102,7 +125,7 @@ npm run dev -- --launch ./my-run.json
 ```
 
 The config is a `LaunchConfig` (see `src/persist.ts`): `goal`, `roles`
-(`{name?, description, model?, provider?}`), and optional `name`, `context` (path
+(`{name?, description, model?, provider?, permissionMode?}`), and optional `name`, `context` (path
 to a doc included whole), `inbox` (path to a handshake doc prepended as context),
 `maxMinutes`, `teams`, `budgetMinutes`, `autoComplete`, `kickoff`, `runDir`,
 `verify`, `escalation`. Anything omitted (run name, per-role name/model) is filled
@@ -119,8 +142,11 @@ so the run starts instantly.
   (default 2) consecutive fails the run HALTs rather than looping. The LLM fixes; the
   gate decides "done".
 - **`escalation`** (`ModelTier[]`, requires `verify`) — on repeated verify failure,
-  climb this tier ladder (re-spawning roles fresh on the stronger tier with the
-  failure context) before the circuit breaker HALTs.
+  climb this tier ladder (re-spawning roles on the stronger tier — resuming their
+  sessions by default, with the failing verify output attached verbatim to the next
+  dispatch) before the circuit breaker HALTs.
+- **`roles[].permissionMode`** — claude CLI `--permission-mode` for that role's
+  session (e.g. `acceptEdits`). See `MD_AGENT_ROLE_PERMISSION_MODE` below.
 
 `autoComplete` lets the orchestrator **end the run itself** — once the goal is
 met, every role is idle, and all work is committed it emits `[[PHASE-COMPLETE]]`
@@ -146,8 +172,7 @@ the next phase's folder (`phases/<id>/INBOX.md`), which that phase reads as
 context on launch. A handshake may target **multiple downstream phases** when the
 outcome materially changes a later one. Before each non-first phase (unless
 `pauseBefore: false`) the driver pauses so you can read the handshake and edit the
-manifest live, then `Enter` to launch, `skip`, or `exit`. A worked example lives
-in `E:/dev/forge-journey/`.
+manifest live, then `Enter` to launch, `skip`, or `exit`.
 
 **Resuming a journey:** `--from <phase-id>` starts at that phase and skips the ones
 before it (e.g. after a crash, a HALT, or a partial prior run):
@@ -201,7 +226,10 @@ orchestrator, which decides how to propagate it). At a checkpoint you can:
 | `MD_AGENT_ORCH_MAX_NUDGES`| `2`          | Consecutive progress-watchdog nudges with no advance before the run HALTs. |
 | `MD_AGENT_SKIP_PREFLIGHT` | unset        | Skip the launch-time agent readiness probe (P4). Set for offline / fast-iteration runs. |
 | `MD_AGENT_MAX_EVENT_CHARS`| `16000`      | Choke-point (P2): a role reply longer than this is spilled to `runs/<dir>/spill/<role>-<ts>.md` and the orchestrator gets a head excerpt + pointer. `0` disables. |
-| `MD_AGENT_ORCH_SDK`       | off          | Opt in (P3 Step 2) to back the **orchestrator** with the Anthropic SDK (`cache_control` on the static system prefix) instead of the `claude` CLI. Requires `ANTHROPIC_API_KEY`. Only worth it once the per-turn cache-hit log shows the CLI orchestrator running cold. |
+| `MD_AGENT_MAX_LEDGER_CHARS`| `8000`      | Ledger size target. The ledger is re-read AND re-emitted every turn, so bloat taxes every later turn twice; past this size the next turn carries a deterministic compact-now nudge. `0` disables. |
+| `MD_AGENT_ROLE_RECYCLE_TURNS` | off      | Opt-in role-session recycling: after N turns, a claude-backed role writes a ≤300-word handoff note and is reseeded as a fresh session (mandate + handoff), bounding its ever-growing resident context on long runs. The per-turn `ctx ~Nk tok · cache X% hit` role log is the data for choosing N. |
+| `MD_AGENT_ROLE_PERMISSION_MODE` | unset  | Default `--permission-mode` for claude-backed roles (e.g. `acceptEdits`, `bypassPermissions`). Headless `-p` sessions auto-deny tools the host settings don't allow, so roles that edit files need this (or a per-role `permissionMode` in the launch config, which takes precedence) on hosts without a global allowlist. |
+| `MD_AGENT_ESCALATION_FRESH` | off        | Escalation (P1c) re-spawns roles on the stronger tier **resuming their sessions** by default (they keep everything learned attempting the fix). Set to discard that context and start the upgraded team fresh instead. |
 | `MD_AGENT_NO_DASHBOARD`   | unset        | Disable the sticky top-of-console status panel (also auto-disabled when stdout isn't a TTY). |
 | `NO_COLOR`                | unset        | Disable ANSI color in the dashboard. |
 
@@ -220,8 +248,13 @@ console.
 
 ```
 runs/<timestamp>-<name>/
-├── state.json          # goal, roles, models, checkpoint interval
+├── state.json          # goal, roles, models, checkpoint interval; "completedAt"
+│                       #   appears when shelved from the home screen (delete the
+│                       #   line to restore the run to the menus)
 ├── ledger.md           # orchestrator's memory (stateless across turns; resume reads this)
+├── context.md          # large shared-context brief (only when > ~2 KB) — the orchestrator
+│                       #   gets a pointer + excerpt in its prefix and reads this on demand;
+│                       #   roles always carry the full brief in their instructions
 ├── transcript.md       # full conversation (orchestrator is sole writer)
 ├── inbox/<role>.txt     # orchestrator → role
 ├── outbox/<role>.txt    # role → orchestrator
@@ -240,6 +273,7 @@ runs/<timestamp>-<name>/
 | File                   | Responsibility |
 |------------------------|----------------|
 | `src/index.ts`         | CLI entry / arg parsing |
+| `src/home.ts`          | home screen: run discovery, resume/combine/complete menus |
 | `src/orchestrator.ts`  | setup wizard, run loop, ledger turns, dispatch, checkpoints |
 | `src/team.ts`          | sub-team engine (1:1 huddle) — opt-in via `MD_AGENT_TEAMS` |
 | `src/role.ts`          | role child-process loop |
