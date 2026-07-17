@@ -6,12 +6,20 @@
   "bin": {
     "md-agent": "dist/index.js"
   },
+  "files": [
+    "dist",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "tsx src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
     "test": "tsx smoke-team.ts",
-    "smoke:gemini": "tsx smoke-gemini.ts"
+    "smoke:gemini": "tsx smoke-gemini.ts",
+    "prepublishOnly": "npm run build && npm test"
   },
   "keywords": [
     "claude",
