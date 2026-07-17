@@ -75,7 +75,8 @@ npm run build     # tsc → dist/
 Just run it:
 
 ```bash
-md-agent                         # after npm install -g (or npx md-agent)
+md-agent                         # after: npm install -g @armoryworks/md-agent
+npx @armoryworks/md-agent        # or without installing
 npm run dev                      # from a checkout, via tsx
 ```
 
