@@ -7,6 +7,7 @@ import { ClaudeSession } from "./claude.js";
 import {
   MODEL_IDS,
   type ModelTier,
+  recentCheckpoints,
   recordUsage,
   type RoleSpec,
   type VerifySpec,
@@ -270,6 +271,19 @@ async function writeHandshakes(
   const ledgerFile = path.join(runDir, "ledger.md");
   const ledger = existsSync(ledgerFile) ? (await readFile(ledgerFile, "utf8")).trim() : "";
 
+  // The final ledger is aggressively pruned by design; the periodic CHECKPOINT
+  // snapshots in the transcript preserve mid-phase state (surprises, dead ends,
+  // interim artifacts) the handshake would otherwise never see.
+  let checkpoints: string[] = [];
+  try {
+    const transcriptFile = path.join(runDir, "transcript.md");
+    if (existsSync(transcriptFile)) {
+      checkpoints = recentCheckpoints(await readFile(transcriptFile, "utf8"));
+    }
+  } catch {
+    // best-effort context; the ledger alone still works
+  }
+
   const sys = [
     "You author a concise PARTING HANDSHAKE from a just-finished phase of a multi-phase journey to the phase(s) that follow.",
     "You are given the finished phase's ledger (its full working memory) and the downstream phases with their goals and roles.",
@@ -295,6 +309,13 @@ async function writeHandshakes(
     "FINISHED PHASE LEDGER (its memory — the source of truth for what happened):",
     ledger || "(ledger empty — the phase left no memory; infer from goal only)",
     "",
+    ...(checkpoints.length
+      ? [
+          "EARLIER CHECKPOINT SNAPSHOTS (mid-phase state the final ledger may have pruned — mine for artifacts and surprises):",
+          checkpoints.join("\n\n--- (later checkpoint) ---\n\n"),
+          "",
+        ]
+      : []),
     "DOWNSTREAM PHASES (earliest first):",
     ...downstream.map(
       (p, idx) =>

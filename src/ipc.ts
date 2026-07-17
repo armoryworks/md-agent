@@ -1,4 +1,4 @@
-import { readFile, writeFile, appendFile, mkdir, stat } from "node:fs/promises";
+import { readFile, writeFile, appendFile, mkdir, rename, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import chokidar from "chokidar";
@@ -7,13 +7,21 @@ export const SENTINEL = "(incomplete communication)";
 export const SAFE_WORD = "exit";
 
 /**
- * Write content atomically-ish: first with sentinel appended, then without.
- * Readers that see the sentinel ending know the write is mid-flight.
+ * Write content atomically: write to a sibling temp file, then rename into
+ * place. Readers can never observe a partial write (rename is atomic on POSIX).
+ * The sentinel protocol is retained only on the read side, for files written by
+ * older versions.
  */
 export async function safeWrite(file: string, content: string): Promise<void> {
   await mkdir(path.dirname(file), { recursive: true });
-  await writeFile(file, content + "\n" + SENTINEL, "utf8");
-  await writeFile(file, content, "utf8");
+  const tmp = `${file}.tmp`;
+  await writeFile(tmp, content, "utf8");
+  try {
+    await rename(tmp, file);
+  } catch {
+    // Windows can refuse rename-over-open-file; fall back to a direct write.
+    await writeFile(file, content, "utf8");
+  }
 }
 
 /**

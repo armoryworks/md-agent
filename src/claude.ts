@@ -32,6 +32,7 @@ export class ClaudeSession implements AgentSession {
   private lastUsageData: Usage | null = null;
   private readonly stateless: boolean;
   private heartbeatPath: string | null;
+  private permissionMode: string | null;
   private lastBeat = 0;
 
   constructor(
@@ -57,6 +58,13 @@ export class ClaudeSession implements AgentSession {
        * from a hung one (stale). Throttled internally.
        */
       heartbeatPath?: string;
+      /**
+       * Claude CLI --permission-mode (e.g. "acceptEdits", "bypassPermissions",
+       * "plan"). Headless -p sessions auto-deny tools the host settings don't
+       * allow, so unattended seats that edit files need an explicit mode rather
+       * than inheriting whatever the host happens to permit.
+       */
+      permissionMode?: string;
     } = {}
   ) {
     this.systemPrompt = opts.systemPrompt ?? null;
@@ -65,6 +73,7 @@ export class ClaudeSession implements AgentSession {
     this.model = opts.model ?? null;
     this.stateless = opts.stateless ?? false;
     this.heartbeatPath = opts.heartbeatPath ?? null;
+    this.permissionMode = opts.permissionMode ?? null;
   }
 
   /** Touch the heartbeat file (throttled) to signal this turn is alive + producing. */
@@ -103,6 +112,9 @@ export class ClaudeSession implements AgentSession {
     const args = ["-p", "--output-format", "stream-json", "--verbose"];
     if (this.model) {
       args.push("--model", this.model);
+    }
+    if (this.permissionMode) {
+      args.push("--permission-mode", this.permissionMode);
     }
     if (this.sessionId) {
       args.push("--resume", this.sessionId);

@@ -7,9 +7,9 @@ export type ModelTier = "opus" | "sonnet" | "haiku";
 
 /** Concrete claude model ids per tier. Single source of truth. */
 export const MODEL_IDS: Record<ModelTier, string> = {
-  opus: "claude-opus-4-7",
-  sonnet: "claude-sonnet-4-6",
-  haiku: "claude-haiku-4-5-20251001",
+  opus: "claude-opus-4-8",
+  sonnet: "claude-sonnet-5",
+  haiku: "claude-haiku-4-5",
 };
 
 export const DEFAULT_TIER: ModelTier = "sonnet";
@@ -57,6 +57,14 @@ export interface RoleSpec {
   model?: ModelTier;
   /** Backing agent CLI for this role. Default "claude". Configuration-based. */
   provider?: Provider;
+  /**
+   * Claude CLI --permission-mode for this role's session (e.g. "acceptEdits",
+   * "bypassPermissions", "plan"). In headless -p mode a denied tool call simply
+   * fails, so a role that must edit files needs this (or a global settings
+   * allowlist on the host). Falls back to MD_AGENT_ROLE_PERMISSION_MODE, then
+   * to the CLI default. Claude provider only.
+   */
+  permissionMode?: string;
 }
 
 /**
@@ -81,6 +89,13 @@ export interface RunState {
   goal: string;
   roles: RoleSpec[];
   context?: string;
+  /**
+   * Set (ISO timestamp) when the user marks the run complete from the home
+   * screen. Completed runs are hidden from every home-screen menu. Restoring is
+   * deliberately a hand edit — delete this field from the run's state.json —
+   * so "complete" is a shelving action, not a destructive one.
+   */
+  completedAt?: string;
   /** Max minutes between synopsis checkpoints. Persisted so resume keeps the cadence. */
   maxMinutes?: number;
   /** Whether the orchestrator may form sub-teams (1:1 huddles). Chosen at setup. */
@@ -385,31 +400,25 @@ export function buildRoleHistory(transcriptText: string, roleName: string): stri
   return tailJoin(turns, HISTORY_CHAR_CAP);
 }
 
-/** Reconstruct a readable history of the orchestrator's coordination so far. */
-export function buildOrchHistory(
+/**
+ * The most recent CHECKPOINT snapshots from a transcript, oldest first. Feeds the
+ * journey handshake author mid-phase state the final (aggressively pruned) ledger
+ * may have discarded.
+ */
+export function recentCheckpoints(
   transcriptText: string,
-  roleNames: string[]
-): string {
-  const roleSet = new Set(roleNames);
-  const turns: string[] = [];
-  let lastDispatch = "";
-  for (const b of parseTranscript(transcriptText)) {
-    const toM = /^→ (.+)$/.exec(b.tag);
-    const fromM = /^← (.+)$/.exec(b.tag);
-    if (toM && roleSet.has(toM[1].trim())) {
-      const key = `${toM[1].trim()}|${b.content}`;
-      if (key === lastDispatch) continue; // dedupe dual-logged dispatch
-      lastDispatch = key;
-      turns.push(`[you dispatched → ${toM[1].trim()}]\n${b.content}`);
-    } else if (fromM && roleSet.has(fromM[1].trim())) {
-      turns.push(`[${fromM[1].trim()} → you]\n${b.content}`);
-    } else if (b.tag === "USER" || b.tag === "USER INTERJECTION") {
-      turns.push(`[user]\n${b.content}`);
-    } else if (b.tag === "USER FEEDBACK") {
-      turns.push(`[user feedback at a checkpoint]\n${b.content}`);
-    } else if (b.tag === "SYNOPSIS") {
-      turns.push(`[you gave this synopsis]\n${b.content}`);
-    }
+  max = 2,
+  capChars = 6000
+): string[] {
+  const cps = parseTranscript(transcriptText)
+    .filter((b) => b.tag === "CHECKPOINT")
+    .map((b) => b.content);
+  const out: string[] = [];
+  let total = 0;
+  for (let i = cps.length - 1; i >= 0 && out.length < max; i--) {
+    total += cps[i].length;
+    if (total > capChars && out.length > 0) break;
+    out.unshift(cps[i]);
   }
-  return tailJoin(turns, HISTORY_CHAR_CAP);
+  return out;
 }

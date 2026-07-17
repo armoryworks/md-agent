@@ -33,7 +33,6 @@
   "homepage": "https://github.com/armoryworks/md-agent#readme",
   "type": "module",
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.99.0",
     "@inquirer/prompts": "^8.4.3",
     "chokidar": "^5.0.0",
     "cross-spawn": "^7.0.6",

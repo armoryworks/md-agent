@@ -40,6 +40,14 @@ export interface TeamIO {
   appendChannel(team: string, who: string, msg: string): Promise<void>;
   /** True once the run is shutting down — the engine bails out promptly. */
   isStopping(): boolean;
+  /**
+   * True when a member's session retains context across turns (claude-backed).
+   * A stateful member that has already spoken in this huddle doesn't need the
+   * channel replayed — it was present for every prior round; only the partner's
+   * latest message is new to it. Optional: absent → treated as stateless
+   * (full-tail prompts, the safe default).
+   */
+  isStateful?(role: string): boolean;
 }
 
 export interface TeamResult {
@@ -103,7 +111,32 @@ function matchBlocked(reply: string): string | null {
   return m ? m[1].trim() : null;
 }
 
-function huddlePrompt(spec: TeamSpec, speaker: string, partner: string, channel: string[]): string {
+const REPLY_RULES = [
+  "Continue the huddle with your partner. Be concise — detailed work goes in files; reference paths, do not paste large content.",
+  "Reply with EXACTLY ONE of:",
+  "  • your next message to your partner (a question, answer, or proposal), OR",
+  "  • `TEAM-DONE: <2-4 sentence summary of what you jointly concluded + file pointers>` when you are finished, OR",
+  "  • `TEAM-BLOCKED: <the specific question or decision you need from the orchestrator>` if you cannot proceed.",
+];
+
+function huddlePrompt(
+  spec: TeamSpec,
+  speaker: string,
+  partner: string,
+  channel: string[],
+  opts: { statefulAndSeen: boolean }
+): string {
+  if (opts.statefulAndSeen) {
+    // The speaker's own session already contains the brief and every prior
+    // round — re-sending the channel tail would just re-bill known context.
+    return [
+      `Huddle "${spec.name}" continues — you have the brief and the prior rounds in your context.`,
+      `Your partner "${partner}" replied:`,
+      channel[channel.length - 1] ?? "(nothing)",
+      "",
+      ...REPLY_RULES,
+    ].join("\n");
+  }
   return [
     `You are "${speaker}" in a two-person huddle "${spec.name}" with "${partner}".`,
     "Shared task:",
@@ -112,21 +145,22 @@ function huddlePrompt(spec: TeamSpec, speaker: string, partner: string, channel:
     "Huddle so far:",
     channel.length ? tail(channel) : "(nothing yet — you open the huddle)",
     "",
-    "Continue the huddle with your partner. Be concise — detailed work goes in files; reference paths, do not paste large content.",
-    "Reply with EXACTLY ONE of:",
-    "  • your next message to your partner (a question, answer, or proposal), OR",
-    "  • `TEAM-DONE: <2-4 sentence summary of what you jointly concluded + file pointers>` when you are finished, OR",
-    "  • `TEAM-BLOCKED: <the specific question or decision you need from the orchestrator>` if you cannot proceed.",
+    ...REPLY_RULES,
   ].join("\n");
 }
 
-function summaryPrompt(spec: TeamSpec, channel: string[]): string {
+function summaryPrompt(
+  spec: TeamSpec,
+  channel: string[],
+  opts: { statefulAndSeen: boolean }
+): string {
   return [
     `The huddle "${spec.name}" has reached its round limit. Shared task:`,
     spec.brief,
     "",
-    "Huddle so far:",
-    tail(channel),
+    ...(opts.statefulAndSeen
+      ? ["(You took part in every round — the huddle is in your context.)"]
+      : ["Huddle so far:", tail(channel)]),
     "",
     "Wrap up now. Reply with `TEAM-DONE: <summary of where things landed, any open items, and file pointers>`.",
   ].join("\n");
@@ -140,6 +174,8 @@ function summaryPrompt(spec: TeamSpec, channel: string[]): string {
  */
 export async function runHuddle(spec: TeamSpec, io: TeamIO): Promise<TeamResult> {
   const channel: string[] = [];
+  const seen = new Set<string>(); // members who have taken at least one turn
+  const statefulAndSeen = (role: string) => (io.isStateful?.(role) ?? false) && seen.has(role);
   // Start with the reporter so the designated owner frames the huddle.
   let speaker = spec.reporter;
   let partner = spec.members.find((m) => m !== speaker) ?? spec.members[0];
@@ -147,7 +183,11 @@ export async function runHuddle(spec: TeamSpec, io: TeamIO): Promise<TeamResult>
   for (let round = 0; round < spec.maxRounds; round++) {
     if (io.isStopping()) return { status: "aborted", report: "(run stopping)" };
 
-    const reply = await io.ask(speaker, huddlePrompt(spec, speaker, partner, channel));
+    const reply = await io.ask(
+      speaker,
+      huddlePrompt(spec, speaker, partner, channel, { statefulAndSeen: statefulAndSeen(speaker) })
+    );
+    seen.add(speaker);
     channel.push(`[${speaker}] ${reply}`);
     await io.appendChannel(spec.name, speaker, reply);
 
@@ -161,7 +201,10 @@ export async function runHuddle(spec: TeamSpec, io: TeamIO): Promise<TeamResult>
 
   // Cap reached without a verdict — ask the reporter to close it out.
   if (io.isStopping()) return { status: "aborted", report: "(run stopping)" };
-  const summary = await io.ask(spec.reporter, summaryPrompt(spec, channel));
+  const summary = await io.ask(
+    spec.reporter,
+    summaryPrompt(spec, channel, { statefulAndSeen: statefulAndSeen(spec.reporter) })
+  );
   await io.appendChannel(spec.name, spec.reporter, summary);
   return { status: "capped", report: matchDone(summary) ?? summary.trim() };
 }
