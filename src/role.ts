@@ -2,6 +2,7 @@ import path from "node:path";
 import { readFile } from "node:fs/promises";
 import { ClaudeSession, type AgentSession } from "./claude.js";
 import { AgySession } from "./agy.js";
+import { provisionWorkspace } from "./workspace.js";
 import {
   clearFile,
   isSafeWord,
@@ -17,6 +18,7 @@ import {
   recordUsage,
   resolveModelFor,
   writeSessionId,
+  DEFAULT_ISOLATION,
 } from "./persist.js";
 
 /**
@@ -98,12 +100,26 @@ export async function runRole(
     }
   }
 
+  // Where this seat's file edits land. An explicit RoleSpec.cwd wins; otherwise
+  // isolation decides — "worktree" hands the seat its own checkout so its output
+  // can be reviewed and kept or dropped, "none" shares md-agent's cwd.
+  const workspaceDir =
+    me.cwd ??
+    (await provisionWorkspace({
+      isolation: state.isolation ?? DEFAULT_ISOLATION,
+      repoDir: process.cwd(),
+      runDir,
+      runName: path.basename(runDir),
+      role: roleName,
+    }));
+  if (workspaceDir) console.log(`[role:${roleName}] workspace: ${workspaceDir}`);
+
   /**
    * Build a seat for this role. Used for both the initial session and recycling,
    * so the two cannot drift on provider, model or permission posture.
    */
   const makeSession = (prompt: string, resumeId?: string): AgentSession => {
-    const common = { model, heartbeatPath, permissionMode };
+    const common = { model, heartbeatPath, permissionMode, cwd: workspaceDir };
     const onSessionId = (id: string) => void writeSessionId(runDir, roleName, id);
     return provider === "agy"
       ? new AgySession({ systemPrompt: prompt, resumeId, onSessionId, ...common })

@@ -21,6 +21,7 @@ export class AgySession implements AgentSession {
   private systemPrompt: string | null;
   private model: string | null;
   private permissionMode: string | null;
+  private cwd: string | null;
   private heartbeatPath: string | null;
   private lastBeat = 0;
   private conversationId: string | null = null;
@@ -32,6 +33,8 @@ export class AgySession implements AgentSession {
     model?: string;
     heartbeatPath?: string;
     permissionMode?: string;
+    /** Working directory for the spawned CLI. Defaults to md-agent's own cwd. */
+    cwd?: string;
     /** Resume an existing conversation instead of starting a new one. */
     resumeId?: string;
     onSessionId?: (id: string) => void;
@@ -39,6 +42,7 @@ export class AgySession implements AgentSession {
     this.systemPrompt = opts.systemPrompt ?? null;
     this.model = opts.model ?? null;
     this.permissionMode = opts.permissionMode ?? null;
+    this.cwd = opts.cwd ?? null;
     this.heartbeatPath = opts.heartbeatPath ?? null;
     this.conversationId = opts.resumeId ?? null;
     this.onSessionId = opts.onSessionId ?? null;
@@ -105,7 +109,10 @@ export class AgySession implements AgentSession {
     args.push("--print-timeout", `${Math.floor(timeoutMs / 1000) + 60}s`);
 
     return new Promise<string>((resolve, reject) => {
-      const child = spawn("agy", args, { stdio: ["ignore", "pipe", "pipe"] });
+      const child = spawn("agy", args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        ...(this.cwd ? { cwd: this.cwd } : {}),
+      });
       let out = "";
       let err = "";
       // The JSON envelope is emitted at the END, so beat on a timer to keep the

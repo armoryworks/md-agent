@@ -123,7 +123,28 @@ export interface RoleSpec {
    * onto --mode accept-edits / --mode plan / --dangerously-skip-permissions.
    */
   permissionMode?: string;
+  /**
+   * Explicit working directory for this role's CLI. Overrides RunState.isolation.
+   * Usually left unset: with isolation "worktree" md-agent fills it in with the
+   * seat's own worktree, and with "none" every seat shares md-agent's cwd.
+   */
+  cwd?: string;
 }
+
+/**
+ * Where a role's file edits land.
+ *
+ * "none" — every seat edits md-agent's cwd (the target repo) directly. Simple,
+ * and correct when the seats are advisory or the run is trusted end to end.
+ *
+ * "worktree" — each seat gets its own `git worktree` on its own branch. Seats
+ * cannot overwrite each other, and the run's output becomes reviewable
+ * artifacts: audit with `git diff`, keep with a merge, discard with
+ * `git worktree remove`. This is what makes delegating to a cheaper provider
+ * safe — a wrong answer is dropped rather than reverted out of your tree.
+ */
+export type Isolation = "none" | "worktree";
+export const DEFAULT_ISOLATION: Isolation = "none";
 
 /**
  * A deterministic completion gate (P1). When set on a run/phase, the orchestrator's
@@ -175,6 +196,8 @@ export interface RunState {
   autoComplete?: boolean;
   /** Deterministic completion gate + circuit breaker (P1). Undefined = no gate. */
   verify?: VerifySpec;
+  /** Where role edits land. Default "none" (shared cwd). See {@link Isolation}. */
+  isolation?: Isolation;
   /**
    * Escalation tiering (P1c) — requires `verify`. An ordered model-tier ladder the
    * circuit breaker climbs on repeated verify failure: instead of HALTing at

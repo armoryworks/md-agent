@@ -6,6 +6,7 @@ import crossSpawn from "cross-spawn";
 import readline from "node:readline";
 import { confirm, input, number, select } from "@inquirer/prompts";
 import { ClaudeSession, type AgentSession } from "./claude.js";
+import { reportWorkspaces } from "./workspace.js";
 import {
   appendTranscript,
   clearFile,
@@ -22,6 +23,8 @@ import {
   AGY_MODEL_IDS,
   PROVIDER_PROFILES,
   DEFAULT_PROVIDER,
+  DEFAULT_ISOLATION,
+  type Isolation,
   type LaunchConfig,
   MODEL_IDS,
   type ModelTier,
@@ -384,6 +387,21 @@ export async function runOrchestrator(opts: {
     });
   }
 
+  const isolation = await select<Isolation>({
+    message: "Where should role edits land?",
+    choices: [
+      {
+        name: "shared — every role edits this repo directly (simple; trust the seats)",
+        value: "none" as Isolation,
+      },
+      {
+        name: "worktree — each role gets its own checkout + branch (review, then keep or drop)",
+        value: "worktree" as Isolation,
+      },
+    ],
+    default: DEFAULT_ISOLATION,
+  });
+
   const goal = await input({
     message: "What is the overall goal?",
     validate: (v) => v.trim().length > 0 || "Required",
@@ -431,6 +449,7 @@ export async function runOrchestrator(opts: {
     teams,
     budgetMinutes: budgetMinutes ?? undefined,
     contextContent,
+    isolation,
     kickoff: "Begin the run.",
   });
 }
@@ -455,6 +474,8 @@ export interface RunSetup {
   verify?: VerifySpec;
   /** Escalation tiering ladder (P1c); requires verify. */
   escalation?: ModelTier[];
+  /** Where role edits land. Default "none" (shared cwd). */
+  isolation?: Isolation;
 }
 
 /**
@@ -567,6 +588,7 @@ export async function launchRun(setup: RunSetup): Promise<void> {
     autoComplete: setup.autoComplete,
     verify: setup.verify,
     escalation: setup.escalation,
+    isolation: setup.isolation,
   };
   await writeFile(path.join(runDir, "state.json"), JSON.stringify(state, null, 2), "utf8");
 
@@ -625,6 +647,7 @@ export async function launchRun(setup: RunSetup): Promise<void> {
     autoComplete: state.autoComplete ?? false,
     verify: state.verify,
     escalation: state.escalation,
+    isolation: state.isolation,
   });
 }
 
@@ -774,6 +797,7 @@ export async function resumeOrchestrator(
     autoComplete: state.autoComplete ?? false,
     verify: state.verify,
     escalation: state.escalation,
+    isolation: state.isolation,
   });
 }
 
@@ -810,11 +834,13 @@ interface LoopCtx {
   verify?: VerifySpec;
   /** Escalation tiering ladder (P1c); requires verify. */
   escalation?: ModelTier[];
+  /** Where role edits land; drives the end-of-run workspace audit. */
+  isolation?: Isolation;
 }
 
 /** Shared event loop used by both fresh runs and resumes. */
 async function runLoop(ctx: LoopCtx): Promise<void> {
-  const { runDir, roles, transcript, orch, children, kickoff, teamsEnabled, budgetMinutes, autoComplete, verify, escalation } = ctx;
+  const { runDir, roles, transcript, orch, children, kickoff, teamsEnabled, budgetMinutes, autoComplete, verify, escalation, isolation } = ctx;
 
   // Give the orchestrator's own claude session a heartbeat file so the watchdog
   // can tell a working turn (recent stream output) from one hung mid-turn. Roles
@@ -1239,6 +1265,35 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     dash.stop();
     console.log(`\n[orchestrator] stopping (${reason})`);
     await appendTranscript(transcript, "RUN END", reason);
+
+    // With isolation on, the run's output is a set of branches rather than edits
+    // already in your tree. Print where they are and what they touched — an audit
+    // surface nobody is told about does not get audited.
+    if ((isolation ?? DEFAULT_ISOLATION) === "worktree") {
+      try {
+        const reports = await reportWorkspaces({
+          repoDir: process.cwd(),
+          runDir,
+          runName: path.basename(runDir),
+          roles: roles.map((r) => r.name),
+        });
+        if (reports.length) {
+          console.log("\n[orchestrator] role workspaces — review, then keep or drop:\n");
+          for (const rep of reports) {
+            console.log(`  ${rep.role}  (${rep.changedFiles} file(s) changed, ${rep.commits} commit(s))`);
+            console.log(`    dir:    ${rep.dir}`);
+            console.log(`    branch: ${rep.branch}`);
+            if (rep.diffstat) {
+              console.log(rep.diffstat.split("\n").map((l) => `      ${l}`).join("\n"));
+            }
+            console.log("");
+          }
+          console.log("  keep: git merge <branch>     drop: git worktree remove <dir>\n");
+        }
+      } catch (e) {
+        console.warn(`[orchestrator] could not summarize workspaces: ${(e as Error).message}`);
+      }
+    }
     for (const r of roles) {
       await safeWrite(path.join(runDir, "inbox", `${r.name}.txt`), "exit");
     }

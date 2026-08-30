@@ -29,6 +29,7 @@ export class ClaudeSession implements AgentSession {
   private systemPrompt: string | null;
   private onSessionId: ((id: string) => void) | null;
   private model: string | null;
+  private cwd: string | null;
   private lastUsageData: Usage | null = null;
   private readonly stateless: boolean;
   private heartbeatPath: string | null;
@@ -44,6 +45,12 @@ export class ClaudeSession implements AgentSession {
       onSessionId?: (id: string) => void;
       /** Concrete claude model id to run this session on (passed as --model). */
       model?: string;
+      /**
+       * Working directory for the spawned CLI. Defaults to md-agent's own cwd
+       * (the target repo). Set per role to isolate a seat's edits — see
+       * RoleSpec.cwd and RunState.isolation.
+       */
+      cwd?: string;
       /**
        * Never carry conversation state between turns. Every `send()` is a fresh,
        * independent call: the system prompt is prepended each time and no
@@ -71,6 +78,7 @@ export class ClaudeSession implements AgentSession {
     this.sessionId = opts.resumeSessionId ?? null;
     this.onSessionId = opts.onSessionId ?? null;
     this.model = opts.model ?? null;
+    this.cwd = opts.cwd ?? null;
     this.stateless = opts.stateless ?? false;
     this.heartbeatPath = opts.heartbeatPath ?? null;
     this.permissionMode = opts.permissionMode ?? null;
@@ -130,6 +138,7 @@ export class ClaudeSession implements AgentSession {
     return new Promise((resolve, reject) => {
       const child = spawn("claude", args, {
         stdio: ["pipe", "pipe", "pipe"],
+        ...(this.cwd ? { cwd: this.cwd } : {}),
       });
 
       let stdoutBuf = "";

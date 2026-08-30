@@ -149,6 +149,25 @@ config/journey path supplies `provider` directly and skips the prompt.
   `gemini-3.7-flash-low`); `agy models` lists what is available. `permissionMode`
   is honored by both: claude passes it to `--permission-mode`, agy maps it onto
   `--mode accept-edits` / `--mode plan` / `--dangerously-skip-permissions`.
+- **`isolation`** — `"none"` (default) or `"worktree"`, asked by the wizard.
+
+  With `"none"` every seat edits md-agent's cwd directly. Simple, and fine when
+  the seats are advisory or you trust the run end to end.
+
+  With `"worktree"` each role gets its own `git worktree` at
+  `<runDir>/workspaces/<role>` on branch `md-agent/<run>/<role>`, cut from the
+  repo's current HEAD. Seats cannot overwrite each other, and the run's output
+  becomes reviewable artifacts instead of edits already in your tree — audit with
+  `git diff`, keep with a merge, discard with `git worktree remove`. That is what
+  makes a cheaper provider safe to delegate to: a wrong answer is dropped, not
+  reverted back out.
+
+  On teardown the orchestrator prints each seat's directory, branch and diffstat,
+  because an audit surface nobody is told about does not get audited. If the
+  target is not a git repo this fails loudly rather than falling back to the
+  shared tree — a silent fallback would leave you believing edits were contained
+  when they were not. `roles[].cwd` overrides it per seat.
+
 - **`verify`** (`{cmd, cwd?, maxFailures?, timeoutSec?}`) — deterministic completion
   gate + circuit breaker. The orchestrator's `[[PHASE-COMPLETE]]` is honored only when
   `cmd` exits 0; a non-zero exit feeds the output back to fix, and after `maxFailures`
