@@ -85,6 +85,13 @@ export interface WorkspaceReport {
   /** `git diff --stat` against that base, including uncommitted work. */
   diffstat: string;
   changedFiles: number;
+  /**
+   * Result of running the run's verify command INSIDE this workspace, when one
+   * is configured. This is the difference between "here are some branches" and
+   * "here is which branch is safe to merge" — admission becomes informed rather
+   * than hopeful. Undefined when no verify command is set.
+   */
+  verify?: { ok: boolean; tail: string };
 }
 
 /**
@@ -97,6 +104,12 @@ export async function reportWorkspaces(opts: {
   runDir: string;
   runName: string;
   roles: string[];
+  /**
+   * Run the configured verify command against one workspace. Injected rather
+   * than reimplemented so it is the same runner, timeout and output-tailing the
+   * completion gate uses — only the working directory differs.
+   */
+  verifyIn?: (dir: string) => Promise<{ ok: boolean; tail: string }>;
 }): Promise<WorkspaceReport[]> {
   const out: WorkspaceReport[] = [];
   for (const role of opts.roles) {
@@ -116,7 +129,15 @@ export async function reportWorkspaces(opts: {
     } catch {
       // A workspace we cannot read is still worth listing; leave the counts at 0.
     }
-    out.push({ role, dir, branch, commits, diffstat, changedFiles });
+    let verify: { ok: boolean; tail: string } | undefined;
+    if (opts.verifyIn) {
+      try {
+        verify = await opts.verifyIn(dir);
+      } catch (e) {
+        verify = { ok: false, tail: `(verify could not run: ${(e as Error).message})` };
+      }
+    }
+    out.push({ role, dir, branch, commits, diffstat, changedFiles, verify });
   }
   return out;
 }

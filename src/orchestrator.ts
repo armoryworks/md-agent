@@ -1080,9 +1080,23 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
    */
   async function escalateRolesTo(tier: ModelTier): Promise<void> {
     const fresh = /^(1|true|on|yes)$/i.test(process.env.MD_AGENT_ESCALATION_FRESH ?? "");
-    for (const r of roles) r.model = tier;
+    // A seat pinned with escalate:false keeps its tier. Deliberately cheap seats
+    // (bulk enumeration, extraction) should stay cheap when the ladder climbs —
+    // otherwise escalation quietly erases the cost split it was chosen for.
+    const climbing = roles.filter((r) => r.escalate !== false);
+    const pinned = roles.filter((r) => r.escalate === false);
+    if (pinned.length) {
+      console.warn(
+        `[verify] not escalating pinned seat(s): ${pinned.map((r) => r.name).join(", ")}`
+      );
+    }
+    if (climbing.length === 0) {
+      console.warn("[verify] every seat is pinned — nothing to escalate");
+      return;
+    }
+    for (const r of climbing) r.model = tier;
     await updateState(runDir, { roles });
-    for (const r of roles) {
+    for (const r of climbing) {
       const old = childByRole.get(r.name);
       if (old && old.exitCode === null && !old.killed) {
         try {
@@ -1271,22 +1285,44 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     // surface nobody is told about does not get audited.
     if ((isolation ?? DEFAULT_ISOLATION) === "worktree") {
       try {
+        if (verify) {
+          console.log(`\n[orchestrator] running \`${verify.cmd}\` in each workspace…`);
+        }
         const reports = await reportWorkspaces({
           repoDir: process.cwd(),
           runDir,
           runName: path.basename(runDir),
           roles: roles.map((r) => r.name),
+          // Same runner, timeout and output tail as the completion gate — only
+          // the working directory changes. A seat's branch is judged by the same
+          // command that judges the run.
+          verifyIn: verify ? (dir) => runVerify({ ...verify, cwd: dir }) : undefined,
         });
         if (reports.length) {
           console.log("\n[orchestrator] role workspaces — review, then keep or drop:\n");
           for (const rep of reports) {
-            console.log(`  ${rep.role}  (${rep.changedFiles} file(s) changed, ${rep.commits} commit(s))`);
-            console.log(`    dir:    ${rep.dir}`);
-            console.log(`    branch: ${rep.branch}`);
+            const mark = rep.verify ? (rep.verify.ok ? "PASS" : "FAIL") : "     ";
+            console.log(`  ${mark}  ${rep.role}  (${rep.changedFiles} file(s) changed, ${rep.commits} commit(s))`);
+            console.log(`        dir:    ${rep.dir}`);
+            console.log(`        branch: ${rep.branch}`);
             if (rep.diffstat) {
-              console.log(rep.diffstat.split("\n").map((l) => `      ${l}`).join("\n"));
+              console.log(rep.diffstat.split("\n").map((l) => `          ${l}`).join("\n"));
+            }
+            if (rep.verify && !rep.verify.ok) {
+              console.log(`        verify output:`);
+              console.log(rep.verify.tail.split("\n").slice(-12).map((l) => `          ${l}`).join("\n"));
             }
             console.log("");
+          }
+          const passing = reports.filter((r) => r.verify?.ok).map((r) => r.branch);
+          const failing = reports.filter((r) => r.verify && !r.verify.ok).map((r) => r.role);
+          if (verify) {
+            console.log(
+              failing.length
+                ? `  ${failing.length} seat(s) FAILED verification: ${failing.join(", ")} — do not merge these without reading why.`
+                : "  every seat passed verification."
+            );
+            if (passing.length) console.log(`  safe to merge: ${passing.join(", ")}`);
           }
           console.log("  keep: git merge <branch>     drop: git worktree remove <dir>\n");
         }

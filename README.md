@@ -163,10 +163,21 @@ config/journey path supplies `provider` directly and skips the prompt.
   reverted back out.
 
   On teardown the orchestrator prints each seat's directory, branch and diffstat,
-  because an audit surface nobody is told about does not get audited. If the
+  because an audit surface nobody is told about does not get audited. **When a
+  `verify` command is configured it is run inside each workspace** — the same
+  runner, timeout and output tail as the completion gate, only the working
+  directory differs — and each seat is marked PASS or FAIL with the failing
+  output. That is the difference between "here are some branches" and "here is
+  which branch is safe to merge": admission becomes informed rather than hopeful. If the
   target is not a git repo this fails loudly rather than falling back to the
   shared tree — a silent fallback would leave you believing edits were contained
   when they were not. `roles[].cwd` overrides it per seat.
+
+- **`roles[].escalate`** — default `true`. Set `false` to pin a seat at its tier
+  so the escalation ladder cannot promote it. A deliberately cheap seat doing
+  bulk enumeration should stay cheap when a verify failure escalates the rest of
+  the team; otherwise escalation quietly erases the cost split the seat was
+  chosen for. If every seat is pinned, escalation logs that and does nothing.
 
 - **`verify`** (`{cmd, cwd?, maxFailures?, timeoutSec?}`) — deterministic completion
   gate + circuit breaker. The orchestrator's `[[PHASE-COMPLETE]]` is honored only when

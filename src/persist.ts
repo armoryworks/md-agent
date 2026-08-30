@@ -129,6 +129,15 @@ export interface RoleSpec {
    * seat's own worktree, and with "none" every seat shares md-agent's cwd.
    */
   cwd?: string;
+  /**
+   * Whether the escalation ladder may promote this seat. Default true.
+   *
+   * Set false to pin a seat at its tier — a deliberately cheap role doing bulk
+   * enumeration should stay cheap even when a verify failure escalates the rest
+   * of the team, or the ladder silently turns the cheap tier into an expensive
+   * one and the reason for the split is lost.
+   */
+  escalate?: boolean;
 }
 
 /**
