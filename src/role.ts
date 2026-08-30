@@ -204,6 +204,25 @@ export async function runRole(
     turnsSinceSpawn++;
     await logTurn();
 
+    // A seat that answers with nothing must not look like a seat that answered.
+    // An empty outbox raises no event, so the orchestrator would carry on as
+    // though this role had reported — the failure would be invisible in the
+    // transcript and the run could complete without it.
+    if (!reply.trim()) {
+      const msg =
+        `[role:${roleName}] EMPTY REPLY from ${provider} — reporting it rather than ` +
+        `writing an empty outbox the orchestrator would never see.`;
+      console.warn(msg);
+      await safeWrite(
+        outbox,
+        `[ROLE ERROR] ${roleName} (${provider}/${model}) returned an empty reply. ` +
+          `Nothing was produced for this dispatch. If this seat must run commands, it ` +
+          `needs permissionMode "bypassPermissions" — headless mode cannot prompt, so ` +
+          `tool calls are auto-denied and the reply comes back empty.`
+      );
+      return true;
+    }
+
     await safeWrite(outbox, reply);
     return true;
   };

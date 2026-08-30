@@ -81,7 +81,15 @@ export class AgySession implements AgentSession {
     return `${this.systemPrompt}\n\n---\n\n${prompt}`;
   }
 
-  /** RoleSpec.permissionMode is written in claude's vocabulary; translate it. */
+  /**
+   * RoleSpec.permissionMode is written in claude's vocabulary; translate it.
+   *
+   * NOTE the vocabularies are not equivalent. "acceptEdits" maps to
+   * `--mode accept-edits`, which grants file edits but NOT command execution —
+   * in headless mode agy cannot prompt, so a seat that shells out has those
+   * calls auto-denied and returns an empty response. A seat that must run
+   * commands needs "bypassPermissions".
+   */
   private permissionArgs(): string[] {
     switch (this.permissionMode) {
       case "acceptEdits":
@@ -163,6 +171,24 @@ export class AgySession implements AgentSession {
               `agy status ${status}\n` +
                 `  model: ${this.model ?? "(default)"}\n` +
                 `  response: ${tail(String(obj?.response ?? ""))}\n` +
+                `  stderr: ${tail(err)}`
+            )
+          );
+          return;
+        }
+        // agy reports status SUCCESS even when every tool call was auto-denied
+        // and it produced nothing; the reason goes to stderr, outside the
+        // envelope. An empty response is therefore a FAILED turn — treating it
+        // as success writes an empty outbox and the orchestrator silently
+        // proceeds as though the seat had answered.
+        if (status === "SUCCESS" && !String(obj?.response ?? "").trim()) {
+          reject(
+            new Error(
+              `agy returned an empty response\n` +
+                `  model: ${this.model ?? "(default)"}\n` +
+                `  This usually means a tool was auto-denied in headless mode. A seat that\n` +
+                `  must run commands needs permissionMode "bypassPermissions"; --mode\n` +
+                `  accept-edits grants edits only.\n` +
                 `  stderr: ${tail(err)}`
             )
           );
