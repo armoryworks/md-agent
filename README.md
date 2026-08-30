@@ -133,6 +133,12 @@ to a doc included whole), `inbox` (path to a handshake doc prepended as context)
 by the one-time bootstrap turn; supply them all and that LLM call is **skipped**,
 so the run starts instantly.
 
+The interactive wizard asks this per role. It prints what each backend is suited
+to — claude for judgement, review and anything that can be quietly wrong; agy for
+breadth, volume and mechanical work behind a verifier — then picks one seat at a
+time, so the choice is made against the task's shape rather than by habit. The
+config/journey path supplies `provider` directly and skips the prompt.
+
 - **`roles[].provider`** — `"claude"` (default) or `"agy"` (Antigravity, which
   replaced the deprecated Gemini CLI). Configuration-based, no autodetection. The
   orchestrator is always `claude`. **Both providers are stateful** — claude resumes

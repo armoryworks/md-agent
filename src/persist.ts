@@ -41,6 +41,53 @@ export function normalizeProvider(p?: string): Provider {
 }
 
 /**
+ * What each provider is actually good for, shown in the setup wizard so the
+ * choice is made against task shape rather than habit. Single source of truth:
+ * the wizard renders this, and it is the place to revise the advice.
+ *
+ * The split that matters is not "smart vs cheap" — it is whether the work has a
+ * cheap, complete check. Where a command can prove the result (tests pass, build
+ * succeeds, files match), delegate freely: the check IS the audit. Where the only
+ * check is judgement, the audit costs about what the work costs, so keep it.
+ */
+export interface ProviderProfile {
+  value: Provider;
+  /** One-line summary shown as the option label. */
+  label: string;
+  /** Task shapes this seat suits. */
+  goodFor: string[];
+  /** Anything the operator should weigh before choosing it. */
+  caution?: string;
+}
+
+export const PROVIDER_PROFILES: ProviderProfile[] = [
+  {
+    value: "claude",
+    label: "claude — judgement, review, anything that can be quietly wrong",
+    goodFor: [
+      "resolving conflicts, and work where docs and code can disagree",
+      "the reviewer/auditor seat over other roles' output",
+      "tasks whose right answer may be \"don't do this\"",
+      "anything touching a public, customer-facing or legal surface",
+    ],
+  },
+  {
+    value: "agy",
+    label: "agy — breadth, volume, mechanical work behind a verifier",
+    goodFor: [
+      "enumeration and search across many files or repos",
+      "extraction and summarising at volume, ideally to a schema",
+      "applying a known change repeatedly",
+      "first-pass drafting that a verify command will check",
+    ],
+    caution:
+      "Content leaves this machine to Google — weigh that for customer, health or " +
+      "client data. Pair it with a `verify` command or a claude reviewer rather " +
+      "than trusting the reply: an agreeable wrong answer is the expensive failure.",
+  },
+];
+
+/**
  * Concrete agy model ids per tier — the cheap/mid/strong rungs. agy encodes
  * reasoning effort in the id itself (…-low/-medium/-high) rather than via a
  * separate flag, so the tier ladder climbs both model and effort at once.

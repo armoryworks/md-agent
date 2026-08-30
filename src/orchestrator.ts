@@ -4,7 +4,7 @@ import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { spawn, ChildProcess } from "node:child_process";
 import crossSpawn from "cross-spawn";
 import readline from "node:readline";
-import { confirm, input, number } from "@inquirer/prompts";
+import { confirm, input, number, select } from "@inquirer/prompts";
 import { ClaudeSession, type AgentSession } from "./claude.js";
 import {
   appendTranscript,
@@ -20,6 +20,8 @@ import { parseTeamBlocks, runHuddle, type TeamIO, type TeamResult, type TeamSpec
 import {
   DEFAULT_TIER,
   AGY_MODEL_IDS,
+  PROVIDER_PROFILES,
+  DEFAULT_PROVIDER,
   type LaunchConfig,
   MODEL_IDS,
   type ModelTier,
@@ -307,6 +309,24 @@ function buildOrchSystem(state: RunState, runDir: string | null): string {
     .join("\n");
 }
 
+/** Wrap `text` to ~76 cols, indenting continuation lines by `indent` spaces. */
+function wrapIndent(text: string, indent: number): string {
+  const width = 76 - indent;
+  const pad = " ".repeat(indent);
+  const out: string[] = [];
+  let line = "";
+  for (const word of text.split(/\s+/)) {
+    if (line && line.length + 1 + word.length > width) {
+      out.push(line);
+      line = word;
+    } else {
+      line = line ? `${line} ${word}` : word;
+    }
+  }
+  if (line) out.push(line);
+  return out.join(`\n${pad}`);
+}
+
 /**
  * Orchestrator entry. Walks setup wizard, names the run, spawns role
  * processes, then enters the main event loop. `contextContent` (pre-built
@@ -339,6 +359,29 @@ export async function runOrchestrator(opts: {
     } else {
       roles.push({ name: "", description: desc.trim() });
     }
+  }
+
+  // Provider is a per-seat decision, so make it one — and make it in front of
+  // the advice rather than from habit. Printed once, not per role.
+  console.log("\nWhich agent backs each role?\n");
+  for (const prof of PROVIDER_PROFILES) {
+    console.log(`  ${prof.label}`);
+    for (const g of prof.goodFor) console.log(`      · ${g}`);
+    if (prof.caution) {
+      console.log(`      ! ${wrapIndent(prof.caution, 8)}`);
+    }
+    console.log("");
+  }
+
+  for (const r of roles) {
+    r.provider = await select<Provider>({
+      message: `  ${r.name || r.description.slice(0, 60)} — backed by:`,
+      choices: PROVIDER_PROFILES.map((prof) => ({
+        name: prof.label,
+        value: prof.value,
+      })),
+      default: DEFAULT_PROVIDER,
+    });
   }
 
   const goal = await input({
