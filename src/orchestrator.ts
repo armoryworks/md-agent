@@ -694,6 +694,7 @@ export async function runFromConfig(configPath: string): Promise<void> {
     runDir: cfg.runDir,
     verify: cfg.verify,
     escalation: cfg.escalation,
+    isolation: cfg.isolation,
   });
 }
 

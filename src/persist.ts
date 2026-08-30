@@ -247,6 +247,8 @@ export interface LaunchConfig {
   verify?: VerifySpec;
   /** Escalation tiering ladder (P1c); requires verify. See RunState.escalation. */
   escalation?: ModelTier[];
+  /** Where role edits land. Default "none" (shared cwd). See {@link Isolation}. */
+  isolation?: Isolation;
 }
 
 export async function readState(runDir: string): Promise<RunState> {

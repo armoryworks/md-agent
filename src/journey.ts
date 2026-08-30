@@ -11,6 +11,7 @@ import {
   recordUsage,
   type RoleSpec,
   type VerifySpec,
+  type Isolation,
 } from "./persist.js";
 
 /**
@@ -41,6 +42,8 @@ export interface JourneyPhase {
   verify?: VerifySpec;
   /** Escalation tiering ladder (P1c); requires verify. See RunState.escalation. */
   escalation?: ModelTier[];
+  /** Where role edits land for this phase. Default "none". See {@link Isolation}. */
+  isolation?: Isolation;
 }
 
 /** A templated multi-phase run, authored up front before phase 0 executes. */
@@ -142,6 +145,7 @@ export async function runJourney(manifestPath: string, opts: { from?: string } =
       autoComplete: phase.autoComplete ?? true,
       verify: phase.verify,
       escalation: phase.escalation,
+      isolation: phase.isolation,
       runDir,
     };
     const cfgPath = path.join(dir, ".phase.launch.json");
