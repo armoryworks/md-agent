@@ -22,13 +22,22 @@ import {
 } from "./persist.js";
 
 /**
- * Opt-in role-session recycling: after this many turns, a claude-backed role
- * writes a short handoff note and is reseeded as a FRESH session (mandate +
- * handoff), so its resident context stops growing without bound. 0/unset = off.
- * The orchestrator's ledger trick, applied to the role seats.
+ * Role-session recycling: after this many turns, a role writes a short handoff
+ * note and is reseeded as a FRESH session (mandate + handoff), so its resident
+ * context — and therefore its cache-read cost per turn — stops growing without
+ * bound. The orchestrator's ledger trick, applied to the role seats.
+ *
+ * Defaults ON at DEFAULT_RECYCLE_TURNS: a prior run left this off (unset) and
+ * one seat's resident context grew to 1.44M cache-read tokens on a single turn,
+ * 53% of a $20.55 run — recycling every N turns bounds that growth instead of
+ * requiring an operator to discover the env var after the fact. An explicit
+ * MD_AGENT_ROLE_RECYCLE_TURNS always wins, including "0" to opt back out.
  */
+const DEFAULT_RECYCLE_TURNS = 20;
 const RECYCLE_TURNS = (() => {
-  const n = Number(process.env.MD_AGENT_ROLE_RECYCLE_TURNS);
+  const raw = process.env.MD_AGENT_ROLE_RECYCLE_TURNS;
+  if (raw == null) return DEFAULT_RECYCLE_TURNS;
+  const n = Number(raw);
   return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 0;
 })();
 
