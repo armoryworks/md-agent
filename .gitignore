@@ -7,6 +7,7 @@ dist/
 # Run artifacts — transcripts contain conversation history and may include
 # credentials, secrets, and project-internal findings. NEVER publish these.
 runs/
+artifacts/
 
 # Project-internal context that is not part of the md-agent tool itself.
 # (These were inputs/outputs of a specific engagement, not tooling docs.)
