@@ -4,7 +4,7 @@ import type { Usage } from "./persist.js";
 
 /**
  * The provider-agnostic seat interface the orchestrator and roles drive. Both
- * ClaudeSession and GeminiSession implement it, so the run loop never cares which
+ * ClaudeSession and AgySession implement it, so the run loop never cares which
  * agent CLI is behind a seat (configuration-based; see RoleSpec.provider).
  */
 export interface AgentSession {

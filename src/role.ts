@@ -1,7 +1,7 @@
 import path from "node:path";
 import { readFile } from "node:fs/promises";
 import { ClaudeSession, type AgentSession } from "./claude.js";
-import { GeminiSession } from "./gemini.js";
+import { AgySession } from "./agy.js";
 import {
   clearFile,
   isSafeWord,
@@ -72,45 +72,50 @@ export async function runRole(
       (permissionMode ? `, permission-mode: ${permissionMode}` : "")
   );
 
-  let session: AgentSession;
-  if (provider === "gemini") {
-    // Gemini is stateless (v1): no session reattach; the system prompt is re-sent
-    // each turn. A resumed gemini role simply starts fresh from its mandate.
-    session = new GeminiSession({ systemPrompt, model, heartbeatPath });
-  } else {
-    // claude — stateful: reattach to the stored session if we have one, otherwise
-    // replay this role's prior turns from the transcript as context.
-    let resumeSessionId: string | undefined;
-    if (opts.resume) {
-      const stored = await readSessionId(runDir, roleName);
-      if (stored) {
-        resumeSessionId = stored;
-        console.log(`[role:${roleName}] resuming claude session ${stored}`);
+  // Both providers are stateful (claude --resume, agy --conversation), so the
+  // resume handling is shared: reattach the stored session id when there is one,
+  // otherwise replay this role's prior turns into its mandate as memory.
+  let resumeSessionId: string | undefined;
+  if (opts.resume) {
+    const stored = await readSessionId(runDir, roleName);
+    if (stored) {
+      resumeSessionId = stored;
+      console.log(`[role:${roleName}] resuming ${provider} session ${stored}`);
+    } else {
+      const history = buildRoleHistory(await readFile(transcript, "utf8"), roleName);
+      if (history) {
+        systemPrompt +=
+          "\n\nThis run is resuming and your previous session could not be reattached. " +
+          "Here is the prior conversation between you and the orchestrator, oldest first. " +
+          "Treat it as your memory of what has already happened, then continue from where it leaves off.\n\n" +
+          "----- PRIOR CONVERSATION -----\n" +
+          history +
+          "\n----- END PRIOR CONVERSATION -----";
+        console.log(`[role:${roleName}] no stored session; replaying transcript history`);
       } else {
-        const history = buildRoleHistory(await readFile(transcript, "utf8"), roleName);
-        if (history) {
-          systemPrompt +=
-            "\n\nThis run is resuming and your previous session could not be reattached. " +
-            "Here is the prior conversation between you and the orchestrator, oldest first. " +
-            "Treat it as your memory of what has already happened, then continue from where it leaves off.\n\n" +
-            "----- PRIOR CONVERSATION -----\n" +
-            history +
-            "\n----- END PRIOR CONVERSATION -----";
-          console.log(`[role:${roleName}] no stored session; replaying transcript history`);
-        } else {
-          console.log(`[role:${roleName}] no stored session and no prior history; starting fresh`);
-        }
+        console.log(`[role:${roleName}] no stored session and no prior history; starting fresh`);
       }
     }
-    session = new ClaudeSession({
-      systemPrompt,
-      resumeSessionId,
-      onSessionId: (id) => void writeSessionId(runDir, roleName, id),
-      model,
-      heartbeatPath,
-      permissionMode,
-    });
   }
+
+  /**
+   * Build a seat for this role. Used for both the initial session and recycling,
+   * so the two cannot drift on provider, model or permission posture.
+   */
+  const makeSession = (prompt: string, resumeId?: string): AgentSession => {
+    const common = { model, heartbeatPath, permissionMode };
+    const onSessionId = (id: string) => void writeSessionId(runDir, roleName, id);
+    return provider === "agy"
+      ? new AgySession({ systemPrompt: prompt, resumeId, onSessionId, ...common })
+      : new ClaudeSession({
+          systemPrompt: prompt,
+          resumeSessionId: resumeId,
+          onSessionId,
+          ...common,
+        });
+  };
+
+  let session: AgentSession = makeSession(systemPrompt, resumeSessionId);
 
   let busy = false;
   let stopped = false;
@@ -137,8 +142,8 @@ export async function runRole(
   /**
    * Recycle the session: ask the outgoing session for a concise handoff note,
    * then reseed a FRESH session from the mandate + handoff. Bounds the role's
-   * resident context on long runs. Claude-backed roles only (gemini is
-   * per-turn stateless already).
+   * resident context on long runs. Applies to both providers — claude and agy
+   * are each stateful, so each accumulates context across turns.
    */
   const recycleSession = async (): Promise<void> => {
     console.log(
@@ -152,16 +157,11 @@ export async function runRole(
         "Reply with ONLY the note."
     );
     await logTurn();
-    session = new ClaudeSession({
-      systemPrompt:
-        baseSystemPrompt +
+    session = makeSession(
+      baseSystemPrompt +
         "\n\nHANDOFF FROM YOUR PREVIOUS SESSION (treat as your memory of the run so far):\n" +
-        handoff,
-      onSessionId: (id) => void writeSessionId(runDir, roleName, id),
-      model,
-      heartbeatPath,
-      permissionMode,
-    });
+        handoff
+    );
     turnsSinceSpawn = 0;
   };
 
@@ -179,7 +179,8 @@ export async function runRole(
     // message. We only consume the inbox and reply via the outbox.
     await clearFile(inbox);
 
-    if (RECYCLE_TURNS > 0 && provider === "claude" && turnsSinceSpawn >= RECYCLE_TURNS) {
+    // Both providers are stateful now, so recycling is no longer claude-only.
+    if (RECYCLE_TURNS > 0 && turnsSinceSpawn >= RECYCLE_TURNS) {
       await recycleSession();
     }
 

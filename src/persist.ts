@@ -26,28 +26,36 @@ export function resolveModel(tier?: string): string {
 
 /**
  * Backing agent CLI for a seat. Configuration-based (set per role / via env) —
- * md-agent never auto-detects what's installed. "claude" is the default and the
- * only fully-featured provider (stateful sessions); "gemini" is a stateless
- * provider (see GeminiSession).
+ * md-agent never auto-detects what's installed. Both providers are stateful:
+ * claude resumes with --resume, agy with --conversation.
+ *
+ * "agy" is Antigravity, which replaced the deprecated Gemini CLI. It is not a
+ * rename: the old provider was stateless and re-sent its mandate every turn,
+ * while agy keeps a conversation, so an agy seat now behaves like a claude seat.
  */
-export type Provider = "claude" | "gemini";
+export type Provider = "claude" | "agy";
 export const DEFAULT_PROVIDER: Provider = "claude";
 
 export function normalizeProvider(p?: string): Provider {
-  return p === "gemini" ? "gemini" : "claude";
+  return p === "agy" ? "agy" : "claude";
 }
 
-/** Concrete gemini model ids per tier — the cheap/mid/strong rungs. */
-export const GEMINI_MODEL_IDS: Record<ModelTier, string> = {
-  opus: "gemini-2.5-pro",
-  sonnet: "gemini-2.5-flash",
-  haiku: "gemini-2.5-flash-lite",
+/**
+ * Concrete agy model ids per tier — the cheap/mid/strong rungs. agy encodes
+ * reasoning effort in the id itself (…-low/-medium/-high) rather than via a
+ * separate flag, so the tier ladder climbs both model and effort at once.
+ * `agy models` lists what is available.
+ */
+export const AGY_MODEL_IDS: Record<ModelTier, string> = {
+  opus: "gemini-3.1-pro-high",
+  sonnet: "gemini-3.7-flash-high",
+  haiku: "gemini-3.7-flash-low",
 };
 
 /** Resolve (provider, tier) to a concrete model id for that provider. */
 export function resolveModelFor(provider: Provider, tier?: string): string {
   const t = normalizeTier(tier);
-  return provider === "gemini" ? GEMINI_MODEL_IDS[t] : MODEL_IDS[t];
+  return provider === "agy" ? AGY_MODEL_IDS[t] : MODEL_IDS[t];
 }
 
 export interface RoleSpec {
@@ -58,11 +66,14 @@ export interface RoleSpec {
   /** Backing agent CLI for this role. Default "claude". Configuration-based. */
   provider?: Provider;
   /**
-   * Claude CLI --permission-mode for this role's session (e.g. "acceptEdits",
-   * "bypassPermissions", "plan"). In headless -p mode a denied tool call simply
-   * fails, so a role that must edit files needs this (or a global settings
-   * allowlist on the host). Falls back to MD_AGENT_ROLE_PERMISSION_MODE, then
-   * to the CLI default. Claude provider only.
+   * Tool-permission posture for this role's session, written in claude's
+   * vocabulary ("acceptEdits", "bypassPermissions", "plan"). In headless print
+   * mode a denied tool call simply fails, so a role that must edit files needs
+   * this (or a global settings allowlist on the host). Falls back to
+   * MD_AGENT_ROLE_PERMISSION_MODE, then to the CLI default.
+   *
+   * Both providers honour it: claude passes it to --permission-mode; agy maps it
+   * onto --mode accept-edits / --mode plan / --dangerously-skip-permissions.
    */
   permissionMode?: string;
 }
@@ -123,7 +134,7 @@ export interface RunState {
    * `verify.maxFailures`, bump every role to the next tier (fresh, stronger
    * sessions) and retry with the failure context; HALT only once the ladder is
    * exhausted. e.g. ["sonnet","opus"]. Each role keeps its provider; tiers map per
-   * provider (claude haiku/sonnet/opus, gemini flash-lite/flash/pro).
+   * provider (claude haiku/sonnet/opus, agy flash-low/flash-high/pro-high).
    */
   escalation?: ModelTier[];
 }

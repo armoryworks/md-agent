@@ -19,7 +19,7 @@ import { Dashboard } from "./dashboard.js";
 import { parseTeamBlocks, runHuddle, type TeamIO, type TeamResult, type TeamSpec } from "./team.js";
 import {
   DEFAULT_TIER,
-  GEMINI_MODEL_IDS,
+  AGY_MODEL_IDS,
   type LaunchConfig,
   MODEL_IDS,
   type ModelTier,
@@ -113,10 +113,10 @@ function resolveOrchModel(): string | undefined {
  * is configured to use — there is no system scan.
  */
 function probeProvider(p: Provider): Promise<{ ok: boolean; detail: string }> {
-  const cmd = p === "gemini" ? "gemini" : "claude";
+  const cmd = p === "agy" ? "agy" : "claude";
   const args =
-    p === "gemini"
-      ? ["-p", "reply with: ok", "-o", "json", "-y", "--skip-trust", "-m", GEMINI_MODEL_IDS.haiku]
+    p === "agy"
+      ? ["-p", "reply with: ok", "--output-format", "json", "--model", AGY_MODEL_IDS.haiku]
       : ["-p", "reply with: ok", "--output-format", "json"];
   const timeoutMs = 60_000;
   return new Promise((resolve) => {
@@ -125,7 +125,7 @@ function probeProvider(p: Provider): Promise<{ ok: boolean; detail: string }> {
     let child: ChildProcess;
     try {
       // cross-spawn (not node's spawn) so the agent CLI resolves on Windows,
-      // where it's a `claude.cmd`/`gemini.cmd` shim that bare spawn won't find.
+      // where it's a `claude.cmd` shim that bare spawn won't find.
       child = crossSpawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
     } catch (e) {
       resolve({ ok: false, detail: `could not spawn "${cmd}": ${(e as Error).message}` });
@@ -151,8 +151,9 @@ function probeProvider(p: Provider): Promise<{ ok: boolean; detail: string }> {
     });
     child.on("exit", (code) => {
       clearTimeout(timer);
-      // gemini -o json can emit an error object; treat that as a failure regardless of code.
-      if (p === "gemini" && /"error"\s*:/.test(out)) {
+      // agy reports the outcome in `status`, and a non-SUCCESS envelope can arrive
+      // on exit 0 — so the status, not the exit code, decides.
+      if (p === "agy" && /"status"\s*:\s*"(?!SUCCESS)/.test(out)) {
         resolve({ ok: false, detail: tail(out) || tail(err) });
         return;
       }
@@ -1140,10 +1141,10 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     ask: askMember,
     appendChannel,
     isStopping: () => stopping,
-    // Claude-backed members keep their session across huddle rounds, so the
-    // engine sends them only the partner's latest message instead of the tail.
-    isStateful: (role) =>
-      normalizeProvider(roles.find((r) => r.name === role)?.provider) === "claude",
+    // Both providers keep their session across huddle rounds (claude --resume,
+    // agy --conversation), so a member that has already spoken gets only the
+    // partner's latest message instead of the whole tail.
+    isStateful: () => true,
   };
 
   async function startTeam(spec: TeamSpec): Promise<void> {

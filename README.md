@@ -133,10 +133,16 @@ to a doc included whole), `inbox` (path to a handshake doc prepended as context)
 by the one-time bootstrap turn; supply them all and that LLM call is **skipped**,
 so the run starts instantly.
 
-- **`roles[].provider`** — `"claude"` (default) or `"gemini"`. Configuration-based,
-  no autodetection. The orchestrator is always `claude`. Gemini seats are stateless
-  (no cross-turn session) — good for cheap/mechanical/self-contained role work. The
-  tier (`model`) maps per provider (claude opus/sonnet/haiku, gemini pro/flash/flash-lite).
+- **`roles[].provider`** — `"claude"` (default) or `"agy"` (Antigravity, which
+  replaced the deprecated Gemini CLI). Configuration-based, no autodetection. The
+  orchestrator is always `claude`. **Both providers are stateful** — claude resumes
+  with `--resume`, agy with `--conversation` — so an agy seat keeps its context
+  across turns and is recycled on the same schedule. Use agy seats for cheap,
+  mechanical or high-volume role work. The tier (`model`) maps per provider
+  (claude opus/sonnet/haiku, agy `gemini-3.1-pro-high` / `gemini-3.7-flash-high` /
+  `gemini-3.7-flash-low`); `agy models` lists what is available. `permissionMode`
+  is honored by both: claude passes it to `--permission-mode`, agy maps it onto
+  `--mode accept-edits` / `--mode plan` / `--dangerously-skip-permissions`.
 - **`verify`** (`{cmd, cwd?, maxFailures?, timeoutSec?}`) — deterministic completion
   gate + circuit breaker. The orchestrator's `[[PHASE-COMPLETE]]` is honored only when
   `cmd` exits 0; a non-zero exit feeds the output back to fix, and after `maxFailures`
