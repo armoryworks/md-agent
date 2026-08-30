@@ -357,6 +357,17 @@ export async function recordUsage(
   return next;
 }
 
+/** Cumulative usage for one participant (zeroed if it hasn't recorded a turn yet). */
+export async function readCost(runDir: string, who: string): Promise<CostRecord> {
+  const file = costFile(runDir, who);
+  if (!existsSync(file)) return { ...ZERO_COST };
+  try {
+    return { ...ZERO_COST, ...(JSON.parse(await readFile(file, "utf8")) as CostRecord) };
+  } catch {
+    return { ...ZERO_COST };
+  }
+}
+
 /** Sum every participant's cost file into a single run-wide total. */
 export async function readRunCost(runDir: string): Promise<CostRecord> {
   const dir = path.join(runDir, "sessions");

@@ -23,6 +23,12 @@ interface DashRole {
 
 const ESC = "\x1b";
 
+function formatTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${Math.round(n / 1000)}k`;
+  return `${n}`;
+}
+
 export class Dashboard {
   private readonly enabled: boolean;
   private readonly noColor: boolean;
@@ -36,6 +42,7 @@ export class Dashboard {
   private active: string | null = null;
   private headerRows = 0;
   private costText = "";
+  private readonly turnInfo = new Map<string, string>();
 
   private readonly origLog = console.log;
   private readonly origWarn = console.warn;
@@ -123,6 +130,16 @@ export class Dashboard {
     this.redraw();
   }
 
+  /**
+   * Show a seat's most recent turn cost and cache-read volume next to its name,
+   * so an expensive seat (e.g. runaway cache-read from a stale session) is
+   * visible live instead of only in sessions/*.cost.json after the run.
+   */
+  setRoleTurn(name: string, costUsd: number, cacheReadTokens: number): void {
+    this.turnInfo.set(name, `$${costUsd.toFixed(2)}·${formatTokens(cacheReadTokens)}`);
+    this.redraw();
+  }
+
   // ---------- internals ----------
 
   private readonly onResize = (): void => {
@@ -183,7 +200,8 @@ export class Dashboard {
     const tokens = this.roles.map((r) => {
       const st = this.status.get(r.name) ?? "idle";
       const glyph = st === "send" ? "→" : st === "reply" ? "←" : "·";
-      const plain = `${glyph} ${r.name}`;
+      const info = this.turnInfo.get(r.name);
+      const plain = `${glyph} ${r.name}${info ? ` ${info}` : ""}`;
       const isActive = r.name === this.active;
       const code = isActive
         ? "7;1" // reverse + bold

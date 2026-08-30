@@ -31,6 +31,8 @@ import {
   normalizeProvider,
   normalizeTier,
   type Provider,
+  type CostRecord,
+  readCost,
   readLedger,
   readRunCost,
   readState,
@@ -906,6 +908,20 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   // P3 Step 1: cumulative orchestrator cache accounting (hit-ratio measurement).
   let orchCacheRead = 0;
   let orchCacheable = 0;
+  // Last cumulative cost snapshot seen per role, so a reply can diff against it
+  // to show that ONE turn's cost/cache-read live in the dashboard (reusing the
+  // cost file the role already wrote — no new SDK calls).
+  const lastRoleCost = new Map<string, CostRecord>();
+  async function showRoleTurnCost(name: string): Promise<void> {
+    try {
+      const cur = await readCost(runDir, name);
+      const prev = lastRoleCost.get(name);
+      lastRoleCost.set(name, cur);
+      dash.setRoleTurn(name, cur.costUsd - (prev?.costUsd ?? 0), cur.cacheReadTokens - (prev?.cacheReadTokens ?? 0));
+    } catch {
+      // Live per-seat cost is best-effort; never let it break the run.
+    }
+  }
 
   // ---------- role-liveness watchdog (state; logic armed lower down) ----------
   // A role child that crashes or hangs without writing its outbox would strand
@@ -1361,6 +1377,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
         pendingTeamReply.delete(r.name);
         await clearFile(outbox);
         dash.flow(r.name, "orch");
+        await showRoleTurnCost(r.name);
         await appendTranscript(transcript, `← ${r.name} (team)`, content);
         printRoleReply(r.name, content);
         pending(content);
@@ -1374,6 +1391,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
       }
 
       dash.flow(r.name, "orch");
+      await showRoleTurnCost(r.name);
       pendingSince.delete(r.name); // role replied — clear its outstanding dispatch
       orchStallNudges = 0; // a role reply is progress — reset the stall escalation
       await appendTranscript(transcript, `← ${r.name}`, content); // full reply → permanent record
