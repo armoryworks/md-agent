@@ -33,7 +33,14 @@ import {
  * requiring an operator to discover the env var after the fact. An explicit
  * MD_AGENT_ROLE_RECYCLE_TURNS always wins, including "0" to opt back out.
  */
-const DEFAULT_RECYCLE_TURNS = 20;
+// 8, not 20: the run this was drawn from had its worst seat reach 1.44M
+// cache-read tokens per turn across EIGHT turns, so a 20-turn threshold would
+// never have fired for the very case cited as the reason to turn this on.
+//
+// Recycling is also only half an answer. In a later run a seat hit 2.4M
+// cache-read on its FIRST turn — that cost is the initial context load, which no
+// turn-count threshold touches. This bounds growth, not baseline.
+const DEFAULT_RECYCLE_TURNS = 8;
 const RECYCLE_TURNS = (() => {
   const raw = process.env.MD_AGENT_ROLE_RECYCLE_TURNS;
   if (raw == null) return DEFAULT_RECYCLE_TURNS;
