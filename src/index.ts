@@ -10,6 +10,7 @@ import { runJourney } from "./journey.js";
 import { runRole } from "./role.js";
 
 import { stopRun } from "./stop.js";
+import { runDigest, watchRun } from "./watch.js";
 
 const USAGE = `md-agent ${VERSION} — a team of agent CLIs on one goal
 
@@ -20,6 +21,9 @@ const USAGE = `md-agent ${VERSION} — a team of agent CLIs on one goal
   md-agent --resume <run-dir> [--minutes N] [--quiet]
   md-agent --stop <run-dir>         end a running (detached) run cleanly
   md-agent --inspect <run-dir> [--seat <name>]
+  md-agent --status <run-dir>       one digest: what each seat is on, tool calls, artifacts, cost
+  md-agent --watch <run-dir>        terminal: the live umbrella · piped: the digest on each change
+                                    [--every N] seconds between checks · --once one frame · --json data
   md-agent --context <brief.md>     wizard, seeded from a document
   md-agent skill install [--project] | uninstall | show
   md-agent --version | -v           md-agent --help | -h
@@ -53,12 +57,18 @@ function parse() {
     // Open a seat's trace from a run dir: --inspect <run-dir> [--seat <name>]
     inspect: { type: "string" },
     seat: { type: "string" },
+    // One digest of a run (--status) or a repeating one until it ends (--watch [--every N sec]).
+    status: { type: "string" },
+    watch: { type: "string" },
+    every: { type: "string" },
     // With `skill install`: into ./.claude/skills instead of ~/.claude/skills.
     project: { type: "boolean" },
     version: { type: "boolean", short: "v" },
     help: { type: "boolean", short: "h" },
     // End a running run cleanly by placing a STOP file in its dir (then SIGTERM if it lingers).
     stop: { type: "string" },
+    once: { type: "boolean" },
+    json: { type: "boolean" },
   },
   allowPositionals: true,
 });
@@ -92,6 +102,14 @@ if (values.help || positionals[0] === "help") {
   await runInit();
 } else if (positionals[0] === "skill") {
   await installSkill(positionals[1], { scope: values.project ? "project" : "user" });
+} else if (values.status) {
+  console.log((await runDigest(path.resolve(values.status))).text);
+} else if (values.watch) {
+  await watchRun(path.resolve(values.watch), {
+    once: !!values.once,
+    json: !!values.json,
+    everySec: values.every ? Math.max(5, Number(values.every)) : 120,
+  });
 } else if (values.inspect) {
   const runDir = path.resolve(values.inspect);
   if (values.seat) {

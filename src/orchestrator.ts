@@ -1151,6 +1151,12 @@ interface LoopCtx {
 
 /** Shared event loop used by both fresh runs and resumes. */
 async function runLoop(ctx: LoopCtx): Promise<void> {
+  // Declared first: notePingPong runs from the first sendToRole, long before the
+  // loop guard's definition below is reached, and a `let` is not hoisted.
+  const PINGPONG_WARN = 4;
+  const PINGPONG_HALT = 6;
+  let pingPongSeat: string | null = null;
+  let pingPongCount = 0;
   const { runDir, goal, roles, transcript, orch, children, kickoff, teamsEnabled, budgetMinutes, autoComplete, verify, escalation, isolation, budget } = ctx;
   // This run's journal settings; the `journals` keyword can turn them back on mid-run.
   let journalCfg: JournalConfig | undefined = ctx.journal;
@@ -2657,10 +2663,6 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   // cache reads. Deterministic: warn the orchestrator at PINGPONG_WARN
   // consecutive dispatches to the same seat, HALT at PINGPONG_HALT. Any
   // dispatch to a different seat, or a verify PASS, resets it.
-  const PINGPONG_WARN = 4;
-  const PINGPONG_HALT = 6;
-  let pingPongSeat: string | null = null;
-  let pingPongCount = 0;
   async function notePingPong(role: string): Promise<void> {
     if (role === pingPongSeat) pingPongCount++;
     else {

@@ -327,6 +327,17 @@ Version:
 md-agent --version        # also -v, or `md-agent version`
 ```
 
+Watch a run from anywhere — a second terminal, or a Claude Code session that
+launched it detached — built from the run's files alone:
+
+```bash
+npm run dev -- --watch runs/<dir>            # terminal: the live umbrella, repainted every 2s until the run ends
+npm run dev -- --watch runs/<dir> --once     # one frame (plain text when piped) — the thing to paste into a message
+npm run dev -- --status runs/<dir>           # one digest: what each seat is on, its tool calls by kind, last line, cost, artifacts
+npm run dev -- --watch runs/<dir> | cat      # piped: the digest printed whenever it changes (--every N seconds) until the run ends
+npm run dev -- --watch runs/<dir> --json     # the frame as data
+```
+
 Stop a run that has no console (started detached, or from another terminal):
 
 ```bash
@@ -595,6 +606,8 @@ runs/<timestamp>-<name>/
 | `src/index.ts`         | CLI entry / arg parsing (`init`, `--inspect`, …) |
 | `src/home.ts`          | home screen: run discovery, continue/resume/inspect/combine/shelve menus |
 | `src/init.ts`          | `md-agent init` — starter launch config |
+| `src/watch.ts`         | `--watch` / `--status`: the umbrella and the digest from a run's files |
+| `src/stop.ts`          | `--stop`: end a detached run cleanly |
 | `src/journal.ts`       | journals: private repo per project, push/pull, visibility + secret checks, the run-end offer |
 | `src/inspect.ts`       | seat traces: render `log/<seat>.jsonl`, pager |
 | `src/plan.ts`          | the planner: goal + repo + design brief → recommended team |

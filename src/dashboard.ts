@@ -90,7 +90,7 @@ export class Dashboard {
   private readonly runName: string;
   private readonly goal: string;
   private readonly seats: Seat[];
-  private readonly startedAt = Date.now();
+  private readonly startedAt: number;
 
   private intervalMin: number;
   private orchText = "waiting…";
@@ -109,8 +109,9 @@ export class Dashboard {
   private readonly origWarn = console.warn;
   private readonly origError = console.error;
 
-  constructor(opts: { runName: string; goal?: string; roles: DashRole[]; intervalMin: number; theme?: Theme }) {
+  constructor(opts: { runName: string; goal?: string; roles: DashRole[]; intervalMin: number; theme?: Theme; startedAt?: number }) {
     this.runName = opts.runName;
+    this.startedAt = opts.startedAt ?? Date.now();
     this.goal = opts.goal ?? "";
     this.intervalMin = opts.intervalMin;
     this.t = opts.theme ?? defaultTheme;
@@ -217,6 +218,28 @@ export class Dashboard {
     this.redraw();
   }
 
+  /** The panel as lines, for a watcher that paints it itself (no scroll region, no console capture). */
+  snapshot(): string[] {
+    return this.render();
+  }
+
+  /** Set the orchestrator's turn count and status directly (a watcher reading files). */
+  setOrch(turns: number, text: string, since: number): void {
+    this.orchTurns = turns;
+    this.orchText = text;
+    this.orchSince = since;
+  }
+
+  /** Set a seat's state with an explicit start time (a watcher reading files). */
+  setSeat(name: string, state: SeatState, since: number, turns: number, detail?: { handoffTo?: string }): void {
+    const s = this.seat(name);
+    if (!s) return;
+    s.state = state;
+    s.since = since;
+    s.turns = turns;
+    if (detail?.handoffTo) s.handoffTo = detail.handoffTo;
+  }
+
   /** Override a seat's state outside the send/reply flow (watchdog, huddles, stops). */
   setSeatState(name: string, state: SeatState, detail?: { handoffTo?: string }): void {
     const s = this.seat(name);
@@ -228,7 +251,7 @@ export class Dashboard {
   }
 
   /** The orchestrator's own last-turn and net spend. */
-  setOrchSpend(turn: Spend, net: Spend): void {
+  setOrchSpend(turn: Spend | null, net: Spend): void {
     this.orchTurn_ = turn;
     this.orchNet = net;
     this.redraw();
@@ -268,7 +291,7 @@ export class Dashboard {
    * (e.g. runaway cache-read from a stale session) is visible live instead of
    * only in sessions/*.cost.json after the run.
    */
-  setRoleSpend(name: string, turn: Spend, net: Spend, cacheReadTokens: number): void {
+  setRoleSpend(name: string, turn: Spend | null, net: Spend, cacheReadTokens: number): void {
     const s = this.seat(name);
     if (!s) return;
     s.turn = turn;

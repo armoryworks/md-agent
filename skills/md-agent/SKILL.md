@@ -88,18 +88,16 @@ A run's record (state, ledger, transcript, traces, spend, `JOURNAL.md`) can be p
 
 ## Watching a run
 
-From the console it was started in: `show <seat>` opens the seat's trace; `stop` / ctrl-x, `journals`, `exit` as above.
-
-From anywhere else, the run folder is the live view:
-
+- `md-agent --status runs/<dir>` — one digest: elapsed time, the last transcript headings, the ledger's artifacts, and per seat its tool calls by kind, what it is on right now, its last spoken line and cost.
+- `md-agent --watch runs/<dir> [--every N]` — the same digest, printed whenever it changes (default every 2 min), until the run ends or HALTs.
+- `md-agent --inspect runs/<dir> --seat <name>` — a seat's full trace: prompts, tool calls, results, denials, cost per turn.
 - `tail -f runs/<dir>/transcript.md` — every message, checkpoint and verify result as it happens.
-- `md-agent --inspect runs/<dir> --seat <name>` — a seat's prompts, tool calls, results, denials and cost per turn.
-- `runs/<dir>/ledger.md` — what the orchestrator currently believes; `runs/<dir>/log/<seat>.jsonl` — the raw stream.
-- `HALT.txt` appearing in the run folder means the run stopped itself — the watchdog (a hung or deadlocked seat), the verify circuit breaker, or a hard budget line; the file holds the reason. `--resume runs/<dir>` (or *Continue* on the home screen) clears it and picks the run up.
-- A seat whose provider is out of quota stops itself and says so in its outbox with the reset time; the orchestrator reassigns. A seat dispatched to 4× in a row with nothing verified gets the orchestrator warned; 6× halts the run (loop guard).
-- **To stop a detached run:** `md-agent --stop runs/<dir>` (or `touch runs/<dir>/STOP`). The run tears down cleanly within seconds — seats told to exit, workspaces audited and verified, `endedAt` stamped; `--stop` only sends SIGTERM if the process lingers. Never kill the PIDs first.
+- `md-agent --watch runs/<dir> --once` — one frame of the **umbrella** (goal, orchestrator, every seat's state, spend, windows, recent events) as text — paste it into a message to show the user where the run stands. On a terminal, `--watch` without `--once` is the live panel.
+- `md-agent --stop runs/<dir>` — end a detached run cleanly (`touch runs/<dir>/STOP` does the same). Seats told to exit, workspaces audited and verified, `endedAt` stamped. Never kill the PIDs first.
+- `HALT.txt` in the run folder means the run stopped itself — the watchdog, the verify circuit breaker, a hard budget line, or the loop guard; the file holds the reason. `--resume` / *Continue* clears it. A seat out of quota stops itself and says so in its outbox with the reset time; the orchestrator reassigns.
+- From the console the run was started in: `show <seat>`, `stop` / ctrl-x, `journals`, `exit`.
 
-**Watching is the default.** Whenever Claude launches or resumes a run it does three things without being asked: starts the run detached (`md-agent --launch … > run.log 2>&1 < /dev/null &`), immediately arms a watch on `run.log` or `transcript.md` for `verify`, `checkpoint`, `HALT` and the teardown branch list so results are reported as they land, and prints the `tail -f` and `--inspect` commands above so the user can follow along in a terminal. A detached run has no console, so `show`/`stop`/`exit` are not available for it; a user who wants the console starts `md-agent --launch` in their own terminal and Claude watches the same files.
+**Watching is the default, and it means progress, not just endings.** Whenever Claude launches or resumes a run it does this without being asked: starts the run detached (`md-agent --launch … > run.log 2>&1 < /dev/null &`); arms `md-agent --watch runs/<dir>` as a background watch so each digest is reported as it lands; arms a second watch on `run.log` for `verify`, `checkpoint`, `HALT`, `loop-guard` and the teardown branch list; and prints the `--status`, `--inspect` and `tail -f` commands so the user can follow along in a terminal. Between events Claude answers "what is it doing" from `--status`, never with "waiting". **Show the umbrella by default:** when reporting on a run — at launch, on each digest that lands, at checkpoints and at the end — include the output of `md-agent --watch runs/<dir> --once` so the user sees the run's state as a panel, not only prose; the digest is for Claude to read, the umbrella is for the user to see. A detached run has no console, so `show`/`stop`/`exit` are not available for it; use `--stop`, or start `md-agent --launch` in your own terminal and let Claude watch the same files.
 
 ## Reading a run
 

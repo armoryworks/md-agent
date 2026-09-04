@@ -30,3 +30,4 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+md-agent.launch.json
