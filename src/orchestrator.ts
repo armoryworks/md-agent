@@ -830,6 +830,11 @@ export async function launchRun(setup: RunSetup): Promise<void> {
       .map((r) => `    ${r.name} → ${r.model}`)
       .join("\n")}\n`
   );
+  const runRel = path.relative(process.cwd(), runDir) || runDir;
+  console.log(
+    `[orchestrator] watch:   tail -f ${path.join(runRel, "transcript.md")}\n` +
+      `[orchestrator] inspect: md-agent --inspect ${runRel} --seat <${roles.map((r) => r.name).join("|")}>\n`
+  );
 
   // -------- Spawn role processes + enter the loop --------
   const children = roles.map((r) => spawnRole(r.name, runDir, false));
@@ -966,6 +971,11 @@ export async function resumeOrchestrator(
   console.log(`\n[md-agent] v${VERSION}`);
   console.log(`[orchestrator] resuming run: ${runDir}`);
   console.log(`[orchestrator] roles: ${roles.map((r) => r.name).join(", ")}`);
+  const runRel = path.relative(process.cwd(), runDir) || runDir;
+  console.log(
+    `[orchestrator] watch:   tail -f ${path.join(runRel, "transcript.md")}\n` +
+      `[orchestrator] inspect: md-agent --inspect ${runRel} --seat <${roles.map((r) => r.name).join("|")}>\n`
+  );
 
   // A resume is a retry: the halt marker and the previous end-of-run stamp
   // describe a run that is no longer over. Keep the reason in the transcript.

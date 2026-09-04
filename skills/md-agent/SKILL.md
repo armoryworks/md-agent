@@ -68,6 +68,19 @@ During a run, typed at the console: `show <seat>` opens its trace; `stop` / **ct
 
 A run's record (state, ledger, transcript, traces, spend, `JOURNAL.md`) can be pushed to a **private repo per project** (`<owner>/<project>-md-agent`) and pulled elsewhere. md-agent asks at the end of every run — including interrupted ones — unless told "never"; a public repo is refused; journals are scanned for credential shapes first. Never commit `runs/` to the project repo.
 
+## Watching a run
+
+From the console it was started in: `show <seat>` opens the seat's trace; `stop` / ctrl-x, `journals`, `exit` as above.
+
+From anywhere else, the run folder is the live view:
+
+- `tail -f runs/<dir>/transcript.md` — every message, checkpoint and verify result as it happens.
+- `md-agent --inspect runs/<dir> --seat <name>` — a seat's prompts, tool calls, results, denials and cost per turn.
+- `runs/<dir>/ledger.md` — what the orchestrator currently believes; `runs/<dir>/log/<seat>.jsonl` — the raw stream.
+- `HALT.txt` appearing in the run folder means the run stopped itself — the watchdog (a hung or deadlocked seat), the verify circuit breaker, or a hard budget line; the file holds the reason. `--resume runs/<dir>` (or *Continue* on the home screen) clears it and picks the run up.
+
+**Watching is the default.** Whenever Claude launches or resumes a run it does three things without being asked: starts the run detached (`md-agent --launch … > run.log 2>&1 < /dev/null &`), immediately arms a watch on `run.log` or `transcript.md` for `verify`, `checkpoint`, `HALT` and the teardown branch list so results are reported as they land, and prints the `tail -f` and `--inspect` commands above so the user can follow along in a terminal. A detached run has no console, so `show`/`stop`/`exit` are not available for it; a user who wants the console starts `md-agent --launch` in their own terminal and Claude watches the same files.
+
 ## Reading a run
 
 - `runs/<dir>/ledger.md` — the orchestrator's memory; `## Artifacts produced` lists outputs.
