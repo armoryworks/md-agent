@@ -12,6 +12,7 @@ import {
 } from "./ipc.js";
 import {
   buildRoleHistory,
+  logPath,
   normalizeProvider,
   readSessionId,
   readState,
@@ -135,7 +136,13 @@ export async function runRole(
    * so the two cannot drift on provider, model or permission posture.
    */
   const makeSession = (prompt: string, resumeId?: string): AgentSession => {
-    const common = { model, heartbeatPath, permissionMode, cwd: workspaceDir };
+    const common = {
+      model,
+      heartbeatPath,
+      permissionMode,
+      cwd: workspaceDir,
+      logPath: logPath(runDir, roleName),
+    };
     const onSessionId = (id: string) => void writeSessionId(runDir, roleName, id);
     return provider === "agy"
       ? new AgySession({ systemPrompt: prompt, resumeId, onSessionId, ...common })

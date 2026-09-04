@@ -5,11 +5,14 @@ import { spawn } from "node:child_process";
 import readline from "node:readline/promises";
 import { ClaudeSession } from "./claude.js";
 import {
+  type JourneyRef,
   MODEL_IDS,
   type ModelTier,
+  readState,
   recentCheckpoints,
   recordUsage,
   type RoleSpec,
+  type RunState,
   type VerifySpec,
   type Isolation,
 } from "./persist.js";
@@ -52,6 +55,59 @@ export interface Journey {
   phases: JourneyPhase[];
 }
 
+/** Where a journey phase's run lives — one fixed dir per (journey, phase). */
+export function phaseRunDir(journeyName: string, phaseIndex: number, phaseId: string): string {
+  return path.resolve("runs", `journey-${journeyName}-${pad(phaseIndex)}-${phaseId}`);
+}
+
+/**
+ * How a phase run stands, from its state on disk: never started, ended cleanly,
+ * halted by the watchdog, or unfinished (killed mid-flight, or still running).
+ */
+export type PhaseStatus = "absent" | "complete" | "halted" | "unfinished";
+
+export async function phaseStatus(runDir: string): Promise<{ status: PhaseStatus; state?: RunState }> {
+  if (!existsSync(path.join(runDir, "state.json"))) return { status: "absent" };
+  let state: RunState;
+  try {
+    state = await readState(runDir);
+  } catch {
+    return { status: "absent" };
+  }
+  if (existsSync(path.join(runDir, "HALT.txt"))) return { status: "halted", state };
+  const ledgerFile = path.join(runDir, "ledger.md");
+  const ledgerLen = existsSync(ledgerFile) ? (await readFile(ledgerFile, "utf8")).trim().length : 0;
+  if (ledgerLen === 0) return { status: "absent", state }; // never took a turn — start it fresh
+  if (state.endedAt) return { status: "complete", state };
+  return { status: "unfinished", state };
+}
+
+/**
+ * The phase a journey should pick up at: the first one that is not cleanly
+ * complete. Returns null when every phase is done.
+ */
+export async function nextPhase(journey: Journey): Promise<{ index: number; status: PhaseStatus } | null> {
+  for (let i = 0; i < journey.phases.length; i++) {
+    const { status } = await phaseStatus(phaseRunDir(journey.name, i, journey.phases[i].id));
+    if (status !== "complete") return { index: i, status };
+  }
+  return null;
+}
+
+export async function readJourney(manifestAbs: string): Promise<Journey> {
+  const j = JSON.parse(await readFile(manifestAbs, "utf8")) as Journey;
+  if (!j.name || !Array.isArray(j.phases) || j.phases.length === 0) {
+    throw new Error(`Journey ${manifestAbs} needs a "name" and a non-empty "phases" array.`);
+  }
+  const ids = new Set<string>();
+  for (const p of j.phases) {
+    if (!p.id) throw new Error(`Journey ${manifestAbs}: every phase needs an "id".`);
+    if (ids.has(p.id)) throw new Error(`Journey ${manifestAbs}: duplicate phase id "${p.id}".`);
+    ids.add(p.id);
+  }
+  return j;
+}
+
 /**
  * Run a templated journey: each phase executes as its own child orchestrator
  * (full console UI), and when a phase finishes the driver authors a PARTING
@@ -64,19 +120,7 @@ export async function runJourney(manifestPath: string, opts: { from?: string } =
   const manifestAbs = path.resolve(manifestPath);
   const dir = path.dirname(manifestAbs);
 
-  const readManifest = async (): Promise<Journey> => {
-    const j = JSON.parse(await readFile(manifestAbs, "utf8")) as Journey;
-    if (!j.name || !Array.isArray(j.phases) || j.phases.length === 0) {
-      throw new Error(`Journey ${manifestPath} needs a "name" and a non-empty "phases" array.`);
-    }
-    const ids = new Set<string>();
-    for (const p of j.phases) {
-      if (!p.id) throw new Error(`Journey ${manifestPath}: every phase needs an "id".`);
-      if (ids.has(p.id)) throw new Error(`Journey ${manifestPath}: duplicate phase id "${p.id}".`);
-      ids.add(p.id);
-    }
-    return j;
-  };
+  const readManifest = (): Promise<Journey> => readJourney(manifestAbs);
 
   let journey = await readManifest();
   const total = journey.phases.length;
@@ -127,8 +171,15 @@ export async function runJourney(manifestPath: string, opts: { from?: string } =
       phase = journey.phases[i];
     }
 
-    const runDir = path.resolve("runs", `journey-${journey.name}-${pad(i)}-${phase.id}`);
+    const runDir = phaseRunDir(journey.name, i, phase.id);
     const inboxAbs = path.join(dir, "phases", phase.id, "INBOX.md");
+    const ref: JourneyRef = {
+      manifest: manifestAbs,
+      name: journey.name,
+      phaseId: phase.id,
+      phaseIndex: i,
+      total,
+    };
     const cfg = {
       name: phase.id,
       goal: phase.goal,
@@ -147,12 +198,25 @@ export async function runJourney(manifestPath: string, opts: { from?: string } =
       escalation: phase.escalation,
       isolation: phase.isolation,
       runDir,
+      journey: ref,
     };
-    const cfgPath = path.join(dir, ".phase.launch.json");
-    await writeFile(cfgPath, JSON.stringify(cfg, null, 2), "utf8");
 
+    // A phase that already has a ledger and did not end cleanly is picked up
+    // where it stopped — its roles reattach to their sessions — rather than
+    // started over. Only the first phase of this invocation qualifies: anything
+    // after it is reached by advancing, which means it is being (re)started.
+    const prior = i === startIndex ? await phaseStatus(runDir) : { status: "absent" as PhaseStatus };
     console.log(`\n[journey] ── phase ${i + 1}/${total}: ${phase.id} ─────────────────────\n`);
-    await spawnPhase(cfgPath);
+    if (prior.status === "halted" || prior.status === "unfinished") {
+      console.log(
+        `[journey] phase "${phase.id}" was ${prior.status === "halted" ? "halted" : "left unfinished"} — resuming it (roles reattach to their sessions)\n`
+      );
+      await spawnPhase({ resume: runDir });
+    } else {
+      const cfgPath = path.join(dir, ".phase.launch.json");
+      await writeFile(cfgPath, JSON.stringify(cfg, null, 2), "utf8");
+      await spawnPhase({ launch: cfgPath });
+    }
     console.log(`\n[journey] phase ${phase.id} ended.\n`);
 
     // Crash guard: an empty ledger means the orchestrator never took a turn — the
@@ -196,11 +260,12 @@ function pad(i: number): string {
   return String(i).padStart(2, "0");
 }
 
-/** Run one phase as a child `--launch` process; resolve when it exits. */
-function spawnPhase(cfgPath: string): Promise<void> {
+/** Run one phase as a child process (fresh `--launch`, or `--resume` of its run dir); resolve when it exits. */
+function spawnPhase(how: { launch: string } | { resume: string }): Promise<void> {
   const entry = process.argv[1];
   const isTs = entry.endsWith(".ts");
-  const args = [...(isTs ? ["--import", "tsx", entry] : [entry]), "--launch", cfgPath];
+  const tail = "launch" in how ? ["--launch", how.launch] : ["--resume", how.resume, "--quiet"];
+  const args = [...(isTs ? ["--import", "tsx", entry] : [entry]), ...tail];
   return new Promise<void>((resolve) => {
     const child = spawn(process.execPath, args, { stdio: "inherit", env: process.env });
     child.on("exit", () => resolve());

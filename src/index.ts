@@ -3,10 +3,12 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import { resumeOrchestrator, runFromConfig, runOrchestrator } from "./orchestrator.js";
 import { runHomeSafe } from "./home.js";
+import { runInit } from "./init.js";
+import { inspectSeat, listSeats } from "./inspect.js";
 import { runJourney } from "./journey.js";
 import { runRole } from "./role.js";
 
-const { values } = parseArgs({
+const { values, positionals } = parseArgs({
   options: {
     role: { type: "string" },
     run: { type: "string" },
@@ -25,6 +27,11 @@ const { values } = parseArgs({
     from: { type: "string" },
     // Disable the sticky top-of-console roles panel.
     "no-dashboard": { type: "boolean" },
+    // With --resume: take the stored interval/budget without prompting (journey driver).
+    quiet: { type: "boolean" },
+    // Open a seat's trace from a run dir: --inspect <run-dir> [--seat <name>]
+    inspect: { type: "string" },
+    seat: { type: "string" },
   },
   allowPositionals: true,
 });
@@ -38,7 +45,19 @@ if (values.from && !values.journey) {
   console.warn(`[md-agent] --from "${values.from}" has no effect without --journey; ignoring.`);
 }
 
-if (values.role) {
+if (positionals[0] === "init") {
+  await runInit();
+} else if (values.inspect) {
+  const runDir = path.resolve(values.inspect);
+  if (values.seat) {
+    await inspectSeat(runDir, values.seat);
+  } else {
+    const seats = await listSeats(runDir);
+    console.log(`seats in ${runDir}:`);
+    for (const s of seats) console.log(`  ${s.name}${s.hasLog ? "" : "  (no log yet)"}`);
+    console.log(`\nopen one with: md-agent --inspect ${values.inspect} --seat <name>`);
+  }
+} else if (values.role) {
   if (!values.run) {
     console.error("Error: --role requires --run <run-dir>");
     process.exit(1);
@@ -58,7 +77,7 @@ if (values.role) {
     }
     minutes = n;
   }
-  await resumeOrchestrator(path.resolve(values.resume), { minutes });
+  await resumeOrchestrator(path.resolve(values.resume), { minutes, quiet: !!values.quiet });
 } else if (values.context) {
   // --context jumps straight into the wizard with a seed doc (back-compat).
   await runOrchestrator({ contextFile: values.context });

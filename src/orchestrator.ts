@@ -1,6 +1,6 @@
 import path from "node:path";
 import { existsSync, statSync } from "node:fs";
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { spawn, ChildProcess } from "node:child_process";
 import crossSpawn from "cross-spawn";
 import readline from "node:readline";
@@ -17,6 +17,8 @@ import {
 import { parseMarkdown } from "./parse.js";
 import { chooseSelection, renderSelection } from "./select.js";
 import { Dashboard } from "./dashboard.js";
+import { listSeats, ORCH, renderSeatLog, resolveSeat, showInPager } from "./inspect.js";
+import { theme as t } from "./theme.js";
 import { parseTeamBlocks, runHuddle, type TeamIO, type TeamResult, type TeamSpec } from "./team.js";
 import {
   DEFAULT_TIER,
@@ -25,12 +27,15 @@ import {
   DEFAULT_PROVIDER,
   DEFAULT_ISOLATION,
   type Isolation,
+  type JourneyRef,
   type LaunchConfig,
+  logPath,
   MODEL_IDS,
   type ModelTier,
   normalizeProvider,
   normalizeTier,
   type Provider,
+  resolveModelFor,
   type CostRecord,
   readCost,
   readLedger,
@@ -208,8 +213,13 @@ function runProviders(roles: RoleSpec[]): Set<Provider> {
  * Build the orchestrator session — a stateless `claude` CLI process, like every
  * other seat in the run. md-agent never talks to the API directly.
  */
-function createOrchSession(systemPrompt: string): AgentSession {
-  return new ClaudeSession({ systemPrompt, model: resolveOrchModel(), stateless: true });
+function createOrchSession(systemPrompt: string, runDir: string): AgentSession {
+  return new ClaudeSession({
+    systemPrompt,
+    model: resolveOrchModel(),
+    stateless: true,
+    logPath: logPath(runDir, ORCH),
+  });
 }
 
 /**
@@ -478,6 +488,8 @@ export interface RunSetup {
   escalation?: ModelTier[];
   /** Where role edits land. Default "none" (shared cwd). */
   isolation?: Isolation;
+  /** Set by the journey driver so the phase run knows how to be resumed. */
+  journey?: JourneyRef;
 }
 
 /**
@@ -591,6 +603,7 @@ export async function launchRun(setup: RunSetup): Promise<void> {
     verify: setup.verify,
     escalation: setup.escalation,
     isolation: setup.isolation,
+    journey: setup.journey,
   };
   await writeFile(path.join(runDir, "state.json"), JSON.stringify(state, null, 2), "utf8");
 
@@ -604,7 +617,7 @@ export async function launchRun(setup: RunSetup): Promise<void> {
   // The orchestrator runs STATELESS: each turn it gets the ledger + new event,
   // so resident context stays bounded and cache expiry between slow role turns
   // becomes cheap rather than catastrophic.
-  const orch = createOrchSession(buildOrchSystem(state, runDir));
+  const orch = createOrchSession(buildOrchSystem(state, runDir), runDir);
 
   // The ledger is the orchestrator's externalized memory; it starts empty and
   // the orchestrator populates it on its first turn. It is also what makes a
@@ -638,6 +651,7 @@ export async function launchRun(setup: RunSetup): Promise<void> {
 
   await runLoop({
     runDir,
+    goal: state.goal,
     roles,
     transcript,
     orch,
@@ -697,6 +711,7 @@ export async function runFromConfig(configPath: string): Promise<void> {
     verify: cfg.verify,
     escalation: cfg.escalation,
     isolation: cfg.isolation,
+    journey: cfg.journey,
   });
 }
 
@@ -706,7 +721,13 @@ export async function runFromConfig(configPath: string): Promise<void> {
  */
 export async function resumeOrchestrator(
   runDir: string,
-  opts: { minutes?: number } = {}
+  opts: {
+    minutes?: number;
+    /** Soft time budget for this session; only read when `quiet`. */
+    budgetMinutes?: number;
+    /** Skip the interval/budget prompts — use stored values (or the ones given). */
+    quiet?: boolean;
+  } = {}
 ): Promise<void> {
   if (!existsSync(path.join(runDir, "state.json"))) {
     console.error(`No resumable run at ${runDir} (missing state.json).`);
@@ -720,6 +741,8 @@ export async function resumeOrchestrator(
   if (opts.minutes != null) {
     // Explicit --minutes flag wins; skip the prompt.
     checkpointMinutes = Math.max(1, Math.min(24 * 60, Math.floor(opts.minutes)));
+  } else if (opts.quiet) {
+    checkpointMinutes = storedMinutes;
   } else {
     // No flag — ask, defaulting to the run's stored interval.
     const answer = await number({
@@ -737,13 +760,15 @@ export async function resumeOrchestrator(
   console.log(`[orchestrator] checkpoint interval: ${checkpointMinutes} min (persisted)`);
 
   // Soft time budget for THIS session (resets per resume — "give it a 15-min run").
-  const resumeBudgetMinutes = await number({
-    message: "Soft time budget for this session in minutes (blank = none; over-runs tolerated to land in-flight work)?",
-    default: state.budgetMinutes,
-    min: 1,
-    max: 24 * 60,
-    required: false,
-  });
+  const resumeBudgetMinutes = opts.quiet
+    ? (opts.budgetMinutes ?? state.budgetMinutes)
+    : await number({
+        message: "Soft time budget for this session in minutes (blank = none; over-runs tolerated to land in-flight work)?",
+        default: state.budgetMinutes,
+        min: 1,
+        max: 24 * 60,
+        required: false,
+      });
   await updateState(runDir, { budgetMinutes: resumeBudgetMinutes ?? undefined });
   console.log(
     `[orchestrator] time budget: ${resumeBudgetMinutes != null ? resumeBudgetMinutes + " min" : "none"}`
@@ -751,6 +776,19 @@ export async function resumeOrchestrator(
 
   console.log(`\n[orchestrator] resuming run: ${runDir}`);
   console.log(`[orchestrator] roles: ${roles.map((r) => r.name).join(", ")}`);
+
+  // A resume is a retry: the halt marker and the previous end-of-run stamp
+  // describe a run that is no longer over. Keep the reason in the transcript.
+  const haltFile = path.join(runDir, "HALT.txt");
+  if (existsSync(haltFile)) {
+    const why = (await readFile(haltFile, "utf8")).trim();
+    console.log(`[orchestrator] clearing HALT marker (${why})`);
+    await appendTranscript(transcript, "HALT CLEARED", `Resumed after: ${why}`);
+    await rm(haltFile, { force: true });
+  }
+  if (state.endedAt) {
+    await updateState(runDir, { endedAt: undefined, endReason: undefined });
+  }
 
   // The orchestrator is stateless — its memory is the ledger on disk, so resume
   // needs no session reattachment or transcript replay. It will read the
@@ -768,7 +806,7 @@ export async function resumeOrchestrator(
   ) {
     await writeFile(contextFilePath(runDir), state.context, "utf8");
   }
-  const orch = createOrchSession(buildOrchSystem(state, runDir));
+  const orch = createOrchSession(buildOrchSystem(state, runDir), runDir);
 
   // Clear stale inbox/outbox so freshly spawned roles don't reprocess leftover
   // content (notably the `exit` sentinel written on a prior clean shutdown).
@@ -787,6 +825,7 @@ export async function resumeOrchestrator(
 
   await runLoop({
     runDir,
+    goal: state.goal,
     roles,
     transcript,
     orch,
@@ -821,6 +860,7 @@ function spawnRole(name: string, runDir: string, resume: boolean): ChildProcess 
 
 interface LoopCtx {
   runDir: string;
+  goal: string;
   roles: RoleSpec[];
   transcript: string;
   orch: AgentSession;
@@ -843,7 +883,7 @@ interface LoopCtx {
 
 /** Shared event loop used by both fresh runs and resumes. */
 async function runLoop(ctx: LoopCtx): Promise<void> {
-  const { runDir, roles, transcript, orch, children, kickoff, teamsEnabled, budgetMinutes, autoComplete, verify, escalation, isolation } = ctx;
+  const { runDir, goal, roles, transcript, orch, children, kickoff, teamsEnabled, budgetMinutes, autoComplete, verify, escalation, isolation } = ctx;
 
   // Give the orchestrator's own claude session a heartbeat file so the watchdog
   // can tell a working turn (recent stream output) from one hung mid-turn. Roles
@@ -917,7 +957,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
       const cur = await readCost(runDir, name);
       const prev = lastRoleCost.get(name);
       lastRoleCost.set(name, cur);
-      dash.setRoleTurn(name, cur.costUsd - (prev?.costUsd ?? 0), cur.cacheReadTokens - (prev?.cacheReadTokens ?? 0));
+      dash.setRoleTurn(name, cur.costUsd - (prev?.costUsd ?? 0), cur.cacheReadTokens - (prev?.cacheReadTokens ?? 0), cur.costUsd);
     } catch {
       // Live per-seat cost is best-effort; never let it break the run.
     }
@@ -948,7 +988,9 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     orchBusy = true;
     try {
       const ledger = await readLedger(runDir);
+      dash.orchThinking();
       const reply = await orch.send(composeOrchPrompt(ledger, eventText));
+      dash.orchTurn();
       const u = orch.lastUsage;
       if (u) {
         await recordUsage(runDir, "orchestrator", u);
@@ -1258,7 +1300,10 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
         return;
       }
     }
-    for (const m of spec.members) teamOwner.set(m, spec.name);
+    for (const m of spec.members) {
+      teamOwner.set(m, spec.name);
+      dash.setSeatState(m, "huddle");
+    }
     dash.setStatus(`huddle ${spec.name}: ${spec.members.join(" ↔ ")}`);
     console.log(`[orchestrator] huddle "${spec.name}" started: ${spec.members.join(" ↔ ")}`);
     await appendTranscript(transcript, `TEAM START ${spec.name}`, `${spec.members.join(", ")} — ${spec.brief}`);
@@ -1269,7 +1314,10 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     } catch (e) {
       result = { status: "aborted", report: `(error: ${(e as Error).message})` };
     } finally {
-      for (const m of spec.members) teamOwner.delete(m);
+      for (const m of spec.members) {
+        teamOwner.delete(m);
+        dash.setSeatState(m, "idle");
+      }
     }
 
     await appendTranscript(transcript, `TEAM ${result.status.toUpperCase()} ${spec.name}`, result.report);
@@ -1282,7 +1330,12 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
 
   const dash = new Dashboard({
     runName: path.basename(runDir),
-    roles: roles.map((r) => ({ name: r.name, model: r.model ?? "sonnet" })),
+    goal,
+    roles: roles.map((r) => ({
+      name: r.name,
+      model: resolveModelFor(normalizeProvider(r.provider), r.model),
+      provider: normalizeProvider(r.provider),
+    })),
     intervalMin: ctx.checkpointMinutes,
   });
   dash.start();
@@ -1296,6 +1349,13 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     dash.stop();
     console.log(`\n[orchestrator] stopping (${reason})`);
     await appendTranscript(transcript, "RUN END", reason);
+    // The home screen reads this to tell a finished run from one that was
+    // killed mid-flight (no stamp) — that is what makes "Continue" pick right.
+    try {
+      await updateState(runDir, { endedAt: new Date().toISOString(), endReason: reason });
+    } catch {
+      // best-effort marker
+    }
 
     // With isolation on, the run's output is a set of branches rather than edits
     // already in your tree. Print where they are and what they touched — an audit
@@ -1409,6 +1469,39 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   // whether/how to propagate to roles.
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   let interjectionsPaused = false;
+
+  /**
+   * `show [seat]` — open a seat's trace (log/<seat>.jsonl) in a pager without
+   * leaving the run. The panel and stdin reader step aside for the pager and
+   * come back when it closes. Returns false if the line wasn't a show command.
+   */
+  const tryShow = async (text: string): Promise<boolean> => {
+    const m = /^\/?(?:show|look|inspect|peek)(?:\s+(\S+))?$/i.exec(text);
+    if (!m) return false;
+    const seats = await listSeats(runDir);
+    const roleSeats = seats.filter((s) => s.name !== ORCH);
+    if (!m[1]) {
+      console.log(`[show] seats: ${roleSeats.map((s, i) => `${i + 1}=${s.name}`).join("  ")}  orch=${ORCH}`);
+      console.log("[show] usage: show <seat|number|orch>");
+      return true;
+    }
+    const who = resolveSeat(m[1], roleSeats);
+    if (!who) {
+      console.warn(`[show] no seat matches "${m[1]}" — try: ${roleSeats.map((s) => s.name).join(", ")}, orch`);
+      return true;
+    }
+    const text2 = await renderSeatLog(runDir, who, { tailTurns: 6 });
+    rl.pause();
+    dash.stop();
+    try {
+      showInPager(text2);
+    } finally {
+      dash.start({ clear: false });
+      rl.resume();
+    }
+    return true;
+  };
+
   const onInterjection = async (line: string) => {
     if (interjectionsPaused) return;
     const text = line.trim();
@@ -1417,6 +1510,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
       await stopAll("user typed exit");
       return;
     }
+    if (await tryShow(text)) return;
     console.log(`[orchestrator] forwarding user interjection to orchestrator claude`);
     await appendTranscript(transcript, "USER", text);
     await postEvent(`[USER INTERJECTION] ${text}`);
@@ -1467,6 +1561,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
       console.log("  (empty)        Enter alone to continue with no feedback");
       console.log(`  extend N       run N more minutes before the NEXT checkpoint only`);
       console.log(`  interval N     change the recurring checkpoint interval to N minutes`);
+      console.log("  show <seat>    open a seat's trace (its tool calls and reasoning) — also works any time");
       console.log("  exit           stop the run");
 
       const userLine = await waitForInput(CHECKPOINT_GRACE_MS);
@@ -1484,6 +1579,12 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
 
       if (isSafeWord(fb)) {
         await stopAll("user typed exit at checkpoint");
+        return;
+      }
+      if (await tryShow(fb)) {
+        dash.setStatus("running");
+        await continueOrch();
+        scheduleCheckpoint();
         return;
       }
       dash.setStatus("running");
@@ -1600,6 +1701,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
         ? `${cause} after ~${mins} min with an outstanding task`
         : `${cause} while idle`;
       console.warn(`[watchdog] role "${name}" ${note} — re-spawning a fresh session`);
+      dash.setSeatState(name, "dead");
       dash.setStatus(`watchdog: re-spawned ${name}`);
       await appendTranscript(transcript, `WATCHDOG ${name}`, note);
       pendingSince.delete(name); // a re-dispatch will re-arm it

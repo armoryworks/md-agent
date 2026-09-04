@@ -7,7 +7,7 @@ export type ModelTier = "opus" | "sonnet" | "haiku";
 
 /** Concrete claude model ids per tier. Single source of truth. */
 export const MODEL_IDS: Record<ModelTier, string> = {
-  opus: "claude-opus-4-8",
+  opus: "claude-opus-5",
   sonnet: "claude-sonnet-5",
   haiku: "claude-haiku-4-5",
 };
@@ -95,21 +95,30 @@ export const PROVIDER_PROFILES: ProviderProfile[] = [
  */
 export const AGY_MODEL_IDS: Record<ModelTier, string> = {
   opus: "gemini-3.1-pro-high",
-  sonnet: "gemini-3.7-flash-high",
-  haiku: "gemini-3.7-flash-low",
+  sonnet: "gemini-3.8-flash-high",
+  haiku: "gemini-3.8-flash-low",
 };
 
-/** Resolve (provider, tier) to a concrete model id for that provider. */
-export function resolveModelFor(provider: Provider, tier?: string): string {
-  const t = normalizeTier(tier);
+/**
+ * Resolve a seat's `model` to a concrete id for its provider. A tier name maps
+ * through the provider's ladder; anything else is passed through verbatim so a
+ * seat can name a model the ladder has no rung for (`gemini-3.1-pro-low`,
+ * `gpt-oss-120b-medium`). Unset → the default tier.
+ */
+export function resolveModelFor(provider: Provider, model?: string): string {
+  if (model && !(model in MODEL_IDS)) return model;
+  const t = normalizeTier(model);
   return provider === "agy" ? AGY_MODEL_IDS[t] : MODEL_IDS[t];
 }
 
 export interface RoleSpec {
   name: string;
   description: string;
-  /** Model tier the orchestrator selected for this role. */
-  model?: ModelTier;
+  /**
+   * Model tier (`opus`/`sonnet`/`haiku`, mapped per provider) or a concrete
+   * model id passed through as-is. Unset → chosen by the bootstrap turn.
+   */
+  model?: ModelTier | string;
   /** Backing agent CLI for this role. Default "claude". Configuration-based. */
   provider?: Provider;
   /**
@@ -216,6 +225,28 @@ export interface RunState {
    * provider (claude haiku/sonnet/opus, agy flash-low/flash-high/pro-high).
    */
   escalation?: ModelTier[];
+  /** Set when this run is one phase of a journey — enough to resume it from the home screen. */
+  journey?: JourneyRef;
+  /** ISO timestamp of the run's clean teardown; absent while running or after a crash. */
+  endedAt?: string;
+  /** Why the run ended (the stopAll reason), e.g. "phase complete: …", "user typed exit". */
+  endReason?: string;
+}
+
+/**
+ * Where a journey phase run came from. Persisted into the phase's state.json so
+ * the home screen can resume the journey without the user re-typing the
+ * manifest path and phase id.
+ */
+export interface JourneyRef {
+  /** Absolute path to the journey manifest. */
+  manifest: string;
+  name: string;
+  phaseId: string;
+  /** 0-based index of this phase in the manifest. */
+  phaseIndex: number;
+  /** Phase count at launch time. */
+  total: number;
 }
 
 /**
@@ -249,6 +280,8 @@ export interface LaunchConfig {
   escalation?: ModelTier[];
   /** Where role edits land. Default "none" (shared cwd). See {@link Isolation}. */
   isolation?: Isolation;
+  /** Set by the journey driver; recorded into state.json for home-screen resume. */
+  journey?: JourneyRef;
 }
 
 export async function readState(runDir: string): Promise<RunState> {
@@ -276,6 +309,15 @@ export async function updateState(
 
 function sessionFile(runDir: string, who: string): string {
   return path.join(runDir, "sessions", `${who}.txt`);
+}
+
+/**
+ * Per-participant stream log: every line the agent CLI streamed during each
+ * turn, verbatim, bracketed by md-agent turn markers. This is what "look inside
+ * a seat" reads — the outbox only ever carries the seat's final status report.
+ */
+export function logPath(runDir: string, who: string): string {
+  return path.join(runDir, "log", `${who}.jsonl`);
 }
 
 export async function writeSessionId(

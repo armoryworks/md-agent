@@ -1,6 +1,53 @@
 import spawn from "cross-spawn";
 import fs from "node:fs";
+import path from "node:path";
 import type { Usage } from "./persist.js";
+
+/**
+ * Append-only NDJSON tee of one seat's turns. Every line the agent CLI streams
+ * is written verbatim between `md-agent` turn markers, so a seat's tool calls
+ * and reasoning survive the turn (the outbox carries only its final report).
+ */
+export class TurnLog {
+  private stream: fs.WriteStream | null = null;
+  constructor(private readonly file: string) {}
+
+  private open(): fs.WriteStream {
+    if (!this.stream) {
+      fs.mkdirSync(path.dirname(this.file), { recursive: true });
+      this.stream = fs.createWriteStream(this.file, { flags: "a" });
+    }
+    return this.stream;
+  }
+
+  /** Write a marker line authored by md-agent (not the CLI). */
+  mark(event: string, data: Record<string, unknown> = {}): void {
+    try {
+      this.open().write(JSON.stringify({ md: event, ts: new Date().toISOString(), ...data }) + "\n");
+    } catch {
+      // the log is for humans; never fail a turn over it
+    }
+  }
+
+  /** Write one raw line exactly as the CLI streamed it. */
+  raw(line: string): void {
+    try {
+      this.open().write(line + "\n");
+    } catch {
+      // see mark()
+    }
+  }
+}
+
+const PROMPT_LOG_CHARS = 4000;
+
+/** What a turn marker records of the prompt: enough to read, not the whole brief. */
+export function promptExcerpt(prompt: string): { prompt: string; promptChars: number } {
+  return {
+    prompt: prompt.length > PROMPT_LOG_CHARS ? prompt.slice(0, PROMPT_LOG_CHARS) + "…" : prompt,
+    promptChars: prompt.length,
+  };
+}
 
 /**
  * The provider-agnostic seat interface the orchestrator and roles drive. Both
@@ -35,6 +82,7 @@ export class ClaudeSession implements AgentSession {
   private heartbeatPath: string | null;
   private permissionMode: string | null;
   private lastBeat = 0;
+  private log: TurnLog | null;
 
   constructor(
     opts: {
@@ -72,6 +120,8 @@ export class ClaudeSession implements AgentSession {
        * than inheriting whatever the host happens to permit.
        */
       permissionMode?: string;
+      /** Append every streamed line of every turn here (see TurnLog). */
+      logPath?: string;
     } = {}
   ) {
     this.systemPrompt = opts.systemPrompt ?? null;
@@ -82,6 +132,7 @@ export class ClaudeSession implements AgentSession {
     this.stateless = opts.stateless ?? false;
     this.heartbeatPath = opts.heartbeatPath ?? null;
     this.permissionMode = opts.permissionMode ?? null;
+    this.log = opts.logPath ? new TurnLog(opts.logPath) : null;
   }
 
   /** Touch the heartbeat file (throttled) to signal this turn is alive + producing. */
@@ -135,6 +186,14 @@ export class ClaudeSession implements AgentSession {
         ? `${this.systemPrompt}\n\n---\n\n${prompt}`
         : prompt;
 
+    this.log?.mark("turn", {
+      provider: "claude",
+      model: this.model,
+      resume: this.sessionId,
+      ...promptExcerpt(fullPrompt),
+    });
+    const startedAt = Date.now();
+
     return new Promise((resolve, reject) => {
       const child = spawn("claude", args, {
         stdio: ["pipe", "pipe", "pipe"],
@@ -156,6 +215,7 @@ export class ClaudeSession implements AgentSession {
           const line = stdoutBuf.slice(0, nl).trim();
           stdoutBuf = stdoutBuf.slice(nl + 1);
           if (!line) continue;
+          this.log?.raw(line);
           try {
             const msg = JSON.parse(line);
             if (typeof msg.session_id === "string" && !this.sessionId && !this.stateless) {
@@ -194,6 +254,12 @@ export class ClaudeSession implements AgentSession {
 
       child.on("error", reject);
       child.on("exit", (code) => {
+        this.log?.mark("end", {
+          code,
+          ms: Date.now() - startedAt,
+          usage: this.lastUsageData,
+          ...(code === 0 ? {} : { stderr: stderrBuf.slice(-1500) }),
+        });
         if (code === 0) {
           resolve(assistantText.trim());
         } else {

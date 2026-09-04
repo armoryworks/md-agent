@@ -1,21 +1,26 @@
 import spawn from "cross-spawn";
 import fs from "node:fs";
 import type { Usage } from "./persist.js";
-import type { AgentSession } from "./claude.js";
+import { promptExcerpt, TurnLog, type AgentSession } from "./claude.js";
 
 /**
  * A persistent Antigravity (`agy`) conversation.
  *
- * Unlike the Gemini CLI adapter this replaces, agy is STATEFUL: `-p --output-format
- * json` returns a `conversation_id`, and passing it back via `--conversation <id>`
- * resumes that thread. So an agy seat behaves like a claude seat — the system prompt
- * is sent once on the first turn, not re-sent every turn, and a resumed role keeps
- * its context.
+ * Unlike the Gemini CLI adapter this replaces, agy is STATEFUL: a turn returns a
+ * `conversation_id`, and passing it back via `--conversation <id>` resumes that
+ * thread. So an agy seat behaves like a claude seat — the system prompt is sent
+ * once on the first turn, not re-sent every turn, and a resumed role keeps its
+ * context.
  *
- * The response envelope is flat:
- *   { conversation_id, status, response, duration_seconds, num_turns,
- *     usage: { input_tokens, output_tokens, thinking_tokens,
- *              cache_read_tokens, total_tokens } }
+ * Runs with `--output-format stream-json`: one NDJSON event per line —
+ *   {"event":"init", "conversation_id", "init":{model, cwd, tools}}
+ *   {"event":"step_update", "step_update":{state, step_type, text_delta?, usage?}}
+ *   {"event":"result", "result":{conversation_id, status, response,
+ *        duration_seconds, num_turns, usage:{input_tokens, output_tokens,
+ *        thinking_tokens, cache_read_tokens, total_tokens}}}
+ * The `result` envelope is what the old `--output-format json` returned whole;
+ * streaming adds a real per-chunk heartbeat and lets the turn be teed to the
+ * seat's log as it happens.
  */
 export class AgySession implements AgentSession {
   private systemPrompt: string | null;
@@ -27,6 +32,7 @@ export class AgySession implements AgentSession {
   private conversationId: string | null = null;
   private lastUsageData: Usage | null = null;
   private onSessionId: ((id: string) => void) | null;
+  private log: TurnLog | null;
 
   constructor(opts: {
     systemPrompt?: string;
@@ -38,6 +44,8 @@ export class AgySession implements AgentSession {
     /** Resume an existing conversation instead of starting a new one. */
     resumeId?: string;
     onSessionId?: (id: string) => void;
+    /** Append every streamed line of every turn here (see TurnLog). */
+    logPath?: string;
   }) {
     this.systemPrompt = opts.systemPrompt ?? null;
     this.model = opts.model ?? null;
@@ -46,6 +54,7 @@ export class AgySession implements AgentSession {
     this.heartbeatPath = opts.heartbeatPath ?? null;
     this.conversationId = opts.resumeId ?? null;
     this.onSessionId = opts.onSessionId ?? null;
+    this.log = opts.logPath ? new TurnLog(opts.logPath) : null;
   }
 
   get id(): string | null {
@@ -108,13 +117,22 @@ export class AgySession implements AgentSession {
   async send(prompt: string): Promise<string> {
     this.beat();
     const timeoutMs = 10 * 60_000;
-    const args = ["-p", this.composePrompt(prompt), "--output-format", "json"];
+    const fullPrompt = this.composePrompt(prompt);
+    const args = ["-p", fullPrompt, "--output-format", "stream-json"];
     if (this.conversationId) args.push("--conversation", this.conversationId);
     if (this.model) args.push("--model", this.model);
     args.push(...this.permissionArgs());
     // Keep agy's own print timeout above ours so OUR timer is the one that fires
     // and produces a diagnosable error rather than an opaque CLI kill.
     args.push("--print-timeout", `${Math.floor(timeoutMs / 1000) + 60}s`);
+
+    this.log?.mark("turn", {
+      provider: "agy",
+      model: this.model,
+      resume: this.conversationId,
+      ...promptExcerpt(fullPrompt),
+    });
+    const startedAt = Date.now();
 
     return new Promise<string>((resolve, reject) => {
       const child = spawn("agy", args, {
@@ -123,8 +141,9 @@ export class AgySession implements AgentSession {
       });
       let out = "";
       let err = "";
-      // The JSON envelope is emitted at the END, so beat on a timer to keep the
-      // liveness watchdog satisfied during a long turn.
+      let lineBuf = "";
+      // Streamed lines beat on arrival; the timer covers a long silent tool call
+      // (agy emits nothing between step updates), so the watchdog stays fed.
       const beatTimer = setInterval(() => this.beat(), 3000);
       const timer = setTimeout(() => {
         try {
@@ -137,7 +156,15 @@ export class AgySession implements AgentSession {
       }, timeoutMs);
       child.stdout!.on("data", (b: Buffer) => {
         this.beat();
-        out += b.toString("utf8");
+        const text = b.toString("utf8");
+        out += text;
+        lineBuf += text;
+        let nl: number;
+        while ((nl = lineBuf.indexOf("\n")) !== -1) {
+          const line = lineBuf.slice(0, nl).trim();
+          lineBuf = lineBuf.slice(nl + 1);
+          if (line) this.log?.raw(line);
+        }
       });
       child.stderr!.on("data", (b: Buffer) => {
         err += b.toString("utf8");
@@ -150,7 +177,15 @@ export class AgySession implements AgentSession {
       child.on("exit", (code) => {
         clearInterval(beatTimer);
         clearTimeout(timer);
-        const obj = this.parseJson(out);
+        if (lineBuf.trim()) this.log?.raw(lineBuf.trim());
+        const obj = this.parseResult(out);
+        this.log?.mark("end", {
+          code,
+          ms: Date.now() - startedAt,
+          status: obj?.status ?? null,
+          usage: obj ? this.extractUsage(obj) : null,
+          ...(code === 0 ? {} : { stderr: err.slice(-1500) }),
+        });
 
         if (obj && typeof obj.conversation_id === "string" && !this.conversationId) {
           this.conversationId = obj.conversation_id;
@@ -194,10 +229,12 @@ export class AgySession implements AgentSession {
           );
           return;
         }
-        if (code !== 0 && !obj) {
+        // No result envelope at all (killed mid-stream, or a startup failure that
+        // never reached `result`): there is nothing to read as a reply.
+        if (!status) {
           reject(
             new Error(
-              `agy exited ${code}\n` +
+              `agy exited ${code} without a result envelope\n` +
                 `  model: ${this.model ?? "(default)"}\n` +
                 `  stderr: ${tail(err)}\n` +
                 `  stdout: ${tail(out)}`
@@ -211,24 +248,31 @@ export class AgySession implements AgentSession {
     });
   }
 
-  /** Parse the single JSON object `--output-format json` prints (tolerate leading noise). */
-  private parseJson(out: string): Record<string, any> | null {
-    const s = out.trim();
-    if (!s) return null;
-    try {
-      return JSON.parse(s) as Record<string, any>;
-    } catch {
-      const i = s.indexOf("{");
-      const j = s.lastIndexOf("}");
-      if (i >= 0 && j > i) {
-        try {
-          return JSON.parse(s.slice(i, j + 1)) as Record<string, any>;
-        } catch {
-          return null;
-        }
+  /**
+   * Pull the final envelope out of the NDJSON stream: the `result` event's
+   * payload, or — for a stream cut off before it — the conversation id from
+   * `init` so a partial turn can still be resumed. Tolerates a stray non-JSON
+   * line (agy prints its own notices to stdout).
+   */
+  private parseResult(out: string): Record<string, any> | null {
+    let init: Record<string, any> | null = null;
+    for (const line of out.split("\n")) {
+      const t = line.trim();
+      if (!t.startsWith("{")) continue;
+      let ev: Record<string, any>;
+      try {
+        ev = JSON.parse(t) as Record<string, any>;
+      } catch {
+        continue;
       }
-      return null;
+      if (ev.event === "result" && ev.result && typeof ev.result === "object") return ev.result;
+      if (ev.event === "init" && typeof ev.conversation_id === "string") {
+        init = { conversation_id: ev.conversation_id };
+      }
+      // A bare envelope (older agy, or --output-format json) is accepted as-is.
+      if (typeof ev.status === "string" && "response" in ev) return ev;
     }
+    return init;
   }
 
   private extractText(obj: Record<string, any> | null, raw: string): string {

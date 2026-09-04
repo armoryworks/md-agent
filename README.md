@@ -82,21 +82,62 @@ npm run dev                      # from a checkout, via tsx
 
 A bare `md-agent` opens the **home screen**: it scans `./runs` for prior work
 and presents it — standalone runs and journeys (grouped with their phases),
-each with its goal, spend, recency, and a `[HALTED]` flag where the watchdog
-stopped one. From there:
+each with its goal, spend, recency and status (`running`, `unfinished`,
+`HALTED`, `complete`). Nothing on it asks you to touch the filesystem:
 
-- **Resume a run** — pick up where it left off (roles reattach to their sessions).
+- **Continue** — the first choice, always the most recent unfinished thing. A
+  run resumes where it stopped (seats reattach to their sessions). A journey is
+  driven from its first phase that did not end cleanly: a halted phase is
+  retried in place (its `HALT.txt` is cleared and the reason kept in the
+  transcript), an unfinished one resumed, the next one started. The manifest
+  path is recorded in each phase run, so nothing has to be re-typed.
+- **Launch `md-agent.launch.json`** — offered when the current directory has
+  one (see `md-agent init` below).
+- **Resume a specific run or phase** — choose exactly which one.
+- **Look inside a seat** — a seat's trace: what it was asked, the tools it ran,
+  what it said, what each turn cost. See *Looking inside a seat*.
 - **Start something new** — the setup wizard (roles, goal, checkpoint interval,
   sub-teams, soft time budget).
 - **Combine past runs into a new run** — select one or more prior runs; a new
   run is seeded with their goals + final ledgers + pointers to their artifacts,
   and the wizard takes it from there.
-- **Mark runs complete** — shelve finished work. Completed runs disappear from
-  every home-screen menu but nothing is deleted: the screen prints where each
-  run's outputs live (`transcript.md`, `ledger.md`, cost files, huddle logs)
-  and how to restore it — delete the `"completedAt"` line from that run's
-  `state.json`. Completing a journey shelves all its phase runs and reminds you
-  how to resume mid-journey later (`--journey <manifest> --from <phase-id>`).
+- **Mark runs complete** / **Restore a shelved run** — shelve finished work
+  (hidden from the menus, untouched on disk) and bring it back later.
+
+### `md-agent init`
+
+Writes a starter `md-agent.launch.json` into the current repo — a cheap seat
+behind a verify command, a claude reviewer, worktree isolation, escalation, an
+inline `$help` block explaining each choice. Edit the goal and `verify.cmd`,
+then `md-agent` offers it as a one-key launch (or `md-agent --launch
+md-agent.launch.json`). The second run never needs the wizard.
+
+### The umbrella
+
+While a run is live the top of the console is frozen — the ArmoryWorks mark,
+the run's **goal**, and a tree of the orchestrator with every seat beneath it:
+provider and model, what it is doing and for how long (`working 38s`,
+`replied 2m ago`, `in huddle`, `recovering`), turns taken, last-turn cost and
+cache read, cumulative spend. Log output scrolls underneath. It is a status
+surface only: seats still report to the orchestrator through their outboxes
+exactly as before.
+
+### Looking inside a seat
+
+Every participant's turns are teed verbatim to `runs/<dir>/log/<seat>.jsonl`
+— the orchestrator included — bracketed by md-agent turn markers carrying the
+prompt excerpt, model, duration and usage. The outbox is a seat's status
+report; the log is its working. Read it three ways:
+
+- **During a run:** type `show <seat>` (a name, its number, or `orch`) at the
+  console — the panel steps aside for a pager and comes back when it closes.
+  `show` alone lists the seats.
+- **From the home screen:** *Look inside a seat*.
+- **From the shell:** `md-agent --inspect runs/<dir> --seat <name>`.
+
+The rendering collapses tool calls to one line each (`⚙ Bash npm test`),
+shows the head of each result, surfaces permission denials (`⛔ denied Write …`)
+and drops the CLI's bookkeeping events.
 
 Everything below remains available as flags for scripting and automation.
 
@@ -112,6 +153,14 @@ Resume a previous run:
 ```bash
 npm run dev -- --resume runs/2026-05-21_00-28-34-my-run         # prompts for the checkpoint interval (defaults to the run's stored value)
 npm run dev -- --resume runs/<dir> --minutes 15                 # skip the prompt; set it directly (also --minutes=15)
+npm run dev -- --resume runs/<dir> --quiet                      # no prompts at all: stored interval + budget (what the journey driver uses)
+```
+
+Look inside a seat of any run:
+
+```bash
+npm run dev -- --inspect runs/<dir>                  # list the seats
+npm run dev -- --inspect runs/<dir> --seat engineer  # open one's trace in a pager
 ```
 
 On resume you're asked for the checkpoint interval (pre-filled with the run's
@@ -145,9 +194,13 @@ config/journey path supplies `provider` directly and skips the prompt.
   with `--resume`, agy with `--conversation` — so an agy seat keeps its context
   across turns and is recycled on the same schedule. Use agy seats for cheap,
   mechanical or high-volume role work. The tier (`model`) maps per provider
-  (claude opus/sonnet/haiku, agy `gemini-3.1-pro-high` / `gemini-3.7-flash-high` /
-  `gemini-3.7-flash-low`); `agy models` lists what is available. `permissionMode`
-  is honored by both: claude passes it to `--permission-mode`, agy maps it onto
+  (claude `claude-opus-5` / `claude-sonnet-5` / `claude-haiku-4-5`, agy
+  `gemini-3.1-pro-high` / `gemini-3.8-flash-high` / `gemini-3.8-flash-low`), or
+  name a concrete id and it is passed through as-is (`gemini-3.1-pro-low`,
+  `gpt-oss-120b-medium`); `agy models` lists what is available. Claude models
+  through agy are a generation behind the `claude` CLI and burn Antigravity
+  quota at 8× — there is no seat where they win. `permissionMode` is honored by
+  both: claude passes it to `--permission-mode`, agy maps it onto
   `--mode accept-edits` / `--mode plan` / `--dangerously-skip-permissions`.
 - **`isolation`** — `"none"` (default) or `"worktree"`, asked by the wizard.
 
@@ -217,8 +270,12 @@ outcome materially changes a later one. Before each non-first phase (unless
 `pauseBefore: false`) the driver pauses so you can read the handshake and edit the
 manifest live, then `Enter` to launch, `skip`, or `exit`.
 
-**Resuming a journey:** `--from <phase-id>` starts at that phase and skips the ones
-before it (e.g. after a crash, a HALT, or a partial prior run):
+**Resuming a journey:** the home screen's *Continue* does this for you. By hand,
+`--from <phase-id>` starts at that phase and skips the ones before it (e.g. after
+a crash, a HALT, or a partial prior run). If that phase already has a ledger and
+did not end cleanly (killed, or halted by the watchdog), it is **resumed** — its
+seats reattach to their sessions and the HALT marker is cleared — rather than
+started over:
 
 ```bash
 npm run dev -- --journey ./journey.json --from 05-some-phase
@@ -270,7 +327,7 @@ orchestrator, which decides how to propagate it). At a checkpoint you can:
 | `MD_AGENT_SKIP_PREFLIGHT` | unset        | Skip the launch-time agent readiness probe (P4). Set for offline / fast-iteration runs. |
 | `MD_AGENT_MAX_EVENT_CHARS`| `16000`      | Choke-point (P2): a role reply longer than this is spilled to `runs/<dir>/spill/<role>-<ts>.md` and the orchestrator gets a head excerpt + pointer. `0` disables. |
 | `MD_AGENT_MAX_LEDGER_CHARS`| `8000`      | Ledger size target. The ledger is re-read AND re-emitted every turn, so bloat taxes every later turn twice; past this size the next turn carries a deterministic compact-now nudge. `0` disables. |
-| `MD_AGENT_ROLE_RECYCLE_TURNS` | `20`     | Role-session recycling: after N turns, a role writes a ≤300-word handoff note and is reseeded as a fresh session (mandate + handoff), bounding its ever-growing resident context (and cache-read cost per turn) on long runs. `0` disables. The per-turn `ctx ~Nk tok · cache X% hit` role log, and the live per-seat cost shown in the dashboard, are the data for tuning N. |
+| `MD_AGENT_ROLE_RECYCLE_TURNS` | `8`      | Role-session recycling: after N turns, a role writes a ≤300-word handoff note and is reseeded as a fresh session (mandate + handoff), bounding its ever-growing resident context (and cache-read cost per turn) on long runs. `0` disables. The per-turn `ctx ~Nk tok · cache X% hit` role log, and the live per-seat cost shown in the dashboard, are the data for tuning N. |
 | `MD_AGENT_ROLE_PERMISSION_MODE` | unset  | Default `--permission-mode` for claude-backed roles (e.g. `acceptEdits`, `bypassPermissions`). Headless `-p` sessions auto-deny tools the host settings don't allow, so roles that edit files need this (or a per-role `permissionMode` in the launch config, which takes precedence) on hosts without a global allowlist. |
 | `MD_AGENT_ESCALATION_FRESH` | off        | Escalation (P1c) re-spawns roles on the stronger tier **resuming their sessions** by default (they keep everything learned attempting the fix). Set to discard that context and start the upgraded team fresh instead. |
 | `MD_AGENT_NO_DASHBOARD`   | unset        | Disable the sticky top-of-console status panel (also auto-disabled when stdout isn't a TTY). |
@@ -291,14 +348,15 @@ console.
 
 ```
 runs/<timestamp>-<name>/
-├── state.json          # goal, roles, models, checkpoint interval; "completedAt"
-│                       #   appears when shelved from the home screen (delete the
-│                       #   line to restore the run to the menus)
+├── state.json          # goal, roles, models, checkpoint interval; "endedAt"/"endReason"
+│                       #   once torn down cleanly; "journey" for a phase run;
+│                       #   "completedAt" when shelved (Restore clears it)
 ├── ledger.md           # orchestrator's memory (stateless across turns; resume reads this)
 ├── context.md          # large shared-context brief (only when > ~2 KB) — the orchestrator
 │                       #   gets a pointer + excerpt in its prefix and reads this on demand;
 │                       #   roles always carry the full brief in their instructions
 ├── transcript.md       # full conversation (orchestrator is sole writer)
+├── log/<seat>.jsonl     # every turn's CLI stream, verbatim — the seat's working (orchestrator too)
 ├── inbox/<role>.txt     # orchestrator → role
 ├── outbox/<role>.txt    # role → orchestrator
 ├── teams/<name>/channel.md  # huddle transcript (only when sub-teams are used)
@@ -315,15 +373,18 @@ runs/<timestamp>-<name>/
 
 | File                   | Responsibility |
 |------------------------|----------------|
-| `src/index.ts`         | CLI entry / arg parsing |
-| `src/home.ts`          | home screen: run discovery, resume/combine/complete menus |
+| `src/index.ts`         | CLI entry / arg parsing (`init`, `--inspect`, …) |
+| `src/home.ts`          | home screen: run discovery, continue/resume/inspect/combine/shelve menus |
+| `src/init.ts`          | `md-agent init` — starter launch config |
+| `src/inspect.ts`       | seat traces: render `log/<seat>.jsonl`, pager |
+| `src/theme.ts`         | ArmoryWorks palette, the mark, ANSI helpers |
 | `src/orchestrator.ts`  | setup wizard, run loop, ledger turns, dispatch, checkpoints |
 | `src/team.ts`          | sub-team engine (1:1 huddle) — opt-in via `MD_AGENT_TEAMS` |
 | `src/role.ts`          | role child-process loop |
 | `src/claude.ts`        | `claude` session wrapper (spawn, session-id, usage capture) |
 | `src/ipc.ts`           | file-based inbox/outbox + transcript helpers |
 | `src/persist.ts`       | run state, session ids, cost accounting, transcript replay |
-| `src/dashboard.ts`     | sticky terminal status panel |
+| `src/dashboard.ts`     | the umbrella: sticky goal + orchestrator/seat tree |
 | `src/parse.ts` / `src/select.ts` | context-file parsing + section selection |
 
 ## License
