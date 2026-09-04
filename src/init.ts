@@ -29,6 +29,7 @@ export async function runInit(cwd = process.cwd()): Promise<void> {
       verify: "A shell command that proves the result (tests, build, lint). Exit 0 = pass. Gates completion AND judges each seat's worktree at teardown.",
       isolation: "worktree gives every seat its own branch under runs/<run>/workspaces/<role>; audit with git diff, merge what passes, drop what doesn't.",
       permissionMode: "Headless seats auto-deny tools the host doesn't allow. acceptEdits for file edits; bypassPermissions if the seat must run commands.",
+      turnTimeoutSec: "Cap on one seat turn (default 300 agy / 600 claude). A turn is a whole agentic loop that re-reads its conversation on every call; keep asks small.",
       budget: "Ceilings: usd and tokens sum every seat; fiveHourPct / sevenDayPct are your plan windows (claude seats report them live). soft = orchestrator winds down, hard = run HALTs and is resumable after the window resets.",
       run: `md-agent --launch ${LAUNCH_FILE}`,
     },

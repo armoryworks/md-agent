@@ -54,6 +54,8 @@ export class AgySession implements AgentSession {
     onSessionId?: (id: string) => void;
     /** Append every streamed line of every turn here (see TurnLog). */
     logPath?: string;
+    /** Kill the turn after this many seconds (default 300). */
+    turnTimeoutSec?: number;
   }) {
     this.systemPrompt = opts.systemPrompt ?? null;
     this.model = opts.model ?? null;
@@ -63,7 +65,10 @@ export class AgySession implements AgentSession {
     this.conversationId = opts.resumeId ?? null;
     this.onSessionId = opts.onSessionId ?? null;
     this.log = opts.logPath ? new TurnLog(opts.logPath) : null;
+    this.turnTimeoutMs = Math.max(30, opts.turnTimeoutSec ?? 300) * 1000;
   }
+
+  private readonly turnTimeoutMs: number;
 
   get id(): string | null {
     return this.conversationId;
@@ -129,7 +134,7 @@ export class AgySession implements AgentSession {
 
   async send(prompt: string): Promise<string> {
     this.beat();
-    const timeoutMs = 10 * 60_000;
+    const timeoutMs = this.turnTimeoutMs;
     const fullPrompt = this.composePrompt(prompt);
     const args = ["-p", fullPrompt, "--output-format", "stream-json"];
     if (this.conversationId) args.push("--conversation", this.conversationId);
@@ -171,7 +176,7 @@ export class AgySession implements AgentSession {
           // already gone
         }
         clearInterval(beatTimer);
-        reject(new Error(`agy timed out after ${timeoutMs / 1000}s`));
+        reject(new Error(`agy turn exceeded its ${Math.round(timeoutMs / 1000)}s cap and was stopped — the ask was too big for one turn; re-scope it smaller`));
       }, timeoutMs);
       child.stdout!.on("data", (b: Buffer) => {
         this.beat();

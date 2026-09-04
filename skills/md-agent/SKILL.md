@@ -22,7 +22,7 @@ Do not use it for judgement-only work with no command to prove the result and no
 
 ## The harness: delegate → isolate → verify → admit
 
-- **Seats**: `provider: "claude"` for judgement, review, anything that can be quietly wrong, customer-facing or legal surfaces; `provider: "agy"` for enumeration, extraction to a schema, applying a known change repeatedly, first-pass drafts a verifier will check. agy content goes to Google — never health, client, or confidential data. Tiers `opus | sonnet | haiku` map per provider (agy: gemini 3.1 pro / 3.8 flash); a concrete model id passes through. `escalate: false` pins a cheap seat so a verify failure elsewhere can't promote it.
+- **Seats**: `provider: "claude"` for judgement, review, anything that can be quietly wrong, customer-facing or legal surfaces; `provider: "agy"` for enumeration, extraction to a schema, applying a known change repeatedly, first-pass drafts a verifier will check. agy content goes to Google — never health, client, or confidential data. Tiers `opus | sonnet | haiku` map per provider (agy: `gemini-3.1-pro-low` / `3.8-flash-medium` / `3.8-flash-low` — low/medium reasoning on purpose; Antigravity's individual plan is a **weekly** cap); a concrete model id passes through. A seat's turn is a long agentic loop inside its CLI, so give agy seats small, well-scoped asks; `turnTimeoutSec` caps a turn (300 agy / 600 claude). `escalate: false` pins a cheap seat so a verify failure elsewhere can't promote it.
 - **Isolation**: `"worktree"` gives each seat its own git worktree + branch `md-agent/<run>/<seat>`; nothing lands in the user's tree until merged. Needs a git repo.
 - **Verify**: `{ "cmd": "npm test", "maxFailures": 2 }`. Every seat reply is checked **in that seat's workspace**; a seat that claims done while it fails gets the output straight back. The run completes only when every changed workspace passes. `escalation: ["sonnet","opus"]` promotes unpinned seats on repeated failure.
 - **Admit**: teardown prints each seat's branch, diffstat and PASS/FAIL; the user merges what passed (`git merge <branch>`) and drops the rest (`git worktree remove <dir>`).
@@ -46,6 +46,22 @@ Do not use it for judgement-only work with no command to prove the result and no
 In the setup wizard the **goal comes first**, then journals, then a fork: **have Claude plan the team** (a high-tier model reads the goal and the repo and recommends seats, verify, isolation, budget — launch it, save it as the launch file, or adjust by hand) or set it up by hand.
 
 During a run, typed at the console: `show <seat>` opens its trace; `stop` / **ctrl-x** stops seats (hand off to another seat, or abandon for the orchestrator); `journals` turns journaling back on; `exit` ends the run. At checkpoints: feedback text, `extend N`, `interval N`.
+
+## Choosing seats with the user
+
+Before launching, **put each seat to the user** — never pick a provider or tier silently. For every seat, show (AskUserQuestion, one question per seat, or one multi-part message if there are only two or three):
+
+- **Recommended:** `provider · tier` (the concrete model id), marked as the recommendation, with **one sentence of why** — what the work's check is, and what would go wrong on a cheaper or a pricier choice. Put it first.
+- **Alternatives:** the other provider · tier pairs with what each is good for and what it costs:
+  - `claude · opus` — deepest judgement; architecture, security, ambiguous calls, the reviewer over other seats. $5/$25 per M tokens.
+  - `claude · sonnet` — strong default for engineering, analysis, writing that can be quietly wrong. $2/$10.
+  - `claude · haiku` — mechanical, narrow, high-volume work on the Claude plan (no Google egress). $1/$5.
+  - `agy · pro-low` — Gemini Pro at low reasoning; breadth with some judgement, behind a verifier. 1.5× Antigravity units, weekly cap.
+  - `agy · flash-medium` — enumeration, extraction, applying a known change, first drafts a command checks. 1× units, weekly cap.
+  - `agy · flash-low` — the cheapest seat: bulk, mechanical, fully verifiable. 1× units, weekly cap.
+- The user's pick replaces the recommendation. For an agy seat, also ask whether escalation may promote it (default no — keep the cheap seat cheap), and note that `acceptEdits` on agy grants edits but not commands.
+
+The wizard's *Review each seat* step does the same thing interactively; the rule here is for when Claude writes the launch config itself.
 
 ## Launch config shape
 

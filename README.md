@@ -131,10 +131,12 @@ each with its goal, spend, recency and status (`running`, `unfinished`,
    is given the goal, a read-only look at the repo, and a brief on how md-agent
    works, and returns a recommended team: how many seats, each one's mandate,
    provider and tier, the verify command it found, isolation, escalation, a
-   budget, and the questions it could not settle. Then: **launch it**, **save
-   it** as `md-agent.launch.json` to edit and launch from the home screen, or
-   **adjust it by hand** (the wizard, prefilled). A plan costs roughly a
-   dollar's worth of tokens and takes under a minute.
+   budget, and the questions it could not settle. Then: **launch it**,
+   **review each seat** — the recommendation first with the planner's one-line
+   reason for that provider and tier, then every alternative with what it is
+   good for and what it costs; your pick replaces the plan's — **save it** as
+   `md-agent.launch.json`, or **adjust it by hand** (the wizard, prefilled). A
+   plan costs roughly a dollar's worth of tokens and takes under a minute.
 
 ### `md-agent init`
 
@@ -178,6 +180,26 @@ reply the orchestrator receives. The completion gate runs the same way: under
 isolation, every seat whose workspace changed must pass. The orchestrator
 itself runs without edit tools (`Write`, `Edit`, `Bash`…) so it coordinates
 rather than doing the work — `MD_AGENT_ORCH_TOOLS=all` restores them.
+
+### Keeping a seat's turns small
+
+A seat's turn is one agentic loop inside its CLI — dozens of model calls, each
+re-reading the whole conversation so far. A turn that reads a repository and
+runs a full test suite can reach millions of tokens on its own, and a stateful
+session carries all of it into the next turn. Three things hold that down:
+
+- **Turn discipline** in every seat's mandate: one slice per turn, one check,
+  then report; never re-read the repo or re-run the suite to "confirm" what an
+  earlier turn established.
+- **A turn cap** — `roles[].turnTimeoutSec`, default 300 for agy and 600 for
+  claude. A turn that runs past it is stopped and reported to the orchestrator
+  as an ask that was too big for one turn, so it re-scopes rather than repeats.
+- **Recycling by size** — a session whose last turn processed more than
+  `MD_AGENT_ROLE_RECYCLE_TOKENS` (default 200k) tokens is reseeded from a
+  handoff note before its next dispatch, in addition to the every-8-turns rule.
+
+Large shared briefs reach seats the way they reach the orchestrator: a pointer
+to `context.md` plus an excerpt, read on demand rather than resident every turn.
 
 ### When a provider runs dry
 
@@ -362,7 +384,9 @@ config/journey path supplies `provider` directly and skips the prompt.
   directory with `--add-dir` — under worktree isolation that is the seat's
   worktree, otherwise the shared tree. The tier (`model`) maps per provider
   (claude `claude-opus-5` / `claude-sonnet-5` / `claude-haiku-4-5`, agy
-  `gemini-3.1-pro-high` / `gemini-3.8-flash-high` / `gemini-3.8-flash-low`), or
+  `gemini-3.1-pro-low` / `gemini-3.8-flash-medium` / `gemini-3.8-flash-low` —
+  low/medium reasoning on purpose: a `-high` turn spends ~60k thinking tokens,
+  and Antigravity's individual plan is a **weekly** cap), or
   name a concrete id and it is passed through as-is (`gemini-3.1-pro-low`,
   `gpt-oss-120b-medium`); `agy models` lists what is available. Claude models
   through agy are a generation behind the `claude` CLI and burn Antigravity
@@ -518,6 +542,7 @@ npm hides install-script output and flags packages that have one.)
 | `MD_AGENT_SKIP_PREFLIGHT` | unset        | Skip the launch-time agent readiness probe (P4). Set for offline / fast-iteration runs. |
 | `MD_AGENT_MAX_EVENT_CHARS`| `16000`      | Choke-point (P2): a role reply longer than this is spilled to `runs/<dir>/spill/<role>-<ts>.md` and the orchestrator gets a head excerpt + pointer. `0` disables. |
 | `MD_AGENT_MAX_LEDGER_CHARS`| `8000`      | Ledger size target. The ledger is re-read AND re-emitted every turn, so bloat taxes every later turn twice; past this size the next turn carries a deterministic compact-now nudge. `0` disables. |
+| `MD_AGENT_ROLE_RECYCLE_TOKENS` | `200000` | Recycle a role session when its last turn processed this many tokens (input + cache reads + output) — it would re-read all of them next turn. `0` disables. |
 | `MD_AGENT_ROLE_RECYCLE_TURNS` | `8`      | Role-session recycling: after N turns, a role writes a ≤300-word handoff note and is reseeded as a fresh session (mandate + handoff), bounding its ever-growing resident context (and cache-read cost per turn) on long runs. `0` disables. The per-turn `ctx ~Nk tok · cache X% hit` role log, and the live per-seat cost shown in the dashboard, are the data for tuning N. |
 | `MD_AGENT_ROLE_PERMISSION_MODE` | unset  | Default `--permission-mode` for claude-backed roles (e.g. `acceptEdits`, `bypassPermissions`). Headless `-p` sessions auto-deny tools the host settings don't allow, so roles that edit files need this (or a per-role `permissionMode` in the launch config, which takes precedence) on hosts without a global allowlist. |
 | `MD_AGENT_ESCALATION_FRESH` | off        | Escalation (P1c) re-spawns roles on the stronger tier **resuming their sessions** by default (they keep everything learned attempting the fix). Set to discard that context and start the upgraded team fresh instead. |

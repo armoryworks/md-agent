@@ -42,7 +42,7 @@ md-agent runs a TEAM of agent CLIs against one goal. A stateless ORCHESTRATOR (c
 The harness is delegate → isolate → verify → admit:
 - DELEGATE: each seat has a provider and a model tier.
   provider "claude": judgement, review, anything that can be quietly wrong, conflicts between docs and code, customer-facing or legal surfaces, the reviewer seat over other seats' output. Tiers: opus (${MODEL_IDS.opus}) deepest reasoning; sonnet (${MODEL_IDS.sonnet}) strong default; haiku (${MODEL_IDS.haiku}) cheap and mechanical.
-  provider "agy" (Antigravity/Gemini): breadth and volume behind a verifier — enumeration across many files, extraction to a schema, applying a known change repeatedly, first-pass drafts a command will check. Tiers: opus (${AGY_MODEL_IDS.opus}), sonnet (${AGY_MODEL_IDS.sonnet}), haiku (${AGY_MODEL_IDS.haiku}). Content goes to Google: never for health, client, or confidential data. An agreeable wrong answer is its expensive failure, so it needs a verify command or a claude reviewer behind it.
+  provider "agy" (Antigravity/Gemini): breadth and volume behind a verifier — enumeration across many files, extraction to a schema, applying a known change repeatedly, first-pass drafts a command will check. Tiers: opus (${AGY_MODEL_IDS.opus}), sonnet (${AGY_MODEL_IDS.sonnet}), haiku (${AGY_MODEL_IDS.haiku}) — deliberately low/medium reasoning; a "-high" id spends ~60k thinking tokens per turn. Antigravity quota is a WEEKLY cap on the individual plan and a seat's turn is a long agentic loop that re-reads its conversation on every call, so agy seats must be given SMALL, well-scoped asks. Content goes to Google: never for health, client, or confidential data. An agreeable wrong answer is its expensive failure, so it needs a verify command or a claude reviewer behind it.
   The split that matters is NOT smart-vs-cheap: it is whether the work has a cheap, complete CHECK. Where a command can prove the result, delegate; where the only check is judgement, keep it on claude.
 - ISOLATE: isolation "worktree" gives every seat its own git worktree and branch; nothing lands in the user's tree until they merge. Requires the target to be a git repo. "none" = seats edit the shared tree directly (only when seats are advisory or fully trusted).
 - VERIFY: a shell command (exit 0 = pass) — tests, build, lint, a grep. Every seat reply is checked in that seat's workspace; a seat that claims done while it fails gets the output straight back. The run only completes when every changed workspace passes. maxFailures (default 2) is the circuit breaker; an escalation ladder (e.g. ["sonnet","opus"]) promotes seats on repeated failure, except seats pinned with escalate:false — pin deliberately cheap seats so a failure elsewhere does not erase the cost split.
@@ -52,10 +52,38 @@ Seats that edit files need permissionMode "acceptEdits"; seats that must run com
 Cost intuition: every seat reply costs an orchestrator turn; more seats means more coordination. Two to four seats is typical; one seat plus a reviewer is common; six or more needs a genuinely parallel goal. A reviewer seat is worth it whenever the work can be quietly wrong. Prefer fewer, sharper seats with a verify command over many seats with none.
 `.trim();
 
+/** A seat as the planner proposed it, with its reasoning attached. */
+export interface PlannedRole extends RoleSpec {
+  /** Why this provider and tier for this seat. */
+  why?: string;
+}
+
+/** One provider · tier a seat can run on, described for a human choosing. */
+export interface SeatOption {
+  provider: "claude" | "agy";
+  tier: ModelTier;
+  id: string;
+  label: string;
+  goodFor: string;
+  cost: string;
+}
+
+/** The catalogue a user picks from when reviewing a seat. */
+export function seatOptions(): SeatOption[] {
+  return [
+    { provider: "claude", tier: "opus", id: MODEL_IDS.opus, label: "claude · opus", goodFor: "deepest judgement — architecture, security, ambiguous calls, the reviewer over other seats", cost: "$5 / $25 per M tokens; the most per turn" },
+    { provider: "claude", tier: "sonnet", id: MODEL_IDS.sonnet, label: "claude · sonnet", goodFor: "strong default for engineering, analysis and writing that can be quietly wrong", cost: "$2 / $10 per M tokens" },
+    { provider: "claude", tier: "haiku", id: MODEL_IDS.haiku, label: "claude · haiku", goodFor: "mechanical, narrow, high-volume work on your Claude plan (no Google egress)", cost: "$1 / $5 per M tokens" },
+    { provider: "agy", tier: "opus", id: AGY_MODEL_IDS.opus, label: "agy · pro-low", goodFor: "Gemini Pro at low reasoning — breadth with some judgement, behind a verifier", cost: "1.5× Antigravity quota units; weekly cap" },
+    { provider: "agy", tier: "sonnet", id: AGY_MODEL_IDS.sonnet, label: "agy · flash-medium", goodFor: "enumeration, extraction, applying a known change, first drafts a command checks", cost: "1× Antigravity quota units; weekly cap" },
+    { provider: "agy", tier: "haiku", id: AGY_MODEL_IDS.haiku, label: "agy · flash-low", goodFor: "the cheapest seat: bulk, mechanical, fully verifiable work", cost: "1× Antigravity quota units, least thinking; weekly cap" },
+  ];
+}
+
 export interface TeamPlan {
   name: string;
   summary: string;
-  roles: RoleSpec[];
+  roles: PlannedRole[];
   verify?: VerifySpec;
   isolation: Isolation;
   budget?: BudgetSpec;
@@ -119,7 +147,8 @@ Reply with ONE JSON object and nothing else — no preamble, no fence:
   "summary": "one sentence: the team and why this shape",
   "roles": [
     { "name": "kebab-name", "description": "what this seat owns and how it reports", "provider": "claude|agy",
-      "model": "opus|sonnet|haiku", "permissionMode": "acceptEdits|bypassPermissions|plan", "escalate": true|false }
+      "model": "opus|sonnet|haiku", "permissionMode": "acceptEdits|bypassPermissions|plan", "escalate": true|false,
+      "why": "one sentence: why THIS provider and tier for THIS seat — what the work's check is, and what would go wrong on a cheaper or a pricier choice" }
   ],
   "verify": { "cmd": "shell command, exit 0 = pass", "maxFailures": 2, "timeoutSec": 600 } | null,
   "isolation": "worktree|none",
@@ -160,13 +189,14 @@ export async function planTeam(goal: string, opts: { cwd?: string; model?: strin
   } catch (e) {
     throw new Error(`planner did not return JSON (${(e as Error).message}):\n${raw.slice(0, 800)}`);
   }
-  const roles: RoleSpec[] = (Array.isArray(parsed.roles) ? parsed.roles : []).map((r: any, i: number) => ({
+  const roles: PlannedRole[] = (Array.isArray(parsed.roles) ? parsed.roles : []).map((r: any, i: number) => ({
     name: String(r.name ?? `role-${i + 1}`).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || `role-${i + 1}`,
     description: String(r.description ?? "").trim(),
     provider: normalizeProvider(r.provider),
     model: typeof r.model === "string" && r.model in MODEL_IDS ? normalizeTier(r.model) : normalizeTier(undefined),
     permissionMode: typeof r.permissionMode === "string" ? r.permissionMode : "acceptEdits",
     ...(r.escalate === false ? { escalate: false } : {}),
+    ...(typeof r.why === "string" && r.why.trim() ? { why: r.why.trim() } : {}),
   }));
   if (!roles.length) throw new Error("planner proposed no seats");
   const plan: TeamPlan = {
@@ -197,6 +227,7 @@ export function renderPlan(plan: TeamPlan, costUsd: number, theme: Theme = t): s
     const prov = theme.paint(r.provider ?? "claude", r.provider === "agy" ? "amberDark" : "tealDark");
     out.push(`  ${theme.paint("●", "teal")} ${theme.bold(r.name)}  ${prov} ${dim("·")} ${theme.paint(String(r.model), "muted")}${r.escalate === false ? dim(" · pinned") : ""}${r.permissionMode ? dim(` · ${r.permissionMode}`) : ""}`);
     out.push(`      ${dim(r.description)}`);
+    if (r.why) out.push(`      ${theme.paint("why:", "amberDark")} ${dim(r.why)}`);
   }
   out.push("");
   out.push(`  ${theme.bold("verify")}     ${plan.verify ? plan.verify.cmd : theme.paint("none — nothing here can prove the result; the reviewer is the check", "amber")}`);

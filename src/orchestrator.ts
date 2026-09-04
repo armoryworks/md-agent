@@ -30,7 +30,7 @@ import {
   writeGlobalJournalConfig,
 } from "./journal.js";
 import { LAUNCH_FILE } from "./init.js";
-import { planTeam, renderPlan, resolvePlannerModel, type TeamPlan } from "./plan.js";
+import { planTeam, renderPlan, resolvePlannerModel, seatOptions, type TeamPlan } from "./plan.js";
 import { theme as t } from "./theme.js";
 import { VERSION } from "./version.js";
 import { parseTeamBlocks, runHuddle, type TeamIO, type TeamResult, type TeamSpec } from "./team.js";
@@ -429,15 +429,29 @@ export async function runOrchestrator(opts: {
     try {
       const { plan, costUsd } = await planTeam(goal);
       console.log(renderPlan(plan, costUsd) + "\n");
-      const next = await select<string>({
+      let next = await select<string>({
         message: "Go with this?",
         choices: [
           { name: "Launch this team now", value: "launch" },
+          { name: "Review each seat first — see the recommendation and its reasoning, pick the provider and tier yourself", value: "review" },
           { name: `Save it as ${LAUNCH_FILE} to edit, then launch from the home screen`, value: "save" },
           { name: "Adjust it by hand (the wizard, prefilled from the plan)", value: "hand" },
           { name: "Cancel", value: "cancel" },
         ],
       });
+      if (next === "review") {
+        await reviewSeats(plan);
+        console.log("\n" + renderPlan(plan, costUsd) + "\n");
+        next = await select<string>({
+          message: "Go with this?",
+          choices: [
+            { name: "Launch this team now", value: "launch" },
+            { name: `Save it as ${LAUNCH_FILE} to edit, then launch from the home screen`, value: "save" },
+            { name: "Adjust it by hand (the wizard, prefilled)", value: "hand" },
+            { name: "Cancel", value: "cancel" },
+          ],
+        });
+      }
       if (next === "cancel") return;
       if (next === "save") {
         const cfg: LaunchConfig = {
@@ -589,6 +603,47 @@ export async function runOrchestrator(opts: {
     journal,
     kickoff: "Begin the run.",
   });
+}
+
+/**
+ * Walk the planned seats one by one: the recommendation first, with the
+ * planner's reasoning, then every other provider · tier with what it is good
+ * for and what it costs. The user's pick replaces the plan's; nothing is
+ * launched here.
+ */
+async function reviewSeats(plan: TeamPlan): Promise<void> {
+  const dim = (s: string) => t.paint(s, "dim");
+  const options = seatOptions();
+  for (const [i, r] of plan.roles.entries()) {
+    console.log("");
+    console.log(` ${t.paint("●", "teal")} ${t.bold(r.name)}  ${dim(`seat ${i + 1} of ${plan.roles.length}`)}`);
+    console.log(`   ${dim(r.description)}`);
+    if (r.why) console.log(`   ${t.paint("planner:", "amberDark")} ${r.why}`);
+    const recProvider = normalizeProvider(r.provider);
+    const recTier = normalizeTier(typeof r.model === "string" ? r.model : undefined);
+    const ordered = [
+      ...options.filter((o) => o.provider === recProvider && o.tier === recTier),
+      ...options.filter((o) => !(o.provider === recProvider && o.tier === recTier)),
+    ];
+    const pick = await select<string>({
+      message: `${r.name} runs on:`,
+      pageSize: 8,
+      choices: ordered.map((o, idx) => ({
+        name: `${idx === 0 ? t.paint("★ recommended  ", "amber", true) : "               "}${o.label}  ${dim(`(${o.id})`)}`,
+        value: `${o.provider}:${o.tier}`,
+        description: `${o.goodFor} — ${o.cost}`,
+      })),
+    });
+    const [provider, tier] = pick.split(":") as [Provider, ModelTier];
+    r.provider = provider;
+    r.model = tier;
+    if (provider === "agy" && r.escalate !== false) {
+      r.escalate = await confirm({ message: `Let escalation promote ${r.name} to a stronger tier on repeated verify failure? (No keeps it cheap)`, default: false });
+    }
+    if (provider === "agy" && r.permissionMode === "acceptEdits") {
+      console.log(`   ${dim("note: agy's accept-edits grants file edits but not commands; a seat that must run the check needs bypassPermissions")}`);
+    }
+  }
 }
 
 /**
@@ -1788,6 +1843,9 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
           seatVerifyFails.set(r.name, n);
           const max = verify.maxFailures ?? 2;
           await appendTranscript(transcript, `VERIFY FAIL ${r.name} ${n}`, res.tail);
+          const sameAsLast = seatLastFailTail.get(r.name) === res.tail;
+          seatLastFailTail.set(r.name, res.tail);
+          const tailForSeat = sameAsLast ? "(the same failure output as last time — nothing changed)" : res.tail;
           if (claimsDone(content) && n <= max && !stopping) {
             console.warn(`[verify] ${r.name} reported done but \`${verify.cmd}\` fails in ${where} (${n}/${max}) — sending the output straight back`);
             await sendToRole({
@@ -1795,7 +1853,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
               body:
                 `[VERIFY FAIL ${n}/${max} — \`${verify.cmd}\` in ${where}]\n` +
                 `You reported done, but the check fails where your work is. Fix the cause in your own workspace, run the check yourself, then report again — and if you are not sure why it fails, say exactly what you tried so another seat can take it from there.\n\n` +
-                res.tail,
+                tailForSeat,
             });
             return;
           }
@@ -1808,6 +1866,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   }
 
   const seatVerifyFails = new Map<string, number>();
+  const seatLastFailTail = new Map<string, string>();
 
   /** A reply that presents itself as finished — the only kind verify-on-reply bounces. */
   function claimsDone(reply: string): boolean {

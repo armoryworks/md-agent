@@ -149,6 +149,8 @@ export class ClaudeSession implements AgentSession {
       logPath?: string;
       /** Tools this session may not use (`--disallowedTools`), e.g. to keep a coordinator from editing. */
       disallowedTools?: string[];
+      /** Kill the turn after this many seconds; 0 = no cap (the orchestrator's own turns). */
+      turnTimeoutSec?: number;
     } = {}
   ) {
     this.systemPrompt = opts.systemPrompt ?? null;
@@ -161,7 +163,10 @@ export class ClaudeSession implements AgentSession {
     this.permissionMode = opts.permissionMode ?? null;
     this.log = opts.logPath ? new TurnLog(opts.logPath) : null;
     this.disallowedTools = opts.disallowedTools ?? [];
+    this.turnTimeoutMs = (opts.turnTimeoutSec ?? 0) * 1000;
   }
+
+  private readonly turnTimeoutMs: number;
 
   get lastWindows(): WindowSnapshot | null {
     return this.lastWindowsData;
@@ -241,6 +246,18 @@ export class ClaudeSession implements AgentSession {
       let assistantText = "";
       let rawStdout = ""; // full stdout, kept so a non-zero exit can surface the real error
       let limited: { message: string; resetsAt?: number } | null = null;
+      let timedOut = false;
+      const turnTimer =
+        this.turnTimeoutMs > 0
+          ? setTimeout(() => {
+              timedOut = true;
+              try {
+                child.kill();
+              } catch {
+                // already gone
+              }
+            }, this.turnTimeoutMs)
+          : null;
 
       child.stdout!.on("data", (chunk: Buffer) => {
         this.beat(); // stream output = the turn is actively working
@@ -310,6 +327,12 @@ export class ClaudeSession implements AgentSession {
 
       child.on("error", reject);
       child.on("exit", (code) => {
+        if (turnTimer) clearTimeout(turnTimer);
+        if (timedOut) {
+          this.log?.mark("end", { code, ms: Date.now() - startedAt, timedOut: true });
+          reject(new Error(`claude turn exceeded its ${Math.round(this.turnTimeoutMs / 1000)}s cap and was stopped — the ask was too big for one turn; re-scope it smaller`));
+          return;
+        }
         this.log?.mark("end", {
           code,
           ms: Date.now() - startedAt,

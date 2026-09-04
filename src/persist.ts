@@ -89,13 +89,15 @@ export const PROVIDER_PROFILES: ProviderProfile[] = [
 
 /**
  * Concrete agy model ids per tier — the cheap/mid/strong rungs. agy encodes
- * reasoning effort in the id itself (…-low/-medium/-high) rather than via a
- * separate flag, so the tier ladder climbs both model and effort at once.
+ * reasoning effort in the id itself (…-low/-medium/-high). The rungs sit at
+ * low/medium effort on purpose: a "-high" turn spends ~60k thinking tokens,
+ * and a seat's turn is already a long agentic loop; pro-low is the interactive
+ * default on the same plan. Name a "-high" id explicitly when a seat needs it.
  * `agy models` lists what is available.
  */
 export const AGY_MODEL_IDS: Record<ModelTier, string> = {
-  opus: "gemini-3.1-pro-high",
-  sonnet: "gemini-3.8-flash-high",
+  opus: "gemini-3.1-pro-low",
+  sonnet: "gemini-3.8-flash-medium",
   haiku: "gemini-3.8-flash-low",
 };
 
@@ -144,6 +146,13 @@ export interface RoleSpec {
    * dispatch to it; its work was handed off or left for the orchestrator.
    */
   stopped?: { at: string; handoffTo?: string; reason?: string; resetsAt?: number };
+  /**
+   * Hard cap on one turn, in seconds: the CLI is killed and the turn reported
+   * as an error the orchestrator can re-scope. Default 300 for agy, 600 for
+   * claude. A turn is a whole agentic loop inside the CLI — every model call
+   * in it re-reads the conversation — so long turns are where quota goes.
+   */
+  turnTimeoutSec?: number;
   /**
    * Whether the escalation ladder may promote this seat. Default true.
    *

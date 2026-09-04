@@ -1,4 +1,5 @@
 import path from "node:path";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { ClaudeSession, ProviderExhaustedError, type AgentSession } from "./claude.js";
 import { AgySession } from "./agy.js";
@@ -53,6 +54,37 @@ const RECYCLE_TURNS = (() => {
   return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 0;
 })();
 
+/**
+ * Recycle by size as well: a turn that processed this many tokens (input +
+ * cache reads + output) leaves a session that will re-read all of it next
+ * turn. One observed turn reached 6M tokens inside the CLI's own loop; the
+ * next turn on that session would have started there. MD_AGENT_ROLE_RECYCLE_TOKENS
+ * overrides; 0 disables.
+ */
+const RECYCLE_TOKENS = (() => {
+  const raw = process.env.MD_AGENT_ROLE_RECYCLE_TOKENS;
+  if (raw == null) return 200_000;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
+})();
+
+/**
+ * The shared brief, for a seat: inline when small; a pointer + excerpt to
+ * <runDir>/context.md when large, so it is read on demand instead of riding
+ * in the seat's resident context every turn. Same scheme the orchestrator uses.
+ */
+function roleContextBlock(context: string | undefined, runDir: string): string {
+  if (!context) return "";
+  const file = path.join(runDir, "context.md");
+  if (context.length <= 2000 || !existsSync(file)) return `\nShared context:\n${context}`;
+  return [
+    "",
+    `Shared context: the full ${Math.max(1, Math.round(context.length / 1000))} KB brief is at ${file} — read it (or the section you need) with your file tools when your work depends on it. Do not paste it back into reports.`,
+    "Opening excerpt:",
+    context.slice(0, 600) + (context.length > 600 ? "\n…[truncated — full text in the file]" : ""),
+  ].join("\n");
+}
+
 export async function runRole(
   roleName: string,
   runDir: string,
@@ -66,6 +98,10 @@ export async function runRole(
   const outbox = path.join(runDir, "outbox", `${roleName}.txt`);
   const transcript = path.join(runDir, "transcript.md");
 
+  const provider = normalizeProvider(me.provider);
+  const model = resolveModelFor(provider, me.model);
+  const turnCapSec = me.turnTimeoutSec ?? (provider === "agy" ? 300 : 600);
+
   let systemPrompt = [
     `You are the "${roleName}" agent.`,
     `Your role: ${me.description}`,
@@ -77,7 +113,12 @@ export async function runRole(
     "- Your reply to the orchestrator is a STATUS REPORT, not the deliverable itself.",
     "- Put detailed work — documents, findings, specs, code — in files in the workspace and REFERENCE them by path. Do NOT paste large file contents, full logs, or long listings back to the orchestrator.",
     "- Target 250 words or fewer: what you did, what you found or decided, what you need next, and file pointers. Expand beyond that only when the orchestrator explicitly asks for a full deliverable inline.",
-    state.context ? `\nShared context:\n${state.context}` : "",
+    "",
+    "TURN DISCIPLINE (a turn is one agentic loop; every call in it re-reads everything so far — long turns are where quota goes):",
+    "- Do ONE slice of the ask per turn: a few files, one change, one check. Run the verify or test once, then REPORT. You will be dispatched again for the next slice.",
+    "- Never re-read the whole repository or re-run the full suite to \"confirm\" something you already established this run — trust your earlier turn's finding and say so.",
+    `- A turn is capped at ${turnCapSec}s; if you are near it, stop and report what is done and what is next.`,
+    roleContextBlock(state.context, runDir),
   ]
     .filter(Boolean)
     .join("\n");
@@ -85,8 +126,6 @@ export async function runRole(
   // resume path may append transcript history to systemPrompt below).
   const baseSystemPrompt = systemPrompt;
 
-  const provider = normalizeProvider(me.provider);
-  const model = resolveModelFor(provider, me.model);
   const heartbeatPath = path.join(runDir, "sessions", `${roleName}.heartbeat`);
   const permissionMode =
     me.permissionMode ?? process.env.MD_AGENT_ROLE_PERMISSION_MODE?.trim() ?? undefined;
@@ -146,6 +185,7 @@ export async function runRole(
       permissionMode,
       cwd: workspaceDir,
       logPath: logPath(runDir, roleName),
+      turnTimeoutSec: turnCapSec,
     };
     const onSessionId = (id: string) => void writeSessionId(runDir, roleName, id);
     return provider === "agy"
@@ -230,7 +270,11 @@ export async function runRole(
     await clearFile(inbox);
 
     // Both providers are stateful now, so recycling is no longer claude-only.
-    if (RECYCLE_TURNS > 0 && turnsSinceSpawn >= RECYCLE_TURNS) {
+    // By turn count, or by size: a session whose last turn read more than
+    // RECYCLE_TOKENS would carry all of that into this turn as well.
+    const lastRead = session.lastUsage ? usageTokens(session.lastUsage) : 0;
+    if ((RECYCLE_TURNS > 0 && turnsSinceSpawn >= RECYCLE_TURNS) || (RECYCLE_TOKENS > 0 && lastRead >= RECYCLE_TOKENS)) {
+      if (lastRead >= RECYCLE_TOKENS) console.log(`[role:${roleName}] last turn processed ${Math.round(lastRead / 1000)}k tokens (≥ ${Math.round(RECYCLE_TOKENS / 1000)}k) — recycling before this one`);
       await recycleSession();
     }
 
