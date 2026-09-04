@@ -1,5 +1,5 @@
 import path from "node:path";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { spawn, ChildProcess } from "node:child_process";
 import crossSpawn from "cross-spawn";
@@ -321,6 +321,7 @@ function buildOrchSystem(state: RunState, runDir: string | null): string {
     "- Prune resolved items in the other sections aggressively. The ledger is working memory, not a log — the transcript and shared files are the permanent record.",
     "",
     "DISPATCH DISCIPLINE:",
+    "- A seat whose verify keeps failing is STUCK, not slow. After two failures on the same work, do not send it back a third time unchanged: route the failing output to a different seat (a reviewer, or one on a stronger tier) for a diagnosis, re-scope the ask, or split it. An idle reviewer while a worker loops on verify is the wrong shape.",
     "- Roles report concise STATUS, not full deliverables; their detailed work lives in shared files. Coordinate on those summaries — never ask a role to echo a large artifact back through you.",
     "- Don't paste one role's output into another's message — summarize the relevant decision and point to the file.",
     "- The literal single-word message `exit` is sent to all roles when the user terminates the run.",
@@ -1252,6 +1253,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   // Seats the user stopped (ctrl-x / `stop`): never dispatched to, respawned or recovered.
   const stoppedRoles = new Set<string>();
   let watchdog: ReturnType<typeof setInterval> | undefined;
+  let stopPoll: ReturnType<typeof setInterval> | undefined;
   roles.forEach((r, i) => {
     const c = children[i];
     if (c) {
@@ -1632,10 +1634,12 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   dash.start();
 
   let stopping = false;
+  let haltWritten = false;
   const stopAll = async (reason: string) => {
     if (stopping) return;
     stopping = true;
     if (watchdog) clearInterval(watchdog);
+    if (stopPoll) clearInterval(stopPoll);
     dash.setStatus(`stopping — ${reason}`);
     dash.stop();
     console.log(`\n[orchestrator] stopping (${reason})`);
@@ -1789,7 +1793,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
               role: r.name,
               body:
                 `[VERIFY FAIL ${n}/${max} — \`${verify.cmd}\` in ${where}]\n` +
-                `You reported done, but the check fails where your work is. Fix the cause in your own workspace, run the check yourself, then report again.\n\n` +
+                `You reported done, but the check fails where your work is. Fix the cause in your own workspace, run the check yourself, then report again — and if you are not sure why it fails, say exactly what you tried so another seat can take it from there.\n\n` +
                 res.tail,
             });
             return;
@@ -2301,6 +2305,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     if (stopping) return;
     console.error(`\n[watchdog] HALT — ${reason}\n`);
     await appendTranscript(transcript, "WATCHDOG HALT", reason);
+    haltWritten = true;
     try {
       await writeFile(path.join(runDir, "HALT.txt"), reason + "\n", "utf8");
     } catch {
@@ -2321,6 +2326,34 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   } catch {
     // footer flag only
   }
+
+  // Detached runs have no console: a STOP file in the run dir (md-agent --stop,
+  // or `touch runs/<dir>/STOP`) ends the run cleanly, same teardown as `exit`.
+  // A HALT.txt that appeared without this run writing it is treated the same.
+  const stopFile = path.join(runDir, "STOP");
+  await writeFile(path.join(runDir, "orchestrator.pid"), String(process.pid), "utf8");
+  process.on("SIGTERM", () => {
+    void stopAll("SIGTERM");
+  });
+
+  // Polled on its own, fast — the watchdog ticks once a minute, which is too
+  // slow for someone who just asked the run to stop.
+  stopPoll = setInterval(() => {
+    if (stopping) return;
+    if (existsSync(stopFile)) {
+      let why = "";
+      try {
+        why = readFileSync(stopFile, "utf8").trim();
+      } catch {
+        // unreadable — still a stop
+      }
+      void stopAll(`stop file${why ? `: ${why}` : ""}`);
+      return;
+    }
+    if (!haltWritten && existsSync(path.join(runDir, "HALT.txt"))) {
+      void stopAll("HALT.txt placed in the run dir");
+    }
+  }, 2000);
 
   watchdog = setInterval(() => {
     if (stopping) return;

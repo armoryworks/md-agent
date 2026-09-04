@@ -9,7 +9,27 @@ import { inspectSeat, listSeats } from "./inspect.js";
 import { runJourney } from "./journey.js";
 import { runRole } from "./role.js";
 
-const { values, positionals } = parseArgs({
+import { stopRun } from "./stop.js";
+
+const USAGE = `md-agent ${VERSION} — a team of agent CLIs on one goal
+
+  md-agent                          home screen: continue, launch, resume, inspect, journals
+  md-agent init                     write a starter md-agent.launch.json here
+  md-agent --launch <file.json>     start a run from a config (no wizard)
+  md-agent --journey <file.json> [--from <phase-id>]
+  md-agent --resume <run-dir> [--minutes N] [--quiet]
+  md-agent --stop <run-dir>         end a running (detached) run cleanly
+  md-agent --inspect <run-dir> [--seat <name>]
+  md-agent --context <brief.md>     wizard, seeded from a document
+  md-agent skill install [--project] | uninstall | show
+  md-agent --version | -v           md-agent --help | -h
+
+In a run: show <seat> · stop / ctrl-x · journals · exit · extend N · interval N
+Docs: https://github.com/armoryworks/md-agent#readme
+`;
+
+function parse() {
+  return parseArgs({
   options: {
     role: { type: "string" },
     run: { type: "string" },
@@ -36,9 +56,22 @@ const { values, positionals } = parseArgs({
     // With `skill install`: into ./.claude/skills instead of ~/.claude/skills.
     project: { type: "boolean" },
     version: { type: "boolean", short: "v" },
+    help: { type: "boolean", short: "h" },
+    // End a running run cleanly by placing a STOP file in its dir (then SIGTERM if it lingers).
+    stop: { type: "string" },
   },
   allowPositionals: true,
 });
+}
+let parsed: ReturnType<typeof parse>;
+try {
+  parsed = parse();
+} catch (e) {
+  console.error(`md-agent: ${(e as Error).message}\n`);
+  console.error(USAGE);
+  process.exit(2);
+}
+const { values, positionals } = parsed;
 
 if (values["no-dashboard"]) {
   process.env.MD_AGENT_NO_DASHBOARD = "1";
@@ -49,8 +82,12 @@ if (values.from && !values.journey) {
   console.warn(`[md-agent] --from "${values.from}" has no effect without --journey; ignoring.`);
 }
 
-if (values.version || positionals[0] === "version") {
+if (values.help || positionals[0] === "help") {
+  console.log(USAGE);
+} else if (values.version || positionals[0] === "version") {
   console.log(`@armoryworks/md-agent ${VERSION}`);
+} else if (values.stop) {
+  await stopRun(path.resolve(values.stop));
 } else if (positionals[0] === "init") {
   await runInit();
 } else if (positionals[0] === "skill") {

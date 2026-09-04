@@ -288,6 +288,19 @@ Version:
 md-agent --version        # also -v, or `md-agent version`
 ```
 
+Stop a run that has no console (started detached, or from another terminal):
+
+```bash
+npm run dev -- --stop runs/<dir>     # places STOP in the run dir; the run tears down cleanly within seconds
+touch runs/<dir>/STOP                # the same, by hand
+```
+
+The run's watchdog picks the file up, tells the seats to exit, audits the
+workspaces, stamps `endedAt`, and — if a journal repo is configured with
+`autoPush` — pushes the journal. `--stop` waits for that and only sends
+`SIGTERM` if the process lingers past 30s. (A `HALT.txt` placed in the dir by
+hand is honored the same way.)
+
 Look inside a seat of any run:
 
 ```bash
@@ -326,7 +339,11 @@ config/journey path supplies `provider` directly and skips the prompt.
   orchestrator is always `claude`. **Both providers are stateful** — claude resumes
   with `--resume`, agy with `--conversation` — so an agy seat keeps its context
   across turns and is recycled on the same schedule. Use agy seats for cheap,
-  mechanical or high-volume role work. The tier (`model`) maps per provider
+  mechanical or high-volume role work. agy resolves paths against its
+  *project*, not the process cwd (started bare it works in
+  `~/.gemini/antigravity-cli/scratch`), so every agy turn is bound to the seat's
+  directory with `--add-dir` — under worktree isolation that is the seat's
+  worktree, otherwise the shared tree. The tier (`model`) maps per provider
   (claude `claude-opus-5` / `claude-sonnet-5` / `claude-haiku-4-5`, agy
   `gemini-3.1-pro-high` / `gemini-3.8-flash-high` / `gemini-3.8-flash-low`), or
   name a concrete id and it is passed through as-is (`gemini-3.1-pro-low`,

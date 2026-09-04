@@ -39,6 +39,8 @@ Do not use it for judgement-only work with no command to prove the result and no
 | `md-agent --resume runs/<dir> [--quiet]` | Resume a run (seats reattach to sessions). |
 | `md-agent --journey journey.json [--from <phase>]` | Multi-phase run with handshakes between phases; `--from` resumes an unfinished/halted phase in place. |
 | `md-agent --inspect runs/<dir> [--seat <name>]` | A seat's trace: prompts, tool calls, results, denials, cost per turn. |
+| `md-agent --stop runs/<dir>` | End a running (detached) run cleanly. |
+| `md-agent --help` | Usage. |
 | `md-agent skill install [--project]` | Put this skill into `~/.claude/skills/` (or the project's `.claude/skills/`). |
 
 In the setup wizard the **goal comes first**, then journals, then a fork: **have Claude plan the team** (a high-tier model reads the goal and the repo and recommends seats, verify, isolation, budget — launch it, save it as the launch file, or adjust by hand) or set it up by hand.
@@ -78,6 +80,7 @@ From anywhere else, the run folder is the live view:
 - `md-agent --inspect runs/<dir> --seat <name>` — a seat's prompts, tool calls, results, denials and cost per turn.
 - `runs/<dir>/ledger.md` — what the orchestrator currently believes; `runs/<dir>/log/<seat>.jsonl` — the raw stream.
 - `HALT.txt` appearing in the run folder means the run stopped itself — the watchdog (a hung or deadlocked seat), the verify circuit breaker, or a hard budget line; the file holds the reason. `--resume runs/<dir>` (or *Continue* on the home screen) clears it and picks the run up.
+- **To stop a detached run:** `md-agent --stop runs/<dir>` (or `touch runs/<dir>/STOP`). The run tears down cleanly within seconds — seats told to exit, workspaces audited and verified, `endedAt` stamped; `--stop` only sends SIGTERM if the process lingers. Never kill the PIDs first.
 
 **Watching is the default.** Whenever Claude launches or resumes a run it does three things without being asked: starts the run detached (`md-agent --launch … > run.log 2>&1 < /dev/null &`), immediately arms a watch on `run.log` or `transcript.md` for `verify`, `checkpoint`, `HALT` and the teardown branch list so results are reported as they land, and prints the `tail -f` and `--inspect` commands above so the user can follow along in a terminal. A detached run has no console, so `show`/`stop`/`exit` are not available for it; a user who wants the console starts `md-agent --launch` in their own terminal and Claude watches the same files.
 

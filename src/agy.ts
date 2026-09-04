@@ -126,6 +126,11 @@ export class AgySession implements AgentSession {
     const args = ["-p", fullPrompt, "--output-format", "stream-json"];
     if (this.conversationId) args.push("--conversation", this.conversationId);
     if (this.model) args.push("--model", this.model);
+    // agy resolves paths against its project, not the process cwd — started
+    // bare it works in ~/.gemini/antigravity-cli/scratch, and a worktree seat
+    // would write into whatever project it last knew. --add-dir binds this
+    // turn to the seat's directory; repeating it per turn is idempotent.
+    args.push("--add-dir", this.cwd ?? process.cwd());
     args.push(...this.permissionArgs());
     // Keep agy's own print timeout above ours so OUR timer is the one that fires
     // and produces a diagnosable error rather than an opaque CLI kill.
