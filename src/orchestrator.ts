@@ -32,6 +32,7 @@ import {
 import { LAUNCH_FILE } from "./init.js";
 import { planTeam, renderPlan, resolvePlannerModel, type TeamPlan } from "./plan.js";
 import { theme as t } from "./theme.js";
+import { VERSION } from "./version.js";
 import { parseTeamBlocks, runHuddle, type TeamIO, type TeamResult, type TeamSpec } from "./team.js";
 import {
   type BudgetSpec,
@@ -822,7 +823,8 @@ export async function launchRun(setup: RunSetup): Promise<void> {
     "utf8"
   );
 
-  console.log(`\n[orchestrator] run dir: ${runDir}`);
+  console.log(`\n[md-agent] v${VERSION}`);
+  console.log(`[orchestrator] run dir: ${runDir}`);
   console.log(
     `[orchestrator] roles + models:\n${roles
       .map((r) => `    ${r.name} → ${r.model}`)
@@ -961,7 +963,8 @@ export async function resumeOrchestrator(
     `[orchestrator] time budget: ${resumeBudgetMinutes != null ? resumeBudgetMinutes + " min" : "none"}`
   );
 
-  console.log(`\n[orchestrator] resuming run: ${runDir}`);
+  console.log(`\n[md-agent] v${VERSION}`);
+  console.log(`[orchestrator] resuming run: ${runDir}`);
   console.log(`[orchestrator] roles: ${roles.map((r) => r.name).join(", ")}`);
 
   // A resume is a retry: the halt marker and the previous end-of-run stamp

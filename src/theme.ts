@@ -5,6 +5,8 @@
  * when stdout is not a TTY.
  */
 
+import { VERSION } from "./version.js";
+
 const ESC = "\x1b";
 
 export type ColorMode = "truecolor" | "256" | "none";
@@ -83,9 +85,9 @@ export class Theme {
     return [`${o("▄")}${f("▄▄▄")}`, `${o("█")}${w("W")}${f("██")}`, `${o("▀")}${f("▙▟▀")}`];
   }
 
-  /** "ARMORY WORKS · md-agent", in brand tones. */
+  /** "ARMORY WORKS · md-agent v1.4.0", in brand tones. */
   wordmark(): string {
-    return `${this.paint("ARMORY", "amber", true)} ${this.paint("WORKS", "amberHi", true)} ${this.paint("·", "dim")} ${this.paint("md-agent", "teal", true)}`;
+    return `${this.paint("ARMORY", "amber", true)} ${this.paint("WORKS", "amberHi", true)} ${this.paint("·", "dim")} ${this.paint("md-agent", "teal", true)} ${this.paint(`v${VERSION}`, "dim")}`;
   }
 
   /** Plain-text width of a string that may carry ANSI sequences. */

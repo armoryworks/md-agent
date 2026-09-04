@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 import path from "node:path";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import { VERSION } from "./version.js";
 import { resumeOrchestrator, runFromConfig, runOrchestrator } from "./orchestrator.js";
 import { runHomeSafe } from "./home.js";
 import { installSkill, runInit } from "./init.js";
@@ -51,8 +50,7 @@ if (values.from && !values.journey) {
 }
 
 if (values.version || positionals[0] === "version") {
-  const pkg = JSON.parse(readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf8"));
-  console.log(`${pkg.name} ${pkg.version}`);
+  console.log(`@armoryworks/md-agent ${VERSION}`);
 } else if (positionals[0] === "init") {
   await runInit();
 } else if (positionals[0] === "skill") {
