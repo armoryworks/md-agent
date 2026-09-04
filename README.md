@@ -1,14 +1,20 @@
 # md-agent
 
-A small CLI that runs a **team of [Claude Code](https://claude.com/claude-code)
-agents** against a single goal. One *orchestrator* agent coordinates several
-named *role* agents (e.g. `backend-engineer`, `qa-lead`, `discovery-analyst`),
-routing work to them and synthesizing what comes back. Coordination happens over
-plain files on disk, so a run is fully inspectable and resumable.
+A small CLI that runs a **team of agent CLIs** — [Claude Code](https://claude.com/claude-code)
+and, per seat, [Antigravity](https://antigravity.google) — against a single goal.
+One *orchestrator* agent coordinates several named *role* agents (e.g.
+`backend-engineer`, `qa-lead`, `discovery-analyst`), routing work to them and
+synthesizing what comes back. Coordination happens over plain files on disk, so
+a run is fully inspectable and resumable.
 
-> Each agent is a real `claude` process. md-agent is the conductor, not the model
-> — it spawns the CLI, routes messages, persists sessions, and keeps a running
-> transcript and cost tally.
+The shape it is built for: **delegate** mechanical work to a cheap seat,
+**isolate** every seat in its own git worktree, **verify** each worktree with a
+command that proves the result, **admit** the branches that pass. Judgement
+stays on a claude seat; nothing lands in your tree until you merge it.
+
+> Each agent is a real `claude` or `agy` process. md-agent is the conductor, not
+> the model — it spawns the CLI, routes messages, persists sessions, tees every
+> seat's stream to a trace, and keeps a running transcript and cost tally.
 
 ## How it works
 
@@ -19,7 +25,7 @@ plain files on disk, so a run is fully inspectable and resumable.
               inbox/*.txt │ ▲ outbox/*.txt
                           ▼ │
         ┌───────────┬───────────┬───────────┐
-        │  role A   │  role B   │  role C    │   (one claude child process each)
+        │  role A   │  role B   │  role C    │   (one agent CLI process each — claude or agy)
         └───────────┴───────────┴───────────┘
 ```
 
@@ -34,7 +40,7 @@ plain files on disk, so a run is fully inspectable and resumable.
   and an unconsumed inbox is appended to, never overwritten, so dispatches can't
   be silently lost.
 - Each **role** is a child process watching its inbox. It runs its own (stateful)
-  `claude` session and writes the reply to `outbox/<role>.txt`.
+  `claude` or `agy` session and writes the reply to `outbox/<role>.txt`.
 - The orchestrator watches every outbox; each reply becomes the next event it
   folds into the ledger and acts on.
 - Every message is appended to a single `transcript.md` (the orchestrator is the
@@ -54,14 +60,19 @@ orchestrator's resident context to `system + ledger + this event` makes it
 The ledger holds status and pointers; details live in shared files and are
 retrieved only when needed.
 
-Each participant's `claude` session id is persisted under `sessions/`, so a run
-can be paused and resumed without losing context.
+Each participant's session id is persisted under `sessions/`, so a run can be
+paused and resumed without losing context.
 
 ## Requirements
 
 - **Node.js** ≥ 20 (ESM, `NodeNext`).
 - The **`claude` CLI** installed and on your `PATH`, already authenticated.
-  md-agent shells out to it (`claude -p --output-format stream-json`).
+  md-agent shells out to it (`claude -p --output-format stream-json`). The
+  orchestrator is always claude.
+- Optionally the **`agy` CLI** (Antigravity), for seats configured with
+  `provider: "agy"` (`agy -p --output-format stream-json`). Only the providers a
+  run is configured to use are probed at launch.
+- **git**, when a run uses `isolation: "worktree"`.
 
 ## Install & build
 
@@ -333,9 +344,11 @@ orchestrator, which decides how to propagate it). At a checkpoint you can:
 | `MD_AGENT_NO_DASHBOARD`   | unset        | Disable the sticky top-of-console status panel (also auto-disabled when stdout isn't a TTY). |
 | `NO_COLOR`                | unset        | Disable ANSI color in the dashboard. |
 
-Per-role models are chosen automatically by the orchestrator at setup (each role
-is assigned `opus`/`sonnet`/`haiku` by cognitive load). The concrete model ids
-per tier live in `src/persist.ts` (`MODEL_IDS`).
+Per-role models are chosen automatically by the orchestrator at setup when a
+seat leaves `model` unset (each role is assigned `opus`/`sonnet`/`haiku` by
+cognitive load); a launch config can pin a tier or a concrete id. The concrete
+ids per tier live in `src/persist.ts` (`MODEL_IDS` for claude, `AGY_MODEL_IDS`
+for agy).
 
 ## Cost tracking
 
