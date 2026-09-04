@@ -125,7 +125,17 @@ export async function reportWorkspaces(opts: {
       commits = Number(await git(dir, ["rev-list", "--count", `${against}..HEAD`])) || 0;
       diffstat = await git(dir, ["diff", "--stat", against]);
       const names = await git(dir, ["diff", "--name-only", against]);
-      changedFiles = names ? names.split("\n").filter(Boolean).length : 0;
+      const changed = new Set(names ? names.split("\n").filter(Boolean) : []);
+      // A file the seat created but never `git add`ed is still its output —
+      // `git diff` alone would report a productive seat as "0 files changed".
+      const untracked = (await git(dir, ["ls-files", "--others", "--exclude-standard"]))
+        .split("\n")
+        .filter(Boolean);
+      for (const f of untracked) changed.add(f);
+      changedFiles = changed.size;
+      if (untracked.length) {
+        diffstat += `${diffstat ? "\n" : ""} + ${untracked.length} untracked: ${untracked.slice(0, 8).join(", ")}${untracked.length > 8 ? ", …" : ""}`;
+      }
     } catch {
       // A workspace we cannot read is still worth listing; leave the counts at 0.
     }
