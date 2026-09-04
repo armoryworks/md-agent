@@ -102,6 +102,7 @@ export class Dashboard {
   private runNet: Spend | null = null;
   private windows: WindowSnapshot | null = null;
   private budgetNote = "";
+  private journalsOff = false;
   private ticker: ReturnType<typeof setInterval> | undefined;
 
   private readonly origLog = console.log;
@@ -242,6 +243,12 @@ export class Dashboard {
   /** Latest plan-window utilization any claude seat reported. */
   setWindows(w: WindowSnapshot | null): void {
     this.windows = w;
+    this.redraw();
+  }
+
+  /** Show in the footer that journals were opted out, with the keyword that turns them back on. */
+  setJournalsOff(off: boolean): void {
+    this.journalsOff = off;
     this.redraw();
   }
 
@@ -490,7 +497,7 @@ export class Dashboard {
       }
     });
 
-    const hint = " ctrl-x stop seats · show <seat> · exit ";
+    const hint = ` ctrl-x stop seats · show <seat> · exit${this.journalsOff ? ' · journals off (type "journals")' : ""} `;
     const rule = width > hint.length + 8 ? `──${hint}${"─".repeat(width - hint.length - 2)}` : "─".repeat(width);
     out.push(t.paint(rule, "dim"));
     return out.map((l) => this.fit(l, width));

@@ -370,9 +370,9 @@ export type EndOffer = "pushed" | "skipped" | "never" | "failed";
 
 const NEVER = "never";
 const NOT_NOW = "not-now";
-const NEVER_CHOICE = { name: "No, and don't ask again — ever", value: NEVER, description: "remembered globally; pushing stays available from the home screen" };
+export const NEVER_CHOICE = { name: "No, and don't ask again — ever", value: NEVER, description: "remembered globally; pushing stays available from the home screen" };
 
-async function rememberNever(): Promise<void> {
+export async function rememberNever(): Promise<void> {
   await writeGlobalJournalConfig({ ask: false });
   console.log(` ${t.paint("▸", "amber", true)} understood — journals won't be offered again (home screen → Journals, if you change your mind)`);
 }

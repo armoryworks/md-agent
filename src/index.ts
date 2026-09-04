@@ -3,7 +3,7 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import { resumeOrchestrator, runFromConfig, runOrchestrator } from "./orchestrator.js";
 import { runHomeSafe } from "./home.js";
-import { runInit } from "./init.js";
+import { installSkill, runInit } from "./init.js";
 import { inspectSeat, listSeats } from "./inspect.js";
 import { runJourney } from "./journey.js";
 import { runRole } from "./role.js";
@@ -47,6 +47,8 @@ if (values.from && !values.journey) {
 
 if (positionals[0] === "init") {
   await runInit();
+} else if (positionals[0] === "skill") {
+  await installSkill(positionals[1]);
 } else if (values.inspect) {
   const runDir = path.resolve(values.inspect);
   if (values.seat) {

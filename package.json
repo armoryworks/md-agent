@@ -8,7 +8,8 @@
   },
   "files": [
     "dist",
-    "NOTICE"
+    "NOTICE",
+    "skills"
   ],
   "publishConfig": {
     "access": "public"

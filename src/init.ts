@@ -1,6 +1,8 @@
 import path from "node:path";
+import os from "node:os";
 import { existsSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import type { LaunchConfig } from "./persist.js";
 import { theme as t } from "./theme.js";
 
@@ -63,4 +65,31 @@ export async function runInit(cwd = process.cwd()): Promise<void> {
   console.log(` ${t.paint("run", "teal", true)}    md-agent   ${t.paint("(the home screen offers this file as a one-key launch)", "dim")}`);
   console.log(`        md-agent --launch ${LAUNCH_FILE}`);
   console.log("");
+}
+
+/**
+ * `md-agent skill install`: put the bundled Claude Code skill (skills/md-agent/
+ * SKILL.md) into ~/.claude/skills/md-agent/, so Claude knows when to reach for
+ * a team, how to write a launch config, and how to read a run. `uninstall`
+ * removes it; anything else prints the skill.
+ */
+export async function installSkill(action = "install"): Promise<void> {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const src = path.resolve(here, "..", "skills", "md-agent", "SKILL.md");
+  const destDir = path.join(process.env.CLAUDE_SKILLS_DIR?.trim() || path.join(os.homedir(), ".claude", "skills"), "md-agent");
+  const dest = path.join(destDir, "SKILL.md");
+  if (action === "uninstall") {
+    const { rm } = await import("node:fs/promises");
+    await rm(destDir, { recursive: true, force: true });
+    console.log(` ${t.paint("✔", "green", true)} removed ${destDir}`);
+    return;
+  }
+  if (action !== "install") {
+    process.stdout.write(await readFile(src, "utf8"));
+    return;
+  }
+  await mkdir(destDir, { recursive: true });
+  await copyFile(src, dest);
+  console.log(` ${t.paint("✔", "green", true)} installed the md-agent skill → ${dest}`);
+  console.log(`   ${t.paint("Claude Code picks it up on its next session; /md-agent invokes it by name.", "dim")}`);
 }

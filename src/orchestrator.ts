@@ -18,7 +18,19 @@ import { parseMarkdown } from "./parse.js";
 import { chooseSelection, renderSelection } from "./select.js";
 import { Dashboard } from "./dashboard.js";
 import { listSeats, ORCH, renderSeatLog, resolveSeat, showInPager } from "./inspect.js";
-import { offerPushAtEnd, type JournalConfig } from "./journal.js";
+import {
+  chooseProjectRemote,
+  type JournalConfig,
+  NEVER_CHOICE,
+  offerPushAtEnd,
+  projectName,
+  rememberNever,
+  resolveJournalConfig,
+  suggestedRemote,
+  writeGlobalJournalConfig,
+} from "./journal.js";
+import { LAUNCH_FILE } from "./init.js";
+import { planTeam, renderPlan, resolvePlannerModel, type TeamPlan } from "./plan.js";
 import { theme as t } from "./theme.js";
 import { parseTeamBlocks, runHuddle, type TeamIO, type TeamResult, type TeamSpec } from "./team.js";
 import {
@@ -375,9 +387,101 @@ export async function runOrchestrator(opts: {
   contextFile?: string;
   contextContent?: string;
 }): Promise<void> {
-  // -------- 1. Wizard --------
+  const dim = (s: string) => t.paint(s, "dim");
+
+  // -------- 1. The goal, first — it is what the orchestrator reaches for --------
+  const goal = await input({
+    message: "What should the orchestrator be reaching for?",
+    validate: (v) => v.trim().length > 0 || "Required — the outcome, concrete enough to check",
+  });
+
+  // -------- 2. Journals: where this run's record goes (skippable, or never) --------
+  const journal = await journalStep();
+
+  // -------- 3. Context, if any was handed in --------
+  let contextContent: string | undefined = opts.contextContent;
+  if (!contextContent && opts.contextFile) {
+    const raw = await readFile(opts.contextFile, "utf8");
+    const parsed = parseMarkdown(raw);
+    console.log(
+      `Loaded ${opts.contextFile} — ${parsed.sections.length} section(s), ${parsed.codeBlocks.length} code block(s).`
+    );
+    const sel = await chooseSelection(parsed);
+    contextContent = renderSelection(parsed, sel);
+  }
+
+  // -------- 4. The fork: let a high-tier Claude plan the team, or do it by hand --------
+  const how = await select<string>({
+    message: "How should the team be set up?",
+    choices: [
+      {
+        name: `Have Claude plan it — ${resolvePlannerModel()} reads the goal and this repo, recommends the seats, verify, isolation and budget`,
+        value: "plan",
+      },
+      { name: "Set it up by hand", value: "hand" },
+    ],
+  });
+  let prefill: TeamPlan | undefined;
+  if (how === "plan") {
+    console.log(dim(`\n  planning with ${resolvePlannerModel()}…\n`));
+    try {
+      const { plan, costUsd } = await planTeam(goal);
+      console.log(renderPlan(plan, costUsd) + "\n");
+      const next = await select<string>({
+        message: "Go with this?",
+        choices: [
+          { name: "Launch this team now", value: "launch" },
+          { name: `Save it as ${LAUNCH_FILE} to edit, then launch from the home screen`, value: "save" },
+          { name: "Adjust it by hand (the wizard, prefilled from the plan)", value: "hand" },
+          { name: "Cancel", value: "cancel" },
+        ],
+      });
+      if (next === "cancel") return;
+      if (next === "save") {
+        const cfg: LaunchConfig = {
+          name: plan.name,
+          goal,
+          roles: plan.roles,
+          verify: plan.verify,
+          isolation: plan.isolation,
+          escalation: plan.escalation,
+          budget: plan.budget,
+          maxMinutes: plan.maxMinutes,
+          teams: plan.teams,
+          autoComplete: true,
+          journal,
+        };
+        await writeFile(path.resolve(LAUNCH_FILE), JSON.stringify(cfg, null, 2) + "\n", "utf8");
+        console.log(` ${t.paint("✔", "green", true)} wrote ${LAUNCH_FILE} — edit it, then \`md-agent\` offers it as a one-key launch`);
+        return;
+      }
+      if (next === "launch") {
+        await launchRun({
+          goal,
+          roles: plan.roles,
+          maxMinutes: plan.maxMinutes,
+          teams: plan.teams,
+          contextContent,
+          isolation: plan.isolation,
+          verify: plan.verify,
+          escalation: plan.escalation,
+          budget: plan.budget,
+          runName: plan.name,
+          journal,
+          kickoff: "Begin the run.",
+        });
+        return;
+      }
+      prefill = plan;
+    } catch (e) {
+      console.warn(`[planner] ${(e as Error).message}\n[planner] setting up by hand instead`);
+    }
+  }
+
+  // -------- 5. By hand (prefilled when a plan was adjusted) --------
   const n = await number({
     message: "How many roles?",
+    default: prefill?.roles.length,
     min: 1,
     max: 12,
     required: true,
@@ -388,8 +492,10 @@ export async function runOrchestrator(opts: {
     // Plain inline prompts — an editor() here silently dropped users into
     // $EDITOR (vim, empty buffer, no instructions), which is a wall for anyone
     // who doesn't live in vim. Long answers just wrap; predictability wins.
+    const pre = prefill?.roles[i - 1];
     const desc = await input({
       message: `Role ${i} — describe it (optionally "name: description"):`,
+      default: pre ? `${pre.name}: ${pre.description}` : undefined,
       validate: (v) => v.trim().length > 0 || "Required — e.g. \"backend: owns the API and DB migrations\"",
     });
     const m = /^([A-Za-z][\w-]*)\s*:\s*([\s\S]+)$/.exec(desc.trim());
@@ -412,15 +518,19 @@ export async function runOrchestrator(opts: {
     console.log("");
   }
 
-  for (const r of roles) {
+  for (const [i, r] of roles.entries()) {
+    const pre = prefill?.roles[i];
     r.provider = await select<Provider>({
       message: `  ${r.name || r.description.slice(0, 60)} — backed by:`,
       choices: PROVIDER_PROFILES.map((prof) => ({
         name: prof.label,
         value: prof.value,
       })),
-      default: DEFAULT_PROVIDER,
+      default: pre?.provider ?? DEFAULT_PROVIDER,
     });
+    if (pre?.model) r.model = pre.model;
+    if (pre?.permissionMode) r.permissionMode = pre.permissionMode;
+    if (pre?.escalate === false) r.escalate = false;
   }
 
   const isolation = await select<Isolation>({
@@ -435,17 +545,12 @@ export async function runOrchestrator(opts: {
         value: "worktree" as Isolation,
       },
     ],
-    default: DEFAULT_ISOLATION,
-  });
-
-  const goal = await input({
-    message: "What is the overall goal?",
-    validate: (v) => v.trim().length > 0 || "Required",
+    default: prefill?.isolation ?? DEFAULT_ISOLATION,
   });
 
   const maxMinutes = await number({
     message: "Max minutes between synopsis checkpoints?",
-    default: DEFAULT_MAX_MINUTES,
+    default: prefill?.maxMinutes ?? DEFAULT_MAX_MINUTES,
     min: 1,
     max: 24 * 60,
     required: true,
@@ -454,7 +559,7 @@ export async function runOrchestrator(opts: {
   const teams = await confirm({
     message:
       "Allow the orchestrator to form sub-teams (send two roles into a 1:1 huddle)?",
-    default: TEAMS_DEFAULT,
+    default: prefill?.teams ?? TEAMS_DEFAULT,
   });
 
   const budgetMinutes = await number({
@@ -464,30 +569,78 @@ export async function runOrchestrator(opts: {
     required: false,
   });
 
-  let contextContent: string | undefined = opts.contextContent;
-  if (!contextContent && opts.contextFile) {
-    const raw = await readFile(opts.contextFile, "utf8");
-    const parsed = parseMarkdown(raw);
-    console.log(
-      `Loaded ${opts.contextFile} — ${parsed.sections.length} section(s), ${parsed.codeBlocks.length} code block(s).`
-    );
-    const sel = await chooseSelection(parsed);
-    contextContent = renderSelection(parsed, sel);
-  }
-
   // Hand the assembled answers to the shared launcher. The wizard supplies no
   // run name or per-role models, so launchRun runs the one-time bootstrap turn
   // to invent them (the config/journey path can pre-supply them and skip it).
   await launchRun({
-    goal: goal!,
+    goal,
     roles,
     maxMinutes: maxMinutes ?? DEFAULT_MAX_MINUTES,
     teams,
     budgetMinutes: budgetMinutes ?? undefined,
     contextContent,
     isolation,
+    verify: prefill?.verify,
+    escalation: prefill?.escalation,
+    budget: prefill?.budget,
+    runName: prefill?.name,
+    journal,
     kickoff: "Begin the run.",
   });
+}
+
+/**
+ * The wizard's journal step. Returns this run's override: `{ask:false}` to
+ * skip journals for just this run, a remote when one was chosen, undefined
+ * to use the configured one. "Never" is remembered globally and shows in the
+ * panel's footer with the keyword that turns it back on.
+ */
+async function journalStep(): Promise<JournalConfig | undefined> {
+  const project = await projectName();
+  const cfg = await resolveJournalConfig(project);
+  const dim = (s: string) => t.paint(s, "dim");
+  if (cfg.ask === false) {
+    console.log(dim(`  journals: off — type "journals" during the run, or home → ⇅ Journals, to turn them back on`));
+    return undefined;
+  }
+  const SKIP = "skip";
+  if (cfg.remote) {
+    const c = await select<string>({
+      message: `Journals for ${project} go to ${cfg.remote}`,
+      choices: [
+        { name: "Keep it", value: "keep" },
+        { name: "Use a different repo — existing, or create one", value: "change" },
+        { name: "Skip journals for this run only", value: SKIP },
+        NEVER_CHOICE,
+      ],
+    });
+    if (c === "keep") return undefined;
+    if (c === SKIP) return { ask: false };
+    if (c === NEVER_CHOICE.value) {
+      await rememberNever();
+      return { ask: false };
+    }
+    const r = await chooseProjectRemote(project, cfg);
+    if (r === "never" || !r) return { ask: false };
+    return { remote: r };
+  }
+  const sug = await suggestedRemote(project);
+  const c = await select<string>({
+    message: `Keep ${project}'s journals (state, ledger, transcript, traces) in a private repo?`,
+    choices: [
+      { name: `Yes — an existing repo, or create ${sug ? sug.slug : "one"}`, value: "yes" },
+      { name: "Skip journals for this run only", value: SKIP },
+      NEVER_CHOICE,
+    ],
+  });
+  if (c === SKIP) return { ask: false };
+  if (c === NEVER_CHOICE.value) {
+    await rememberNever();
+    return { ask: false };
+  }
+  const r = await chooseProjectRemote(project, cfg);
+  if (r === "never" || !r) return { ask: false };
+  return { remote: r };
 }
 
 /** A fully-resolved run handed to {@link launchRun}. */
@@ -929,7 +1082,9 @@ interface LoopCtx {
 
 /** Shared event loop used by both fresh runs and resumes. */
 async function runLoop(ctx: LoopCtx): Promise<void> {
-  const { runDir, goal, roles, transcript, orch, children, kickoff, teamsEnabled, budgetMinutes, autoComplete, verify, escalation, isolation, budget, journal } = ctx;
+  const { runDir, goal, roles, transcript, orch, children, kickoff, teamsEnabled, budgetMinutes, autoComplete, verify, escalation, isolation, budget } = ctx;
+  // This run's journal settings; the `journals` keyword can turn them back on mid-run.
+  let journalCfg: JournalConfig | undefined = ctx.journal;
 
   // Give the orchestrator's own claude session a heartbeat file so the watchdog
   // can tell a working turn (recent stream output) from one hung mid-turn. Roles
@@ -1539,7 +1694,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     try {
       process.stdin.off("keypress", onKeypress);
       rl.close();
-      await offerPushAtEnd(runDir, journal);
+      await offerPushAtEnd(runDir, journalCfg);
     } catch (e) {
       console.warn(`[journal] ${(e as Error).message}`);
     }
@@ -1833,6 +1988,23 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     console.log(`[stop] ${name} stopped${handoffTo ? ` → handed to ${handoffTo}` : " (abandoned)"}`);
   }
 
+  /** `journals` typed at the console — pick or create the repo and turn the run-end offer back on. */
+  const tryJournals = async (text: string): Promise<boolean> => {
+    if (!/^\/?journals?$/i.test(text)) return false;
+    await withInputSuspended(async () => {
+      const project = await projectName();
+      const cfg = await resolveJournalConfig(project);
+      const r = await chooseProjectRemote(project, { ...cfg, ask: true });
+      if (r && r !== "never") {
+        await writeGlobalJournalConfig({ ask: true });
+        journalCfg = { ...(journalCfg ?? {}), ask: true, remote: r };
+        dash.setJournalsOff(false);
+        console.log(`[journals] on — ${project} → ${r}; you'll be asked at the end of this run`);
+      }
+    });
+    return true;
+  };
+
   /** `stop` typed at the console — same menu as ctrl-x. */
   const tryStop = async (text: string): Promise<boolean> => {
     if (!/^\/?stop$/i.test(text)) return false;
@@ -1875,6 +2047,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     }
     if (await tryShow(text)) return;
     if (await tryStop(text)) return;
+    if (await tryJournals(text)) return;
     console.log(`[orchestrator] forwarding user interjection to orchestrator claude`);
     await appendTranscript(transcript, "USER", text);
     await postEvent(`[USER INTERJECTION] ${text}`);
@@ -1947,7 +2120,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
         await stopAll("user typed exit at checkpoint");
         return;
       }
-      if ((await tryShow(fb)) || (await tryStop(fb))) {
+      if ((await tryShow(fb)) || (await tryStop(fb)) || (await tryJournals(fb))) {
         dash.setStatus("running");
         await continueOrch();
         scheduleCheckpoint();
@@ -2129,6 +2302,12 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     else if (r.stopped) dash.setSeatState(r.name, "stopped", { handoffTo: r.stopped.handoffTo });
   }
   console.log("[keys] ctrl-x stop seats · show <seat> · exit");
+  try {
+    const eff = await resolveJournalConfig(await projectName(), journalCfg);
+    dash.setJournalsOff(eff.ask === false);
+  } catch {
+    // footer flag only
+  }
 
   watchdog = setInterval(() => {
     if (stopping) return;

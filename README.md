@@ -115,6 +115,27 @@ each with its goal, spend, recency and status (`running`, `unfinished`,
 - **Mark runs complete** / **Restore a shelved run** — shelve finished work
   (hidden from the menus, untouched on disk) and bring it back later.
 
+### The wizard: goal first, then a fork
+
+*Start something new* asks, in this order:
+
+1. **What should the orchestrator be reaching for?** — the goal. It is the
+   first question because it is what everything else is sized to.
+2. **Journals** — keep this project's run records in a private repo? Use the
+   configured one, pick or create another, skip for this run only, or *No, and
+   don't ask again — ever*. Once opted out the panel's footer shows
+   `journals off (type "journals")`; that keyword, typed during any run, turns
+   them back on.
+3. **How should the team be set up?** — *Have Claude plan it* or *Set it up by
+   hand*. The planner (`MD_AGENT_PLANNER_MODEL`, default `claude-fable-5-1`)
+   is given the goal, a read-only look at the repo, and a brief on how md-agent
+   works, and returns a recommended team: how many seats, each one's mandate,
+   provider and tier, the verify command it found, isolation, escalation, a
+   budget, and the questions it could not settle. Then: **launch it**, **save
+   it** as `md-agent.launch.json` to edit and launch from the home screen, or
+   **adjust it by hand** (the wizard, prefilled). A plan costs roughly a
+   dollar's worth of tokens and takes under a minute.
+
 ### `md-agent init`
 
 Writes a starter `md-agent.launch.json` into the current repo — a cheap seat
@@ -412,11 +433,24 @@ orchestrator, which decides how to propagate it). At a checkpoint you can:
 | `stop`       | stop one or more seats — hand off or abandon (also **ctrl-x** any time) |
 | `exit`       | stop the run cleanly                                  |
 
+## As a Claude Code skill
+
+```bash
+md-agent skill install      # → ~/.claude/skills/md-agent/SKILL.md
+```
+
+Teaches Claude Code when a task is a team job (a cheap complete check, parallel
+parts, branches to review, work that outlives the session), how to write a
+launch config, the console commands, and how to read a run. `/md-agent`
+invokes it by name; `md-agent skill uninstall` removes it. The skill ships in
+the npm package under `skills/`.
+
 ## Configuration (environment variables)
 
 | Variable                  | Default      | Purpose |
 |---------------------------|--------------|---------|
 | `MD_AGENT_ORCH_MODEL`     | `sonnet`     | The orchestrator's model — a tier (`opus`/`sonnet`/`haiku`) or a concrete model id. It re-reads a ledger and routes, so it does not inherit the CLI's default model; set `opus` when there is no `verify` and judgement is the whole job. |
+| `MD_AGENT_PLANNER_MODEL`  | `claude-fable-5-1` | The model that plans a team in the wizard's *Have Claude plan it* fork — a tier or a concrete id. |
 | `MD_AGENT_ORCH_TOOLS`     | unset        | `all` gives the orchestrator its edit tools back (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Bash`). Off by default: a coordinator that can edit will do the seats' work itself. |
 | `MD_AGENT_HANDSHAKE_MODEL`| *(orch model, then CLI default)* | Model for the short between-phase handshake turn in a `--journey` run. Falls back to `MD_AGENT_ORCH_MODEL`, then the CLI default. |
 | `MD_AGENT_CHECKPOINT_GRACE`| `120`        | Seconds a checkpoint waits for your input before auto-continuing and arming the next one. `0` = wait indefinitely (block until you respond — the old behavior). |
@@ -483,6 +517,7 @@ runs/<timestamp>-<name>/
 | `src/init.ts`          | `md-agent init` — starter launch config |
 | `src/journal.ts`       | journals: private repo per project, push/pull, visibility + secret checks, the run-end offer |
 | `src/inspect.ts`       | seat traces: render `log/<seat>.jsonl`, pager |
+| `src/plan.ts`          | the planner: goal + repo + design brief → recommended team |
 | `src/theme.ts`         | ArmoryWorks palette, the mark, ANSI helpers |
 | `src/orchestrator.ts`  | setup wizard, run loop, ledger turns, dispatch, checkpoints |
 | `src/team.ts`          | sub-team engine (1:1 huddle) — opt-in via `MD_AGENT_TEAMS` |
