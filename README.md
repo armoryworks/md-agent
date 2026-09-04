@@ -275,6 +275,12 @@ npm run dev -- --resume runs/<dir> --minutes 15                 # skip the promp
 npm run dev -- --resume runs/<dir> --quiet                      # no prompts at all: stored interval + budget (what the journey driver uses)
 ```
 
+Version:
+
+```bash
+md-agent --version        # also -v, or `md-agent version`
+```
+
 Look inside a seat of any run:
 
 ```bash

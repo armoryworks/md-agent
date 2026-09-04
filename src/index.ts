@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import path from "node:path";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { resumeOrchestrator, runFromConfig, runOrchestrator } from "./orchestrator.js";
 import { runHomeSafe } from "./home.js";
@@ -34,6 +36,7 @@ const { values, positionals } = parseArgs({
     seat: { type: "string" },
     // With `skill install`: into ./.claude/skills instead of ~/.claude/skills.
     project: { type: "boolean" },
+    version: { type: "boolean", short: "v" },
   },
   allowPositionals: true,
 });
@@ -47,7 +50,10 @@ if (values.from && !values.journey) {
   console.warn(`[md-agent] --from "${values.from}" has no effect without --journey; ignoring.`);
 }
 
-if (positionals[0] === "init") {
+if (values.version || positionals[0] === "version") {
+  const pkg = JSON.parse(readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf8"));
+  console.log(`${pkg.name} ${pkg.version}`);
+} else if (positionals[0] === "init") {
   await runInit();
 } else if (positionals[0] === "skill") {
   await installSkill(positionals[1], { scope: values.project ? "project" : "user" });
