@@ -143,7 +143,7 @@ export interface RoleSpec {
    * seat is not respawned on resume and the orchestrator is told not to
    * dispatch to it; its work was handed off or left for the orchestrator.
    */
-  stopped?: { at: string; handoffTo?: string };
+  stopped?: { at: string; handoffTo?: string; reason?: string; resetsAt?: number };
   /**
    * Whether the escalation ladder may promote this seat. Default true.
    *

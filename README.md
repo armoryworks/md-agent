@@ -179,6 +179,23 @@ isolation, every seat whose workspace changed must pass. The orchestrator
 itself runs without edit tools (`Write`, `Edit`, `Bash`…) so it coordinates
 rather than doing the work — `MD_AGENT_ORCH_TOOLS=all` restores them.
 
+### When a provider runs dry
+
+A seat whose provider is out of quota — agy's *"Individual quota reached …
+Resets in 164h48m"*, or a claude `rate_limit_event` that isn't `allowed` —
+**stops itself**: it records the stop and the reset time in `state.json`, tells
+the orchestrator through its outbox (`[SEAT STOPPED] … OUT OF QUOTA … resets in
+~165h`), and exits. It is not respawned; the orchestrator reassigns its work to
+a seat that still has quota or drops it. Any other turn error is reported to
+the orchestrator the same way (`[ROLE ERROR] …`) instead of leaving it waiting
+on a seat that will never answer.
+
+A **loop guard** watches for one seat being dispatched to over and over with
+nothing verified in between — the shape that spends a week of quota on cache
+reads. At four consecutive dispatches the orchestrator is told, in its next
+event, to change approach; at six the run HALTs with the reason. A dispatch to
+any other seat, or a verify PASS, resets the count.
+
 ### Budgets
 
 `budget` in a launch config (or journey phase) sets spend ceilings, each with a

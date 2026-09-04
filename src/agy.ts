@@ -1,7 +1,15 @@
 import spawn from "cross-spawn";
 import fs from "node:fs";
 import type { Usage, WindowSnapshot } from "./persist.js";
-import { promptExcerpt, TurnLog, type AgentSession } from "./claude.js";
+import { looksExhausted, promptExcerpt, ProviderExhaustedError, TurnLog, type AgentSession } from "./claude.js";
+
+/** "Resets in 164h48m" → unix seconds, when agy says when. */
+function parseResetsIn(text: string): number | undefined {
+  const m = /resets? in\s+(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?/i.exec(text);
+  if (!m || (!m[1] && !m[2] && !m[3])) return undefined;
+  const secs = (Number(m[1] ?? 0) * 3600) + (Number(m[2] ?? 0) * 60) + Number(m[3] ?? 0);
+  return Math.floor(Date.now() / 1000) + secs;
+}
 
 /**
  * A persistent Antigravity (`agy`) conversation.
@@ -207,6 +215,16 @@ export class AgySession implements AgentSession {
           const t = s.trim();
           return t.length > 1500 ? "…" + t.slice(-1500) : t || "(empty)";
         };
+
+        // Out of quota is not a failed turn to retry — it is a seat that cannot
+        // work until the window resets. Surface it as its own error so the seat
+        // stops itself instead of looping on empty replies.
+        const everything = `${String(obj?.response ?? "")}\n${err}\n${out.slice(-2000)}`;
+        if (looksExhausted(everything)) {
+          const line = everything.split("\n").find((l) => looksExhausted(l))?.trim() ?? "quota reached";
+          reject(new ProviderExhaustedError("agy", `agy: ${line.slice(0, 300)}`, parseResetsIn(everything)));
+          return;
+        }
 
         // status is the authoritative outcome: a non-SUCCESS envelope can still
         // arrive on exit 0, so check it before trusting `response`.

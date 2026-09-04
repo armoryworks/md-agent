@@ -1780,6 +1780,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
         dash.setStatus("running");
         if (res.ok) {
           seatVerifyFails.delete(r.name);
+          resetPingPong();
           console.log(`[verify] ${r.name}'s reply: PASS in ${where}`);
           event = `[verify PASS in ${where}: \`${verify.cmd}\`]\n${event}`;
         } else {
@@ -2248,6 +2249,23 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
 
   async function recoverRole(name: string, cause: string): Promise<void> {
     if (stopping || stoppedRoles.has(name) || recovering.has(name) || teamOwner.has(name)) return;
+    // A seat that stopped itself (out of quota) wrote that into state.json
+    // before exiting — respawning it would just hit the same wall.
+    try {
+      const fresh = await readState(runDir);
+      const mine = fresh.roles.find((r) => r.name === name);
+      if (mine?.stopped) {
+        stoppedRoles.add(name);
+        pendingSince.delete(name);
+        const spec = roles.find((r) => r.name === name);
+        if (spec) spec.stopped = mine.stopped;
+        dash.setSeatState(name, "stopped");
+        console.warn(`[watchdog] role "${name}" stopped itself (${mine.stopped.reason ?? "stopped"}) — not respawning`);
+        return;
+      }
+    } catch {
+      // unreadable state — fall through to the normal recovery
+    }
     recovering.add(name);
     try {
       const since = pendingSince.get(name);
@@ -2571,6 +2589,38 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     await safeWrite(inboxFile, payload);
     pendingSince.set(b.role, Date.now()); // mark outstanding for the liveness watchdog
     orchStallNudges = 0; // a real dispatch is progress — reset the stall escalation
+    await notePingPong(b.role);
+  }
+
+  // ---------- ping-pong guard ----------
+  // One seat dispatched to over and over, with nothing verified in between, is
+  // a loop — the "confirm the tests exist" kind that burns a week of quota on
+  // cache reads. Deterministic: warn the orchestrator at PINGPONG_WARN
+  // consecutive dispatches to the same seat, HALT at PINGPONG_HALT. Any
+  // dispatch to a different seat, or a verify PASS, resets it.
+  const PINGPONG_WARN = 4;
+  const PINGPONG_HALT = 6;
+  let pingPongSeat: string | null = null;
+  let pingPongCount = 0;
+  async function notePingPong(role: string): Promise<void> {
+    if (role === pingPongSeat) pingPongCount++;
+    else {
+      pingPongSeat = role;
+      pingPongCount = 1;
+    }
+    if (pingPongCount === PINGPONG_WARN) {
+      console.warn(`[loop-guard] ${role} has been dispatched to ${pingPongCount} times in a row with nothing verified — warning the orchestrator`);
+      await appendTranscript(transcript, "LOOP GUARD", `${role} dispatched ${pingPongCount}× consecutively with no verified progress`);
+      await postEvent(
+        `[SYSTEM/loop-guard] You have dispatched to "${role}" ${pingPongCount} times in a row and nothing has been verified in between. This is a loop, and it is spending quota. Do NOT send "${role}" the same ask again: route the problem to a different seat, re-scope or split the work, or — if the goal is actually met — finalize. ${PINGPONG_HALT - pingPongCount} more consecutive dispatches to "${role}" will HALT the run.`
+      );
+    } else if (pingPongCount >= PINGPONG_HALT) {
+      await haltRun(`loop: "${role}" dispatched to ${pingPongCount} times consecutively with no verified progress (see LOOP GUARD in the transcript)`);
+    }
+  }
+  function resetPingPong(): void {
+    pingPongSeat = null;
+    pingPongCount = 0;
   }
 }
 

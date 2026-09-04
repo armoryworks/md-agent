@@ -1,6 +1,6 @@
 import path from "node:path";
 import { readFile } from "node:fs/promises";
-import { ClaudeSession, type AgentSession } from "./claude.js";
+import { ClaudeSession, ProviderExhaustedError, type AgentSession } from "./claude.js";
 import { AgySession } from "./agy.js";
 import { provisionWorkspace } from "./workspace.js";
 import {
@@ -19,6 +19,7 @@ import {
   readState,
   recordUsage,
   resolveModelFor,
+  updateState,
   usageTokens,
   writeSessionId,
   writeWindow,
@@ -260,6 +261,36 @@ export async function runRole(
     return true;
   };
 
+  /**
+   * Out of quota: mark this seat stopped in state.json (so the orchestrator
+   * neither dispatches to it nor respawns it), tell the orchestrator through
+   * the outbox, and exit. The same shape as a user stop, with the reset time.
+   */
+  const stopSelf = async (err: ProviderExhaustedError): Promise<void> => {
+    const resetNote = err.resetsAt
+      ? ` It resets in ~${Math.max(1, Math.round((err.resetsAt * 1000 - Date.now()) / 3600000))}h (${new Date(err.resetsAt * 1000).toISOString()}).`
+      : "";
+    console.error(`[role:${roleName}] ${provider} is out of quota — stopping this seat.${resetNote}`);
+    try {
+      const cur = await readState(runDir);
+      const mine = cur.roles.find((r) => r.name === roleName);
+      if (mine) {
+        mine.stopped = { at: new Date().toISOString(), reason: `${provider} exhausted: ${err.message}`, resetsAt: err.resetsAt };
+        await updateState(runDir, { roles: cur.roles });
+      }
+    } catch {
+      // state is best-effort; the outbox note still gets the orchestrator to re-plan
+    }
+    await safeWrite(
+      outbox,
+      `[SEAT STOPPED] "${roleName}" (${provider}/${model}) is OUT OF QUOTA and has stopped itself: ${err.message}.${resetNote} ` +
+        `Its work is ABANDONED. Never dispatch to "${roleName}" again in this run; reassign its outstanding work to another seat or drop it. Update Role status.`
+    );
+    stopped = true;
+    await closeWatcher();
+    process.exit(0);
+  };
+
   const handle = async (initialContent: string): Promise<void> => {
     if (stopped) return;
     if (busy) {
@@ -280,6 +311,21 @@ export async function runRole(
       }
     } catch (err) {
       console.error(`[role:${roleName}] error:`, err);
+      // A silent seat strands the orchestrator until the watchdog gives up on
+      // it; a seat that says what went wrong lets it re-plan now.
+      if (err instanceof ProviderExhaustedError) {
+        await stopSelf(err);
+        return;
+      }
+      try {
+        await safeWrite(
+          outbox,
+          `[ROLE ERROR] ${roleName} (${provider}/${model}) could not complete this turn: ${(err as Error).message.split("\n")[0].slice(0, 300)}. ` +
+            `Re-dispatch if it should retry, or route the work elsewhere.`
+        );
+      } catch {
+        // nothing more to do
+      }
     } finally {
       busy = false;
     }

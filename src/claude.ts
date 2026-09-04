@@ -39,6 +39,27 @@ export class TurnLog {
   }
 }
 
+/**
+ * The provider will not serve this seat again for a while: a plan window or
+ * quota is exhausted. The seat stops itself on this rather than looping.
+ */
+export class ProviderExhaustedError extends Error {
+  constructor(
+    readonly provider: "claude" | "agy",
+    message: string,
+    /** Unix seconds when the limit resets, when the provider says. */
+    readonly resetsAt?: number
+  ) {
+    super(message);
+    this.name = "ProviderExhaustedError";
+  }
+}
+
+/** Provider text that means "out of quota", as the CLIs phrase it. */
+export function looksExhausted(text: string): boolean {
+  return /quota (reached|exceeded|exhausted)|usage limit reached|rate limit(ed| exceeded)|out of (credits|quota)|upgrade your subscription|resets in \d/i.test(text);
+}
+
 const PROMPT_LOG_CHARS = 4000;
 
 /** What a turn marker records of the prompt: enough to read, not the whole brief. */
@@ -219,6 +240,7 @@ export class ClaudeSession implements AgentSession {
       let stderrBuf = "";
       let assistantText = "";
       let rawStdout = ""; // full stdout, kept so a non-zero exit can surface the real error
+      let limited: { message: string; resetsAt?: number } | null = null;
 
       child.stdout!.on("data", (chunk: Buffer) => {
         this.beat(); // stream output = the turn is actively working
@@ -246,6 +268,15 @@ export class ClaudeSession implements AgentSession {
             }
             // The CLI reports the account's plan windows on every turn — the
             // same numbers the usage page shows. Keep the latest.
+            if (msg.type === "rate_limit_event" && msg.rate_limit_info) {
+              const info = msg.rate_limit_info;
+              if (typeof info.status === "string" && info.status !== "allowed" && !info.isUsingOverage) {
+                limited = {
+                  message: `claude ${info.rateLimitType ?? "plan"} limit: ${info.status}`,
+                  resetsAt: Number(info.resetsAt) || undefined,
+                };
+              }
+            }
             if (msg.type === "rate_limit_event" && msg.rate_limit_info?.unifiedWindows) {
               const w = msg.rate_limit_info.unifiedWindows;
               this.lastWindowsData = {
@@ -285,8 +316,14 @@ export class ClaudeSession implements AgentSession {
           usage: this.lastUsageData,
           ...(code === 0 ? {} : { stderr: stderrBuf.slice(-1500) }),
         });
+        if (code === 0 && limited && !assistantText.trim()) {
+          reject(new ProviderExhaustedError("claude", limited.message, limited.resetsAt));
+          return;
+        }
         if (code === 0) {
           resolve(assistantText.trim());
+        } else if (limited || looksExhausted(stderrBuf + rawStdout)) {
+          reject(new ProviderExhaustedError("claude", limited?.message ?? `claude reports its limit is reached: ${(stderrBuf || rawStdout).trim().slice(-300)}`, limited?.resetsAt));
         } else {
           // The claude CLI in stream-json mode writes its error to STDOUT, and
           // the line-parser above silently drops non-JSON lines — so stderr is
