@@ -206,9 +206,16 @@ total, and `5h 21% · 7d 7%`.
 
 A run's **journal** is its durable record: `state.json` (goal, seats, context,
 budget, journey reference, end stamp), `ledger.md`, `transcript.md`,
-`context.md`, `log/` (the seat traces), spend files, and a generated
-`JOURNAL.md` cover page. Not the seats' worktrees — those are branches in the
-project repo already — and not the transient inbox/outbox.
+`context.md`, `log/` (the seat traces), spend files, the mailboxes, and a
+generated `JOURNAL.md` cover page. Not the seats' worktrees — those are
+branches in the project repo already. The repo root carries a **master index**,
+regenerated on every push: `index.json` for md-agent and `JOURNALS.md` for
+people — every run across every project with status, spend and goal, linked
+to its cover page — so one pull tells the home screen what the repo holds.
+
+`./runs/` stays the working store and the journal is a filtered copy of it,
+rather than the run directory being a checkout: the seats' git worktrees live
+under the run directory, and a live run writes every turn.
 
 Journals never go into the project repo (`runs/` is gitignored there on
 purpose: transcripts and traces carry credentials and internal findings).
@@ -454,11 +461,10 @@ the start of the next session, in the CLI, desktop app and IDE extensions;
 a task looks team-sized. `md-agent skill uninstall` removes it, `skill show`
 prints it. The skill ships in the npm package under `skills/`.
 
-You're told about it twice: a notice after `npm install` (where the package
-manager lets install-script output through — npm hides and now gates it by
-default, `--foreground-scripts` shows it), and an offer the **first time the
-home screen opens** on a machine that has Claude Code but not the skill —
-install user-wide, for this project, not now, or don't ask again.
+You're offered it the **first time the home screen opens** on a machine that
+has Claude Code but not the skill — install user-wide, for this project, not
+now, or don't ask again. (There is deliberately no install-time script: current
+npm hides install-script output and flags packages that have one.)
 
 ## Configuration (environment variables)
 

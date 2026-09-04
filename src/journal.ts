@@ -1,7 +1,7 @@
 import path from "node:path";
 import os from "node:os";
 import { existsSync } from "node:fs";
-import { cp, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { cp, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { confirm, input, select } from "@inquirer/prompts";
@@ -36,7 +36,9 @@ const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 const CLONES_DIR = path.join(CONFIG_DIR, "journals");
 
 /** Files that are the journal. Everything else in a run dir is transient or lives elsewhere. */
-const JOURNAL_TOP = new Set(["state.json", "ledger.md", "transcript.md", "context.md", "HALT.txt", "JOURNAL.md", "log", "spill", "teams", "sessions"]);
+const JOURNAL_TOP = new Set(["state.json", "ledger.md", "transcript.md", "context.md", "HALT.txt", "JOURNAL.md", "log", "spill", "teams", "sessions", "inbox", "outbox"]);
+const INDEX_JSON = "index.json";
+const INDEX_MD = "JOURNALS.md";
 const SESSION_KEEP = /\.(cost|window)\.json$/;
 
 export interface GlobalConfig {
@@ -298,6 +300,86 @@ export interface PushResult {
   detail: string;
 }
 
+/** One row of the repo's master index. */
+export interface JournalIndexEntry {
+  project: string;
+  run: string;
+  status: RunStatus;
+  goal: string;
+  costUsd: number;
+  turns: number;
+  updatedAt: string;
+  journey?: { name: string; phaseId: string; phaseIndex: number; total: number };
+  endReason?: string;
+}
+
+/**
+ * Rebuild the master index at the clone's root from every journal in it:
+ * index.json for md-agent, JOURNALS.md for people. Read after a single pull,
+ * it tells the home screen what the repo holds without opening each run.
+ */
+export async function writeIndex(clone: string): Promise<JournalIndexEntry[]> {
+  const rows: JournalIndexEntry[] = [];
+  for (const project of await readdir(clone, { withFileTypes: true })) {
+    if (!project.isDirectory() || project.name.startsWith(".")) continue;
+    for (const runName of await readdir(path.join(clone, project.name))) {
+      const dir = path.join(clone, project.name, runName);
+      try {
+        const state = await readState(dir);
+        const cost = await readRunCost(dir);
+        let updatedAt = state.endedAt ?? "";
+        try {
+          updatedAt = (await stat(path.join(dir, "transcript.md"))).mtime.toISOString();
+        } catch {
+          // no transcript
+        }
+        rows.push({
+          project: project.name,
+          run: runName,
+          status: await runStatus(dir, state),
+          goal: state.goal ?? "",
+          costUsd: cost.costUsd,
+          turns: cost.turns,
+          updatedAt,
+          journey: state.journey ? { name: state.journey.name, phaseId: state.journey.phaseId, phaseIndex: state.journey.phaseIndex, total: state.journey.total } : undefined,
+          endReason: state.endReason,
+        });
+      } catch {
+        // not a journal
+      }
+    }
+  }
+  rows.sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
+  await writeFile(path.join(clone, INDEX_JSON), JSON.stringify({ generatedAt: new Date().toISOString(), journals: rows }, null, 2) + "\n", "utf8");
+  const byProject = new Map<string, JournalIndexEntry[]>();
+  for (const r of rows) byProject.set(r.project, [...(byProject.get(r.project) ?? []), r]);
+  const md: string[] = ["# md-agent journals", "", `_${rows.length} run(s) across ${byProject.size} project(s). Regenerated on every push; \`index.json\` is the machine-readable twin._`, ""];
+  for (const [project, list] of byProject) {
+    md.push(`## ${project}`, "", "| run | status | spend | goal |", "|---|---|---|---|");
+    for (const r of list) {
+      const goal = r.goal.replace(/\s+/g, " ").replace(/\|/g, "\\|").slice(0, 90);
+      md.push(`| [${r.run}](./${encodeURIComponent(project)}/${encodeURIComponent(r.run)}/JOURNAL.md) | ${r.status}${r.journey ? ` · ${r.journey.name} ${r.journey.phaseIndex + 1}/${r.journey.total}` : ""} | $${r.costUsd.toFixed(2)} · ${r.turns}t | ${goal} |`);
+    }
+    md.push("");
+  }
+  md.push("_Journals hold transcripts and traces. Keep this repository private._", "");
+  await writeFile(path.join(clone, INDEX_MD), md.join("\n"), "utf8");
+  return rows;
+}
+
+/** The repo's master index after a pull — what it holds, without opening each run. */
+export async function readIndex(cfg: JournalConfig): Promise<JournalIndexEntry[]> {
+  if (!cfg.remote) return [];
+  const clone = await ensureClone(cfg.remote);
+  try {
+    const parsed = JSON.parse(await readFile(path.join(clone, INDEX_JSON), "utf8"));
+    if (Array.isArray(parsed.journals)) return parsed.journals as JournalIndexEntry[];
+  } catch {
+    // no index yet (older repo) — build one locally without pushing
+  }
+  return writeIndex(clone);
+}
+
 /**
  * Push one run's journal. Refuses a public remote, warns on an unverifiable
  * one, and stops on credential shapes unless `force`. Interactive checks go
@@ -328,6 +410,7 @@ export async function pushJournal(
   }
   const clone = await ensureClone(cfg.remote);
   await fileRun(runDir, clone, project);
+  await writeIndex(clone);
   const state = await readState(runDir);
   const status = await runStatus(runDir, state);
   await git(clone, ["add", "-A"]);
@@ -346,24 +429,12 @@ export async function pushJournal(
   return { ok: true, detail: `${project}/${path.basename(runDir)} → ${cfg.remote}` };
 }
 
-/** Journals in the remote, by project. */
+/** Journals in the remote, by project — from the master index. */
 export async function listRemoteJournals(cfg: JournalConfig): Promise<{ project: string; run: string; dir: string; goal: string; status: string }[]> {
   if (!cfg.remote) return [];
   const clone = await ensureClone(cfg.remote);
-  const out: { project: string; run: string; dir: string; goal: string; status: string }[] = [];
-  for (const project of await readdir(clone, { withFileTypes: true })) {
-    if (!project.isDirectory() || project.name.startsWith(".")) continue;
-    for (const runName of await readdir(path.join(clone, project.name))) {
-      const dir = path.join(clone, project.name, runName);
-      try {
-        const state = await readState(dir);
-        out.push({ project: project.name, run: runName, dir, goal: state.goal ?? "", status: await runStatus(dir, state) });
-      } catch {
-        // not a journal
-      }
-    }
-  }
-  return out;
+  const rows = await readIndex(cfg);
+  return rows.map((r) => ({ project: r.project, run: r.run, dir: path.join(clone, r.project, r.run), goal: r.goal, status: r.status }));
 }
 
 /** Copy a journal from the clone into ./runs so it appears on the home screen. */
@@ -371,8 +442,13 @@ export async function pullJournal(journalDir: string, runsDir = path.resolve("ru
   const dest = path.join(runsDir, path.basename(journalDir));
   if (existsSync(dest)) throw new Error(`${dest} already exists`);
   await cp(journalDir, dest, { recursive: true });
-  await mkdir(path.join(dest, "inbox"), { recursive: true });
-  await mkdir(path.join(dest, "outbox"), { recursive: true });
+  // Mailboxes travel for completeness but must start empty: a stale dispatch
+  // or reply would be replayed the moment the seats spawn.
+  for (const box of ["inbox", "outbox"]) {
+    const d = path.join(dest, box);
+    await mkdir(d, { recursive: true });
+    for (const f of await readdir(d)) await writeFile(path.join(d, f), "", "utf8");
+  }
   await updateState(dest, { journalPulledAt: new Date().toISOString() });
   return dest;
 }
