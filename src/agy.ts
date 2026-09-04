@@ -1,6 +1,6 @@
 import spawn from "cross-spawn";
 import fs from "node:fs";
-import type { Usage } from "./persist.js";
+import type { Usage, WindowSnapshot } from "./persist.js";
 import { promptExcerpt, TurnLog, type AgentSession } from "./claude.js";
 
 /**
@@ -63,6 +63,11 @@ export class AgySession implements AgentSession {
 
   get lastUsage(): Usage | null {
     return this.lastUsageData;
+  }
+
+  /** Antigravity reports token counts only — no window utilization. */
+  get lastWindows(): WindowSnapshot | null {
+    return null;
   }
 
   setHeartbeatPath(p: string): void {
@@ -130,7 +135,8 @@ export class AgySession implements AgentSession {
       provider: "agy",
       model: this.model,
       resume: this.conversationId,
-      ...promptExcerpt(fullPrompt),
+      ...promptExcerpt(prompt),
+      systemChars: fullPrompt.length - prompt.length,
     });
     const startedAt = Date.now();
 

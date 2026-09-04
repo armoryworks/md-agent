@@ -1,4 +1,5 @@
 import util from "node:util";
+import type { WindowSnapshot } from "./persist.js";
 import { Theme, theme as defaultTheme } from "./theme.js";
 
 /**
@@ -17,7 +18,13 @@ import { Theme, theme as defaultTheme } from "./theme.js";
  */
 
 /** What a seat is doing right now, as far as the orchestrator can tell. */
-export type SeatState = "idle" | "working" | "replied" | "dead" | "huddle";
+export type SeatState = "idle" | "working" | "replied" | "dead" | "huddle" | "stopped";
+
+/** One turn's, or a running total's, spend — shown side by side everywhere. */
+export interface Spend {
+  usd: number;
+  tokens: number;
+}
 
 interface DashRole {
   name: string;
@@ -30,9 +37,11 @@ interface Seat extends DashRole {
   /** When the current state began (ms). */
   since: number;
   turns: number;
-  lastCost: number;
+  turn: Spend | null;
+  net: Spend | null;
   lastCacheRead: number;
-  totalCost: number;
+  /** Who took over, when the seat was stopped with a handoff. */
+  handoffTo?: string;
 }
 
 const ESC = "\x1b";
@@ -87,8 +96,12 @@ export class Dashboard {
   private orchText = "waiting…";
   private orchSince = Date.now();
   private orchTurns = 0;
+  private orchTurn_: Spend | null = null;
+  private orchNet: Spend | null = null;
   private headerRows = 0;
-  private costText = "";
+  private runNet: Spend | null = null;
+  private windows: WindowSnapshot | null = null;
+  private budgetNote = "";
   private ticker: ReturnType<typeof setInterval> | undefined;
 
   private readonly origLog = console.log;
@@ -105,9 +118,9 @@ export class Dashboard {
       state: "idle",
       since: Date.now(),
       turns: 0,
-      lastCost: 0,
+      turn: null,
+      net: null,
       lastCacheRead: 0,
-      totalCost: 0,
     }));
     this.enabled = !!process.stdout.isTTY && process.env.MD_AGENT_NO_DASHBOARD !== "1";
   }
@@ -203,12 +216,38 @@ export class Dashboard {
     this.redraw();
   }
 
-  /** Override a seat's state outside the send/reply flow (watchdog, huddles). */
-  setSeatState(name: string, state: SeatState): void {
+  /** Override a seat's state outside the send/reply flow (watchdog, huddles, stops). */
+  setSeatState(name: string, state: SeatState, detail?: { handoffTo?: string }): void {
     const s = this.seat(name);
     if (!s) return;
     s.state = state;
     s.since = Date.now();
+    if (detail?.handoffTo) s.handoffTo = detail.handoffTo;
+    this.redraw();
+  }
+
+  /** The orchestrator's own last-turn and net spend. */
+  setOrchSpend(turn: Spend, net: Spend): void {
+    this.orchTurn_ = turn;
+    this.orchNet = net;
+    this.redraw();
+  }
+
+  /** Run-wide net spend, every seat and the orchestrator. */
+  setRunSpend(net: Spend): void {
+    this.runNet = net;
+    this.redraw();
+  }
+
+  /** Latest plan-window utilization any claude seat reported. */
+  setWindows(w: WindowSnapshot | null): void {
+    this.windows = w;
+    this.redraw();
+  }
+
+  /** A short budget state for the header, e.g. "soft $ line passed — winding down". */
+  setBudgetNote(note: string): void {
+    this.budgetNote = note;
     this.redraw();
   }
 
@@ -217,25 +256,17 @@ export class Dashboard {
     this.redraw();
   }
 
-  /** Update the run-wide cumulative spend shown in the header. */
-  setCost(usd: number): void {
-    const next = `$${usd.toFixed(2)}`;
-    if (next === this.costText) return;
-    this.costText = next;
-    this.redraw();
-  }
-
   /**
-   * Show a seat's most recent turn cost and cache-read volume, so an expensive
-   * seat (e.g. runaway cache-read from a stale session) is visible live instead
-   * of only in sessions/*.cost.json after the run.
+   * A seat's most recent turn next to its running total, so an expensive seat
+   * (e.g. runaway cache-read from a stale session) is visible live instead of
+   * only in sessions/*.cost.json after the run.
    */
-  setRoleTurn(name: string, costUsd: number, cacheReadTokens: number, totalUsd?: number): void {
+  setRoleSpend(name: string, turn: Spend, net: Spend, cacheReadTokens: number): void {
     const s = this.seat(name);
     if (!s) return;
-    s.lastCost = costUsd;
+    s.turn = turn;
+    s.net = net;
     s.lastCacheRead = cacheReadTokens;
-    if (totalUsd != null) s.totalCost = totalUsd;
     this.redraw();
   }
 
@@ -306,9 +337,21 @@ export class Dashboard {
         return this.t.paint("✖", "red", true);
       case "huddle":
         return this.t.paint("◆", "tealHi", true);
+      case "stopped":
+        return this.t.paint("⏹", "dim");
       default:
         return this.t.paint("○", "dim");
     }
+  }
+
+  private spendText(turn: Spend | null, net: Spend | null): string {
+    if (!turn && !net) return this.t.paint("—", "dim");
+    const one = (s: Spend) => `$${s.usd.toFixed(2)}·${formatTokens(s.tokens)}`;
+    return (
+      (turn ? `${this.t.paint("▸", "muted")} ${one(turn)}` : "") +
+      (turn && net ? "  " : "") +
+      (net ? this.t.paint(`Σ ${one(net)}`, "dim") : "")
+    );
   }
 
   private stateText(s: Seat): string {
@@ -322,27 +365,23 @@ export class Dashboard {
         return this.t.paint(`recovering ${ago}`, "red");
       case "huddle":
         return this.t.paint(`in huddle ${ago}`, "tealHi");
+      case "stopped":
+        return this.t.paint(s.handoffTo ? `stopped → ${s.handoffTo}` : "stopped · abandoned", "red");
       default:
         return this.t.paint("idle", "dim");
     }
   }
 
-  /** The 4 lines describing one seat, plain-width aligned to `colW`. */
+  /** The lines describing one seat, plain-width aligned to `colW`. */
   private seatLines(s: Seat, colW: number): string[] {
     const pad = (line: string) => line + " ".repeat(Math.max(0, colW - Theme.width(line)));
     const provider = s.provider ?? "claude";
     const model = s.model.replace(/^claude-|^gemini-/, "");
-    const cost =
-      s.turns > 0
-        ? `$${s.lastCost.toFixed(2)}` +
-          (s.lastCacheRead ? this.t.paint(` · ⌁${formatTokens(s.lastCacheRead)}`, "dim") : "") +
-          (s.totalCost ? this.t.paint(`  Σ$${s.totalCost.toFixed(2)}`, "dim") : "")
-        : this.t.paint("—", "dim");
     return [
       pad(`${this.glyph(s.state)} ${this.t.bold(s.name)}`),
       pad(`  ${this.t.paint(provider, provider === "agy" ? "amberDark" : "tealDark")} ${this.t.paint("·", "dim")} ${this.t.paint(model, "muted")}`),
       pad(`  ${this.stateText(s)}${s.turns ? this.t.paint(` · ${s.turns}t`, "dim") : ""}`),
-      pad(`  ${cost}`),
+      pad(`  ${this.spendText(s.turn, s.net)}`),
     ];
   }
 
@@ -378,14 +417,30 @@ export class Dashboard {
     const shieldW = 4;
     const gutter = shieldW + 3;
     const elapsed = formatAgo(Date.now() - this.startedAt);
-    const facts = [this.runName, this.costText, `⏱ ${elapsed}`, `ckpt ${this.intervalMin}m`]
-      .filter(Boolean)
-      .join(t.paint(" · ", "dim"));
+    const pct = (x?: { utilization: number }) => (x ? `${Math.round(x.utilization * 100)}%` : null);
+    const w5 = pct(this.windows?.fiveHour);
+    const w7 = pct(this.windows?.sevenDay);
+    // Facts in priority order; the least important are dropped first when the
+    // terminal is narrow rather than truncating the line mid-word.
+    const factList: { text: string; keep: number }[] = [
+      { text: this.budgetNote ? t.paint(this.budgetNote, "amber") : "", keep: 5 },
+      { text: this.runNet ? `Σ $${this.runNet.usd.toFixed(2)} · ${formatTokens(this.runNet.tokens)}` : "", keep: 4 },
+      { text: w5 || w7 ? `5h ${w5 ?? "—"} · 7d ${w7 ?? "—"}` : "", keep: 3 },
+      { text: `⏱ ${elapsed}`, keep: 2 },
+      { text: this.runName, keep: 1 },
+      { text: `ckpt ${this.intervalMin}m`, keep: 0 },
+    ].filter((f) => f.text);
     const wordmark = t.wordmark();
     const room = width - gutter - Theme.width(wordmark) - 2;
-    const factsShown = Theme.width(facts) <= room ? facts : this.fit(facts, Math.max(0, room));
-    const gap = Math.max(2, width - gutter - Theme.width(wordmark) - Theme.width(factsShown));
-    out.push(` ${shield[0]}  ${wordmark}${" ".repeat(gap)}${t.paint(factsShown, "muted")}`);
+    const joinFacts = (fs: { text: string }[]) => fs.map((f) => f.text).join(t.paint(" · ", "dim"));
+    let shown = [...factList];
+    while (shown.length && Theme.width(joinFacts(shown)) > room) {
+      const drop = shown.reduce((m, f) => (f.keep < m.keep ? f : m));
+      shown = shown.filter((f) => f !== drop);
+    }
+    const facts = joinFacts(shown);
+    const gap = Math.max(2, width - gutter - Theme.width(wordmark) - Theme.width(facts));
+    out.push(` ${shield[0]}  ${wordmark}${" ".repeat(gap)}${t.paint(facts, "muted")}`);
 
     const goalLabel = t.paint("GOAL", "amberHi", true);
     const goalLines = wrapText(this.goal || "(no goal recorded)", width - gutter - 6, 2);
@@ -417,7 +472,8 @@ export class Dashboard {
     const orchAgo = formatAgo(Date.now() - this.orchSince);
     const orchLine =
       `${t.paint("◆", "amber", true)} ${t.bold("orchestrator")}` +
-      t.paint(`   turn ${this.orchTurns} · ${this.orchText} ${orchAgo}`, "muted");
+      t.paint(`   turn ${this.orchTurns} · ${this.orchText} ${orchAgo}`, "muted") +
+      (this.orchTurn_ || this.orchNet ? `   ${this.spendText(this.orchTurn_, this.orchNet)}` : "");
     const orchPad = Math.max(1, Math.min(center, width - Theme.width(orchLine) - 1));
     out.push(" ".repeat(orchPad) + orchLine);
 
@@ -434,7 +490,9 @@ export class Dashboard {
       }
     });
 
-    out.push(t.paint("─".repeat(width), "dim"));
+    const hint = " ctrl-x stop seats · show <seat> · exit ";
+    const rule = width > hint.length + 8 ? `──${hint}${"─".repeat(width - hint.length - 2)}` : "─".repeat(width);
+    out.push(t.paint(rule, "dim"));
     return out.map((l) => this.fit(l, width));
   }
 }

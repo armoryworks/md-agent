@@ -27,6 +27,7 @@ export async function runInit(cwd = process.cwd()): Promise<void> {
       verify: "A shell command that proves the result (tests, build, lint). Exit 0 = pass. Gates completion AND judges each seat's worktree at teardown.",
       isolation: "worktree gives every seat its own branch under runs/<run>/workspaces/<role>; audit with git diff, merge what passes, drop what doesn't.",
       permissionMode: "Headless seats auto-deny tools the host doesn't allow. acceptEdits for file edits; bypassPermissions if the seat must run commands.",
+      budget: "Ceilings: usd and tokens sum every seat; fiveHourPct / sevenDayPct are your plan windows (claude seats report them live). soft = orchestrator winds down, hard = run HALTs and is resumable after the window resets.",
       run: `md-agent --launch ${LAUNCH_FILE}`,
     },
     name: "my-run",
@@ -51,6 +52,7 @@ export async function runInit(cwd = process.cwd()): Promise<void> {
     verify: { cmd: "npm test", maxFailures: 2, timeoutSec: 600 },
     escalation: ["sonnet", "opus"],
     isolation: "worktree",
+    budget: { usd: { soft: 5, hard: 10 }, fiveHourPct: { soft: 70, hard: 90 } },
     autoComplete: true,
     maxMinutes: 15,
   };

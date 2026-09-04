@@ -139,6 +139,12 @@ export interface RoleSpec {
    */
   cwd?: string;
   /**
+   * Set when the user stopped this seat mid-run (ctrl-x / `stop`). A stopped
+   * seat is not respawned on resume and the orchestrator is told not to
+   * dispatch to it; its work was handed off or left for the orchestrator.
+   */
+  stopped?: { at: string; handoffTo?: string };
+  /**
    * Whether the escalation ladder may promote this seat. Default true.
    *
    * Set false to pin a seat at its tier — a deliberately cheap role doing bulk
@@ -171,6 +177,37 @@ export const DEFAULT_ISOLATION: Isolation = "none";
  * run HALTs (circuit breaker) rather than looping. LLM does the fixing; this decides
  * "done" and breaks the loop deterministically.
  */
+/** A soft line (wind down) and a hard line (HALT) on one budget axis. */
+export interface Limit {
+  soft?: number;
+  hard?: number;
+}
+
+/**
+ * Spend ceilings for a run. `usd` and `tokens` are summed over every seat from
+ * the per-turn usage each CLI reports (tokens = everything processed: input,
+ * cache reads, cache writes, output). `fiveHourPct` / `sevenDayPct` are the
+ * plan windows the claude CLI streams on every turn (`rate_limit_event`,
+ * utilization 0–100) — exact for claude seats, invisible to agy seats. At a
+ * soft line the orchestrator is told to wind down; at a hard line the run
+ * HALTs cleanly and is resumable once the window resets.
+ */
+export interface BudgetSpec {
+  usd?: Limit;
+  tokens?: Limit;
+  fiveHourPct?: Limit;
+  sevenDayPct?: Limit;
+}
+
+/** The plan-window utilization a claude turn reports, as md-agent stores it. */
+export interface WindowSnapshot {
+  /** 0–1 */
+  fiveHour?: { utilization: number; resetsAt: number };
+  sevenDay?: { utilization: number; resetsAt: number };
+  /** ms when observed */
+  at: number;
+}
+
 export interface VerifySpec {
   /** Shell command; exit 0 = pass. e.g. "npm test", "dotnet build". */
   cmd: string;
@@ -214,6 +251,8 @@ export interface RunState {
   autoComplete?: boolean;
   /** Deterministic completion gate + circuit breaker (P1). Undefined = no gate. */
   verify?: VerifySpec;
+  /** Spend ceilings; see {@link BudgetSpec}. */
+  budget?: BudgetSpec;
   /** Where role edits land. Default "none" (shared cwd). See {@link Isolation}. */
   isolation?: Isolation;
   /**
@@ -280,6 +319,8 @@ export interface LaunchConfig {
   escalation?: ModelTier[];
   /** Where role edits land. Default "none" (shared cwd). See {@link Isolation}. */
   isolation?: Isolation;
+  /** Spend ceilings; see {@link BudgetSpec}. */
+  budget?: BudgetSpec;
   /** Set by the journey driver; recorded into state.json for home-screen resume. */
   journey?: JourneyRef;
 }
@@ -318,6 +359,47 @@ function sessionFile(runDir: string, who: string): string {
  */
 export function logPath(runDir: string, who: string): string {
   return path.join(runDir, "log", `${who}.jsonl`);
+}
+
+// -------- plan-window snapshots --------
+// Each claude seat writes what its last turn reported; the run's view is the
+// freshest one across participants (they all see the same account windows).
+
+function windowFile(runDir: string, who: string): string {
+  return path.join(runDir, "sessions", `${who}.window.json`);
+}
+
+export async function writeWindow(runDir: string, who: string, w: WindowSnapshot): Promise<void> {
+  const file = windowFile(runDir, who);
+  await mkdir(path.dirname(file), { recursive: true });
+  await writeFile(file, JSON.stringify(w), "utf8");
+}
+
+export async function readLatestWindow(runDir: string): Promise<WindowSnapshot | null> {
+  const dir = path.join(runDir, "sessions");
+  if (!existsSync(dir)) return null;
+  let best: WindowSnapshot | null = null;
+  for (const name of await readdir(dir)) {
+    if (!name.endsWith(".window.json")) continue;
+    try {
+      const w = JSON.parse(await readFile(path.join(dir, name), "utf8")) as WindowSnapshot;
+      if (!best || w.at > best.at) best = w;
+    } catch {
+      // unreadable snapshot — skip
+    }
+  }
+  return best;
+}
+
+/** Everything a turn processed: input, cache reads, cache writes, output. */
+export function usageTokens(u: Usage | CostRecord): number {
+  return u.inputTokens + u.cacheReadTokens + u.cacheCreationTokens + u.outputTokens;
+}
+
+/** `in 18 / cache 36k / out 554` — the shape every usage line uses. */
+export function formatUsage(u: Usage | CostRecord): string {
+  const k = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 100_000 ? 0 : 1)}k` : `${n}`);
+  return `in ${k(u.inputTokens)} / cache ${k(u.cacheReadTokens)}${u.cacheCreationTokens ? `+${k(u.cacheCreationTokens)}w` : ""} / out ${k(u.outputTokens)}`;
 }
 
 export async function writeSessionId(

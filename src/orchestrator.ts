@@ -4,9 +4,9 @@ import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { spawn, ChildProcess } from "node:child_process";
 import crossSpawn from "cross-spawn";
 import readline from "node:readline";
-import { confirm, input, number, select } from "@inquirer/prompts";
+import { checkbox, confirm, input, number, select } from "@inquirer/prompts";
 import { ClaudeSession, type AgentSession } from "./claude.js";
-import { reportWorkspaces } from "./workspace.js";
+import { reportWorkspaces, workspaceBranch, workspaceHasChanges } from "./workspace.js";
 import {
   appendTranscript,
   clearFile,
@@ -21,8 +21,15 @@ import { listSeats, ORCH, renderSeatLog, resolveSeat, showInPager } from "./insp
 import { theme as t } from "./theme.js";
 import { parseTeamBlocks, runHuddle, type TeamIO, type TeamResult, type TeamSpec } from "./team.js";
 import {
+  type BudgetSpec,
   DEFAULT_TIER,
   AGY_MODEL_IDS,
+  formatUsage,
+  type Limit,
+  parseTranscript,
+  readLatestWindow,
+  usageTokens,
+  type WindowSnapshot,
   PROVIDER_PROFILES,
   DEFAULT_PROVIDER,
   DEFAULT_ISOLATION,
@@ -108,14 +115,26 @@ const ORCH_CONTEXT_INLINE_MAX = 2000;
 const TEAMS_DEFAULT = /^(1|true|on|yes)$/i.test(process.env.MD_AGENT_TEAMS ?? "");
 
 /**
- * Concrete model for the orchestrator session. The orchestrator is the
- * highest-context seat in the run; MD_AGENT_ORCH_MODEL lets you pin it (a tier
- * name like "sonnet"/"haiku" or a concrete id). Unset → the claude CLI default.
+ * Concrete model for the orchestrator session. MD_AGENT_ORCH_MODEL pins it (a
+ * tier name like "opus"/"haiku" or a concrete id). Unset → the sonnet tier: the
+ * orchestrator re-reads a ledger and routes; it should not inherit whatever
+ * premium model the CLI happens to default to on this machine.
  */
-function resolveOrchModel(): string | undefined {
+function resolveOrchModel(): string {
   const m = process.env.MD_AGENT_ORCH_MODEL?.trim();
-  if (!m) return undefined;
+  if (!m) return MODEL_IDS.sonnet;
   return m in MODEL_IDS ? MODEL_IDS[m as ModelTier] : m;
+}
+
+/**
+ * The orchestrator coordinates; it does not do the work. Left with edit tools
+ * it will — a run was seen writing a seat's deliverable itself to get a verify
+ * command to pass, which quietly defeats isolation. Read tools stay so it can
+ * consult the context brief. MD_AGENT_ORCH_TOOLS=all restores everything.
+ */
+const ORCH_EDIT_TOOLS = ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"];
+function orchDisallowedTools(): string[] {
+  return /^(all|full)$/i.test(process.env.MD_AGENT_ORCH_TOOLS ?? "") ? [] : ORCH_EDIT_TOOLS;
 }
 
 /**
@@ -219,6 +238,7 @@ function createOrchSession(systemPrompt: string, runDir: string): AgentSession {
     model: resolveOrchModel(),
     stateless: true,
     logPath: logPath(runDir, ORCH),
+    disallowedTools: orchDisallowedTools(),
   });
 }
 
@@ -254,7 +274,10 @@ function buildOrchSystem(state: RunState, runDir: string | null): string {
     "Roles:",
     ...state.roles.map(
       (r, i) =>
-        `  ${i + 1}. ${r.name ? `(name: ${r.name}) ` : "(name: ?) "}${r.description}`
+        `  ${i + 1}. ${r.name ? `(name: ${r.name}) ` : "(name: ?) "}${r.description}` +
+        (r.stopped
+          ? `  [STOPPED by the user${r.stopped.handoffTo ? `; its work went to ${r.stopped.handoffTo}` : ""} — never dispatch to it]`
+          : "")
     ),
     orchContextBlock(state.context, runDir),
     "",
@@ -490,6 +513,8 @@ export interface RunSetup {
   isolation?: Isolation;
   /** Set by the journey driver so the phase run knows how to be resumed. */
   journey?: JourneyRef;
+  /** Spend ceilings. See {@link BudgetSpec}. */
+  budget?: BudgetSpec;
 }
 
 /**
@@ -604,6 +629,7 @@ export async function launchRun(setup: RunSetup): Promise<void> {
     escalation: setup.escalation,
     isolation: setup.isolation,
     journey: setup.journey,
+    budget: setup.budget,
   };
   await writeFile(path.join(runDir, "state.json"), JSON.stringify(state, null, 2), "utf8");
 
@@ -664,6 +690,7 @@ export async function launchRun(setup: RunSetup): Promise<void> {
     verify: state.verify,
     escalation: state.escalation,
     isolation: state.isolation,
+    budget: state.budget,
   });
 }
 
@@ -712,6 +739,7 @@ export async function runFromConfig(configPath: string): Promise<void> {
     escalation: cfg.escalation,
     isolation: cfg.isolation,
     journey: cfg.journey,
+    budget: cfg.budget,
   });
 }
 
@@ -821,7 +849,12 @@ export async function resumeOrchestrator(
   // P4: probe agents before re-spawning roles (resume is a common post-rate-limit path).
   await preflightAgents(runProviders(roles));
 
-  const children = roles.map((r) => spawnRole(r.name, runDir, true));
+  // A seat the user stopped stays stopped across a resume; the orchestrator is
+  // told about it in its system prompt and refused if it dispatches there.
+  const children = roles.map((r) => (r.stopped ? null : spawnRole(r.name, runDir, true)));
+  for (const r of roles) {
+    if (r.stopped) console.log(`[orchestrator] seat "${r.name}" is stopped (${r.stopped.handoffTo ? `handed to ${r.stopped.handoffTo}` : "abandoned"}) — not respawned`);
+  }
 
   await runLoop({
     runDir,
@@ -840,6 +873,7 @@ export async function resumeOrchestrator(
     verify: state.verify,
     escalation: state.escalation,
     isolation: state.isolation,
+    budget: state.budget,
   });
 }
 
@@ -864,7 +898,8 @@ interface LoopCtx {
   roles: RoleSpec[];
   transcript: string;
   orch: AgentSession;
-  children: ChildProcess[];
+  /** One per role, in order; null for a seat that is stopped. */
+  children: (ChildProcess | null)[];
   checkpointMinutes: number;
   kickoff: string;
   /** Whether the orchestrator may form sub-teams (per-run setup choice). */
@@ -879,11 +914,13 @@ interface LoopCtx {
   escalation?: ModelTier[];
   /** Where role edits land; drives the end-of-run workspace audit. */
   isolation?: Isolation;
+  /** Spend ceilings; checked after every turn. */
+  budget?: BudgetSpec;
 }
 
 /** Shared event loop used by both fresh runs and resumes. */
 async function runLoop(ctx: LoopCtx): Promise<void> {
-  const { runDir, goal, roles, transcript, orch, children, kickoff, teamsEnabled, budgetMinutes, autoComplete, verify, escalation, isolation } = ctx;
+  const { runDir, goal, roles, transcript, orch, children, kickoff, teamsEnabled, budgetMinutes, autoComplete, verify, escalation, isolation, budget } = ctx;
 
   // Give the orchestrator's own claude session a heartbeat file so the watchdog
   // can tell a working turn (recent stream output) from one hung mid-turn. Roles
@@ -895,16 +932,23 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   // Session clock — drives the ⏱ time signal injected into every orchestrator
   // turn so the (stateless) orchestrator can scope work to the time available.
   const sessionStart = Date.now();
+  // Set once a soft budget line is crossed; rides on every later turn's ⏱ line.
+  let budgetSoftNote = "";
+  let budgetHalting = false;
+  const budgetSoftAnnounced = new Set<string>();
   function timeStatus(): string {
     const elapsed = Math.round((Date.now() - sessionStart) / 60000);
+    const spendNote = budgetSoftNote
+      ? `\n💰 BUDGET: ${budgetSoftNote}. Drive in-flight work to a committed state and start nothing new.`
+      : "";
     if (budgetMinutes == null) {
-      return `⏱ ~${elapsed} min into this session.`;
+      return `⏱ ~${elapsed} min into this session.${spendNote}`;
     }
     const remaining = budgetMinutes - elapsed;
     if (remaining >= 0) {
-      return `⏱ ~${elapsed} min in, ~${remaining} min left of a ~${budgetMinutes} min budget — scope work to finish and commit within it.`;
+      return `⏱ ~${elapsed} min in, ~${remaining} min left of a ~${budgetMinutes} min budget — scope work to finish and commit within it.${spendNote}`;
     }
-    return `⏱ ~${elapsed} min in, OVER the ~${budgetMinutes} min budget by ~${-remaining} min — WIND DOWN: drive in-flight work to a committed state and start nothing new (over-runs are tolerated only to land work already underway).`;
+    return `⏱ ~${elapsed} min in, OVER the ~${budgetMinutes} min budget by ~${-remaining} min — WIND DOWN: drive in-flight work to a committed state and start nothing new (over-runs are tolerated only to land work already underway).${spendNote}`;
   }
 
   // Every orchestrator turn is serialized through a single pump over an event
@@ -957,9 +1001,64 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
       const cur = await readCost(runDir, name);
       const prev = lastRoleCost.get(name);
       lastRoleCost.set(name, cur);
-      dash.setRoleTurn(name, cur.costUsd - (prev?.costUsd ?? 0), cur.cacheReadTokens - (prev?.cacheReadTokens ?? 0), cur.costUsd);
+      dash.setRoleSpend(
+        name,
+        { usd: cur.costUsd - (prev?.costUsd ?? 0), tokens: usageTokens(cur) - (prev ? usageTokens(prev) : 0) },
+        { usd: cur.costUsd, tokens: usageTokens(cur) },
+        cur.cacheReadTokens - (prev?.cacheReadTokens ?? 0)
+      );
+      await refreshSpend();
     } catch {
       // Live per-seat cost is best-effort; never let it break the run.
+    }
+  }
+
+  /** Run-wide net spend + the freshest plan-window reading, then the budget check. */
+  async function refreshSpend(): Promise<void> {
+    const total = await readRunCost(runDir);
+    dash.setRunSpend({ usd: total.costUsd, tokens: usageTokens(total) });
+    const fromFiles = await readLatestWindow(runDir);
+    const own = orch.lastWindows;
+    const latest = own && (!fromFiles || own.at >= fromFiles.at) ? own : fromFiles;
+    dash.setWindows(latest);
+    await checkBudget(total, latest);
+  }
+
+  /**
+   * Compare the run's spend to its ceilings. A soft line changes the ⏱ line the
+   * orchestrator reads every turn; a hard line HALTs — cleanly, resumable from
+   * the home screen once a window resets or the ceiling is raised.
+   */
+  async function checkBudget(total: CostRecord, w: WindowSnapshot | null): Promise<void> {
+    if (!budget || stopping || budgetHalting) return;
+    const pct = (x?: { utilization: number }) => (x ? x.utilization * 100 : undefined);
+    const resetIn = (x?: { resetsAt: number }) =>
+      x?.resetsAt ? ` (resets in ~${Math.max(1, Math.round((x.resetsAt * 1000 - Date.now()) / 60000))} min)` : "";
+    const axes: { label: string; value?: number; limit?: Limit; fmt: (n: number) => string; reset: string }[] = [
+      { label: "spend", value: total.costUsd, limit: budget.usd, fmt: (n) => `$${n.toFixed(2)}`, reset: "" },
+      { label: "tokens", value: usageTokens(total), limit: budget.tokens, fmt: (n) => `${Math.round(n / 1000)}k`, reset: "" },
+      { label: "5h window", value: pct(w?.fiveHour), limit: budget.fiveHourPct, fmt: (n) => `${Math.round(n)}%`, reset: resetIn(w?.fiveHour) },
+      { label: "7d window", value: pct(w?.sevenDay), limit: budget.sevenDayPct, fmt: (n) => `${Math.round(n)}%`, reset: resetIn(w?.sevenDay) },
+    ];
+    for (const a of axes) {
+      if (!a.limit || a.value == null) continue;
+      if (a.limit.hard != null && a.value >= a.limit.hard) {
+        budgetHalting = true;
+        await haltRun(
+          `budget: ${a.label} ${a.fmt(a.value)} reached the hard line ${a.fmt(a.limit.hard)}${a.reset} — resume from the home screen once it clears`
+        );
+        return;
+      }
+      if (a.limit.soft != null && a.value >= a.limit.soft) {
+        const note = `${a.label} ${a.fmt(a.value)} ≥ soft ${a.fmt(a.limit.soft)}${a.reset}`;
+        budgetSoftNote = note;
+        dash.setBudgetNote(`⚠ ${note}`);
+        if (!budgetSoftAnnounced.has(a.label)) {
+          budgetSoftAnnounced.add(a.label);
+          console.warn(`[budget] ${note} — winding down`);
+          await appendTranscript(transcript, "BUDGET SOFT", note);
+        }
+      }
     }
   }
 
@@ -973,10 +1072,18 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   const aliveByRole = new Map<string, boolean>();
   const pendingSince = new Map<string, number>(); // role -> ms of its outstanding dispatch
   const recovering = new Set<string>();
+  // Seats the user stopped (ctrl-x / `stop`): never dispatched to, respawned or recovered.
+  const stoppedRoles = new Set<string>();
   let watchdog: ReturnType<typeof setInterval> | undefined;
   roles.forEach((r, i) => {
-    childByRole.set(r.name, children[i]);
-    aliveByRole.set(r.name, true);
+    const c = children[i];
+    if (c) {
+      childByRole.set(r.name, c);
+      aliveByRole.set(r.name, true);
+    } else {
+      aliveByRole.set(r.name, false);
+      stoppedRoles.add(r.name);
+    }
   });
 
   /**
@@ -993,7 +1100,11 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
       dash.orchTurn();
       const u = orch.lastUsage;
       if (u) {
-        await recordUsage(runDir, "orchestrator", u);
+        const orchTotal = await recordUsage(runDir, "orchestrator", u);
+        dash.setOrchSpend(
+          { usd: u.costUsd, tokens: usageTokens(u) },
+          { usd: orchTotal.costUsd, tokens: usageTokens(orchTotal) }
+        );
         // Cache-hit ratio of the CLI's own prompt caching. The system prompt is
         // the only large static prefix; warm turns read it from cache, cold
         // turns (sparse cadence > the ~5-min TTL) re-pay for it. When this runs
@@ -1004,11 +1115,14 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
         orchCacheRead += u.cacheReadTokens;
         orchCacheable += cacheable;
         const cumPct = orchCacheable > 0 ? Math.round((orchCacheRead / orchCacheable) * 100) : 0;
-        console.log(`[orchestrator] turn $${u.costUsd.toFixed(4)} · cache ${hitPct}% hit (cum ${cumPct}%)`);
+        console.log(
+          `[orchestrator] turn $${u.costUsd.toFixed(4)} · ${formatUsage(u)} · cache ${hitPct}% hit (cum ${cumPct}%)` +
+            `  ‖  net $${orchTotal.costUsd.toFixed(2)} · ${formatUsage(orchTotal)} (${orchTotal.turns} turns)`
+        );
         try {
-          dash.setCost((await readRunCost(runDir)).costUsd);
+          await refreshSpend();
         } catch {
-          // Cost display is best-effort; never let it break the run.
+          // Spend display is best-effort; never let it break the run.
         }
       }
       const extracted = extractLedger(reply);
@@ -1142,8 +1256,8 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     // A seat pinned with escalate:false keeps its tier. Deliberately cheap seats
     // (bulk enumeration, extraction) should stay cheap when the ladder climbs —
     // otherwise escalation quietly erases the cost split it was chosen for.
-    const climbing = roles.filter((r) => r.escalate !== false);
-    const pinned = roles.filter((r) => r.escalate === false);
+    const climbing = roles.filter((r) => r.escalate !== false && !stoppedRoles.has(r.name));
+    const pinned = roles.filter((r) => r.escalate === false && !stoppedRoles.has(r.name));
     if (pinned.length) {
       console.warn(
         `[verify] not escalating pinned seat(s): ${pinned.map((r) => r.name).join(", ")}`
@@ -1187,7 +1301,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     console.log(`[verify] running: ${verify.cmd}`);
     let result: { ok: boolean; tail: string };
     try {
-      result = await runVerify(verify);
+      result = await runGate();
     } finally {
       verifying = false;
     }
@@ -1450,7 +1564,8 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
         return;
       }
 
-      dash.flow(r.name, "orch");
+      const wasStopped = stoppedRoles.has(r.name);
+      if (!wasStopped) dash.flow(r.name, "orch");
       await showRoleTurnCost(r.name);
       pendingSince.delete(r.name); // role replied — clear its outstanding dispatch
       orchStallNudges = 0; // a role reply is progress — reset the stall escalation
@@ -1461,14 +1576,250 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
       // large one is spilled to a file and the orchestrator gets a head excerpt +
       // pointer, so a misbehaving role can't blow up its resident context.
       // postEvent coalesces near-simultaneous role replies into one turn.
-      await postEvent(await chokeEvent(r.name, content));
+      let event = await chokeEvent(r.name, content);
+      // Verify-on-reply: the check runs where the seat's work actually is, and
+      // a seat that claims done while it fails gets the output straight back —
+      // no orchestrator turn spent relaying it. The orchestrator only sees the
+      // reply once it passes, isn't a completion claim, or has failed too often.
+      if (verify && !wasStopped && !stopping) {
+        const ws = seatWorkspaceDir(r.name);
+        const where = ws ? `${r.name}'s workspace` : "the shared tree";
+        dash.setStatus(`verifying ${r.name}: ${verify.cmd}`);
+        const res = await runVerify({ ...verify, cwd: ws ?? verify.cwd ?? process.cwd() });
+        dash.setStatus("running");
+        if (res.ok) {
+          seatVerifyFails.delete(r.name);
+          console.log(`[verify] ${r.name}'s reply: PASS in ${where}`);
+          event = `[verify PASS in ${where}: \`${verify.cmd}\`]\n${event}`;
+        } else {
+          const n = (seatVerifyFails.get(r.name) ?? 0) + 1;
+          seatVerifyFails.set(r.name, n);
+          const max = verify.maxFailures ?? 2;
+          await appendTranscript(transcript, `VERIFY FAIL ${r.name} ${n}`, res.tail);
+          if (claimsDone(content) && n <= max && !stopping) {
+            console.warn(`[verify] ${r.name} reported done but \`${verify.cmd}\` fails in ${where} (${n}/${max}) — sending the output straight back`);
+            await sendToRole({
+              role: r.name,
+              body:
+                `[VERIFY FAIL ${n}/${max} — \`${verify.cmd}\` in ${where}]\n` +
+                `You reported done, but the check fails where your work is. Fix the cause in your own workspace, run the check yourself, then report again.\n\n` +
+                res.tail,
+            });
+            return;
+          }
+          console.warn(`[verify] ${r.name}'s reply: FAIL in ${where} (${n}) — attached to the event`);
+          event = `[verify FAIL in ${where}: \`${verify.cmd}\` — attempt ${n}; output tail:]\n${res.tail}\n\n${event}`;
+        }
+      }
+      await postEvent(event);
     });
+  }
+
+  const seatVerifyFails = new Map<string, number>();
+
+  /** A reply that presents itself as finished — the only kind verify-on-reply bounces. */
+  function claimsDone(reply: string): boolean {
+    return (
+      /\b(done|complete|completed|finished|ready for review|all set)\b/i.test(reply) &&
+      !/\b(not (yet )?(done|complete)|blocked|cannot|can't|unable|question)\b/i.test(reply)
+    );
+  }
+
+  /** Where a seat's edits land: an explicit cwd, its worktree, or nothing (shared tree). */
+  function seatWorkspaceDir(name: string): string | undefined {
+    const r = roles.find((x) => x.name === name);
+    if (r?.cwd) return r.cwd;
+    if ((isolation ?? DEFAULT_ISOLATION) !== "worktree") return undefined;
+    const dir = path.join(runDir, "workspaces", name);
+    return existsSync(path.join(dir, ".git")) ? dir : undefined;
+  }
+
+  /**
+   * The completion gate, where the work is. Under isolation every seat that
+   * changed its workspace must pass; an untouched workspace is not judged. With
+   * no isolated changes at all the shared tree is checked, as before.
+   */
+  async function runGate(): Promise<{ ok: boolean; tail: string }> {
+    const spec = verify!;
+    const dirty: { name: string; dir: string }[] = [];
+    for (const r of roles) {
+      if (stoppedRoles.has(r.name)) continue;
+      const dir = seatWorkspaceDir(r.name);
+      if (dir && (await workspaceHasChanges(dir))) dirty.push({ name: r.name, dir });
+    }
+    if (!dirty.length) return runVerify(spec);
+    let ok = true;
+    const tails: string[] = [];
+    for (const { name, dir } of dirty) {
+      const res = await runVerify({ ...spec, cwd: dir });
+      if (!res.ok) ok = false;
+      tails.push(`--- ${name} (${dir}): ${res.ok ? "PASS" : "FAIL"}${res.ok ? "" : `\n${res.tail}`}`);
+    }
+    return { ok, tail: tails.join("\n") };
   }
 
   // User interjection via stdin — feed to orchestrator only; it decides
   // whether/how to propagate to roles.
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  let rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   let interjectionsPaused = false;
+
+  /**
+   * Hand the terminal to something else (a pager, an inquirer prompt): the
+   * panel and the line reader step aside and come back afterwards. A ctrl-c
+   * inside the prompt is a cancel, not a crash.
+   */
+  async function withInputSuspended<T>(fn: () => Promise<T>): Promise<T | undefined> {
+    interjectionsPaused = true;
+    process.stdin.off("keypress", onKeypress);
+    rl.close();
+    dash.stop();
+    try {
+      return await fn();
+    } catch (e) {
+      if ((e as Error).name === "ExitPromptError") return undefined;
+      throw e;
+    } finally {
+      dash.start({ clear: false });
+      rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      rl.on("line", onInterjection);
+      armHotkeys();
+      interjectionsPaused = false;
+    }
+  }
+
+  // ctrl-x opens the stop menu any time the console is free (not mid-prompt).
+  const onKeypress = (_s: string, key: { ctrl?: boolean; name?: string } | undefined): void => {
+    if (!key?.ctrl || key.name !== "x" || stopping || interjectionsPaused) return;
+    void stopSeats();
+  };
+  function armHotkeys(): void {
+    if (!process.stdin.isTTY) return;
+    process.stdin.off("keypress", onKeypress);
+    process.stdin.on("keypress", onKeypress);
+  }
+
+  /**
+   * Stop one or more seats. Each stopped seat either hands its work to a
+   * remaining seat — which gets the outstanding dispatch, last report and
+   * workspace pointer directly — or leaves an ABANDONED note in its outbox for
+   * the orchestrator to plan around. Either way the orchestrator hears about it
+   * through the normal outbox path.
+   */
+  async function stopSeats(): Promise<void> {
+    const live = roles.filter((r) => !stoppedRoles.has(r.name));
+    if (!live.length) {
+      console.log("[stop] no live seats to stop");
+      return;
+    }
+    await withInputSuspended(async () => {
+      const picked = await checkbox<string>({
+        message: "Stop which seats? (space to select, enter to confirm, ctrl-c to cancel)",
+        choices: live.map((r) => ({
+          name: `${r.name}  ${pendingSince.has(r.name) ? "(working)" : teamOwner.has(r.name) ? "(in huddle)" : "(idle)"}`,
+          value: r.name,
+          description: r.description,
+        })),
+      });
+      for (const name of picked) {
+        const others = roles.filter((r) => r.name !== name && !stoppedRoles.has(r.name) && !picked.includes(r.name));
+        const NONE = "";
+        const to = await select<string>({
+          message: `${name}: hand its work to another seat, or leave it for the orchestrator?`,
+          choices: [
+            ...others.map((o) => ({ name: `hand off to ${o.name}`, value: o.name, description: o.description })),
+            { name: "leave abandoned — the orchestrator decides what happens to the work", value: NONE },
+          ],
+        });
+        await stopSeat(name, to || undefined);
+      }
+    });
+  }
+
+  async function stopSeat(name: string, handoffTo?: string): Promise<void> {
+    const spec = roles.find((r) => r.name === name);
+    if (!spec || stoppedRoles.has(name)) return;
+    stoppedRoles.add(name);
+    pendingSince.delete(name);
+    recovering.delete(name);
+    const child = childByRole.get(name);
+    if (child && child.exitCode === null && !child.killed) {
+      try {
+        child.kill();
+      } catch {
+        // already gone
+      }
+    }
+    aliveByRole.set(name, false);
+
+    const inboxFile = path.join(runDir, "inbox", `${name}.txt`);
+    let outstanding = "";
+    try {
+      outstanding = (await readFile(inboxFile, "utf8")).trim();
+      if (isSafeWord(outstanding)) outstanding = "";
+    } catch {
+      // no inbox
+    }
+    await clearFile(inboxFile);
+    const blocks = parseTranscript(await readFile(transcript, "utf8"));
+    const lastTo = [...blocks].reverse().find((b) => b.tag === `→ ${name}`)?.content ?? "";
+    const lastFrom = [...blocks].reverse().find((b) => b.tag === `← ${name}`)?.content ?? "";
+    const ws = seatWorkspaceDir(name);
+    const wsNote = ws
+      ? `Its workspace: ${ws} (branch ${workspaceBranch(path.basename(runDir), name)}). Its edits live there, not in your workspace — read them there, or cherry-pick what you need.`
+      : "";
+
+    spec.stopped = { at: new Date().toISOString(), handoffTo };
+    await updateState(runDir, { roles });
+    dash.setSeatState(name, "stopped", { handoffTo });
+    await appendTranscript(
+      transcript,
+      `SEAT STOPPED ${name}`,
+      handoffTo ? `stopped by the user; work handed to ${handoffTo}` : "stopped by the user; work abandoned for the orchestrator"
+    );
+
+    const outbox = path.join(runDir, "outbox", `${name}.txt`);
+    if (handoffTo) {
+      await sendToRole({
+        role: handoffTo,
+        body: [
+          `[HANDOFF — you are taking over "${name}", which the user stopped]`,
+          `${name}'s mandate: ${spec.description}`,
+          outstanding
+            ? `Its outstanding dispatch (never answered):\n${outstanding}`
+            : lastTo
+              ? `The last dispatch it was working on:\n${lastTo}`
+              : "",
+          lastFrom ? `Its last report:\n${lastFrom}` : "",
+          wsNote,
+          `Its full trace: ${logPath(runDir, name)}`,
+          "Pick this work up alongside your own role and report to the orchestrator as usual.",
+        ]
+          .filter(Boolean)
+          .join("\n\n"),
+      });
+      await safeWrite(
+        outbox,
+        `[SEAT STOPPED] "${name}" was stopped by the user. Its work is HANDED OFF to "${handoffTo}", which has already been given ${name}'s outstanding dispatch, last report and workspace pointer. ` +
+          `Never dispatch to "${name}" again; route anything it owned to "${handoffTo}". Update Role status.`
+      );
+    } else {
+      await safeWrite(
+        outbox,
+        `[SEAT STOPPED] "${name}" was stopped by the user with its work ABANDONED — no handoff. ` +
+          (outstanding ? `Its outstanding dispatch was:\n${outstanding}\n\n` : "") +
+          (ws ? `Partial work may exist in ${ws}. ` : "") +
+          `Never dispatch to "${name}" again. Decide now: reassign its work to another role, or drop it. Update Role status.`
+      );
+    }
+    console.log(`[stop] ${name} stopped${handoffTo ? ` → handed to ${handoffTo}` : " (abandoned)"}`);
+  }
+
+  /** `stop` typed at the console — same menu as ctrl-x. */
+  const tryStop = async (text: string): Promise<boolean> => {
+    if (!/^\/?stop$/i.test(text)) return false;
+    await stopSeats();
+    return true;
+  };
 
   /**
    * `show [seat]` — open a seat's trace (log/<seat>.jsonl) in a pager without
@@ -1491,14 +1842,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
       return true;
     }
     const text2 = await renderSeatLog(runDir, who, { tailTurns: 6 });
-    rl.pause();
-    dash.stop();
-    try {
-      showInPager(text2);
-    } finally {
-      dash.start({ clear: false });
-      rl.resume();
-    }
+    await withInputSuspended(async () => showInPager(text2));
     return true;
   };
 
@@ -1511,11 +1855,13 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
       return;
     }
     if (await tryShow(text)) return;
+    if (await tryStop(text)) return;
     console.log(`[orchestrator] forwarding user interjection to orchestrator claude`);
     await appendTranscript(transcript, "USER", text);
     await postEvent(`[USER INTERJECTION] ${text}`);
   };
   rl.on("line", onInterjection);
+  armHotkeys();
 
   // Wait for one line from the user (interjections paused). Resolves to the line,
   // or null if `timeoutMs` elapses first. timeoutMs <= 0 means wait indefinitely.
@@ -1562,6 +1908,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
       console.log(`  extend N       run N more minutes before the NEXT checkpoint only`);
       console.log(`  interval N     change the recurring checkpoint interval to N minutes`);
       console.log("  show <seat>    open a seat's trace (its tool calls and reasoning) — also works any time");
+      console.log("  stop           stop one or more seats (hand off, or abandon) — also ctrl-x any time");
       console.log("  exit           stop the run");
 
       const userLine = await waitForInput(CHECKPOINT_GRACE_MS);
@@ -1581,7 +1928,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
         await stopAll("user typed exit at checkpoint");
         return;
       }
-      if (await tryShow(fb)) {
+      if ((await tryShow(fb)) || (await tryStop(fb))) {
         dash.setStatus("running");
         await continueOrch();
         scheduleCheckpoint();
@@ -1691,7 +2038,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   }
 
   async function recoverRole(name: string, cause: string): Promise<void> {
-    if (stopping || recovering.has(name) || teamOwner.has(name)) return;
+    if (stopping || stoppedRoles.has(name) || recovering.has(name) || teamOwner.has(name)) return;
     recovering.add(name);
     try {
       const since = pendingSince.get(name);
@@ -1757,7 +2104,12 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     await stopAll(`halt: ${reason}`);
   }
 
-  for (const r of roles) armChildExit(r.name, childByRole.get(r.name)!);
+  for (const r of roles) {
+    const c = childByRole.get(r.name);
+    if (c) armChildExit(r.name, c);
+    else if (r.stopped) dash.setSeatState(r.name, "stopped", { handoffTo: r.stopped.handoffTo });
+  }
+  console.log("[keys] ctrl-x stop seats · show <seat> · exit");
 
   watchdog = setInterval(() => {
     if (stopping) return;
@@ -1947,6 +2299,13 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     if (teamOwner.has(b.role)) {
       console.warn(
         `[orchestrator] "${b.role}" is busy in huddle "${teamOwner.get(b.role)}"; skipping direct dispatch`
+      );
+      return;
+    }
+    if (stoppedRoles.has(b.role)) {
+      console.warn(`[orchestrator] "${b.role}" is stopped; dispatch dropped`);
+      await postEvent(
+        `[SYSTEM] Your dispatch to "${b.role}" was DROPPED — the user stopped that seat. Route the work to another role, or note it as dropped in the ledger.`
       );
       return;
     }

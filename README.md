@@ -133,6 +133,54 @@ cache read, cumulative spend. Log output scrolls underneath. It is a status
 surface only: seats still report to the orchestrator through their outboxes
 exactly as before.
 
+### Stopping a seat
+
+**ctrl-x** at any time (or type `stop`) opens the stop menu: pick one or more
+seats, then for each choose **hand off to <seat>** or **leave abandoned**. A
+handoff gives the receiving seat the stopped seat's mandate, its outstanding
+dispatch (or the last one it was working on), its last report, and — under
+worktree isolation — where its edits live, so nothing has to be re-explained.
+Either way the stopped seat's outbox carries a `[SEAT STOPPED]` note naming
+who picked the work up (or that nobody did), which reaches the orchestrator
+through the normal path, so it re-plans instead of waiting on a seat that is
+gone. A stopped seat stays stopped across resumes; dispatches to it are
+dropped and reported back.
+
+### Verify where the work is
+
+With a `verify` command set, **every seat reply is checked in that seat's own
+workspace** before the orchestrator sees it. A reply that claims to be done
+while the check fails is sent straight back to the seat with the output — no
+orchestrator turn is spent relaying it — up to `maxFailures` times; after that
+(or for replies that are not completion claims) the result is attached to the
+reply the orchestrator receives. The completion gate runs the same way: under
+isolation, every seat whose workspace changed must pass. The orchestrator
+itself runs without edit tools (`Write`, `Edit`, `Bash`…) so it coordinates
+rather than doing the work — `MD_AGENT_ORCH_TOOLS=all` restores them.
+
+### Budgets
+
+`budget` in a launch config (or journey phase) sets spend ceilings, each with a
+**soft** line (the orchestrator is told to wind down) and a **hard** line (the
+run HALTs cleanly and can be continued from the home screen once it clears):
+
+```json
+"budget": {
+  "usd":         { "soft": 5,  "hard": 10 },
+  "tokens":      { "soft": 2000000 },
+  "fiveHourPct": { "soft": 70, "hard": 90 },
+  "sevenDayPct": { "hard": 95 }
+}
+```
+
+`usd` and `tokens` sum every seat and the orchestrator (tokens = everything
+processed: input, cache reads and writes, output). `fiveHourPct` and
+`sevenDayPct` are your **plan windows** — the claude CLI reports them on every
+turn, so they are exact and need no translation from your usage page; agy seats
+don't report them, so for agy-heavy runs use `tokens`. The umbrella shows all
+of it live: per-turn and net spend for each seat and the orchestrator, the run
+total, and `5h 21% · 7d 7%`.
+
 ### Looking inside a seat
 
 Every participant's turns are teed verbatim to `runs/<dir>/log/<seat>.jsonl`
@@ -189,7 +237,7 @@ The config is a `LaunchConfig` (see `src/persist.ts`): `goal`, `roles`
 (`{name?, description, model?, provider?, permissionMode?}`), and optional `name`, `context` (path
 to a doc included whole), `inbox` (path to a handshake doc prepended as context),
 `maxMinutes`, `teams`, `budgetMinutes`, `autoComplete`, `kickoff`, `runDir`,
-`verify`, `escalation`. Anything omitted (run name, per-role name/model) is filled
+`verify`, `escalation`, `isolation`, `budget`. Anything omitted (run name, per-role name/model) is filled
 by the one-time bootstrap turn; supply them all and that LLM call is **skipped**,
 so the run starts instantly.
 
@@ -320,13 +368,16 @@ orchestrator, which decides how to propagate it). At a checkpoint you can:
 | *(no input)* | after the grace window, auto-continues (heartbeat stays alive) |
 | `extend N`   | run N more minutes before the **next** checkpoint only|
 | `interval N` | change the recurring checkpoint interval to N minutes |
+| `show <seat>`| open a seat's trace (any time, not only at a checkpoint) |
+| `stop`       | stop one or more seats — hand off or abandon (also **ctrl-x** any time) |
 | `exit`       | stop the run cleanly                                  |
 
 ## Configuration (environment variables)
 
 | Variable                  | Default      | Purpose |
 |---------------------------|--------------|---------|
-| `MD_AGENT_ORCH_MODEL`     | *(CLI default)* | Pin the orchestrator's model — a tier (`opus`/`sonnet`/`haiku`) or a concrete model id. Set `sonnet` to trade some judgment for lower burn. |
+| `MD_AGENT_ORCH_MODEL`     | `sonnet`     | The orchestrator's model — a tier (`opus`/`sonnet`/`haiku`) or a concrete model id. It re-reads a ledger and routes, so it does not inherit the CLI's default model; set `opus` when there is no `verify` and judgement is the whole job. |
+| `MD_AGENT_ORCH_TOOLS`     | unset        | `all` gives the orchestrator its edit tools back (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Bash`). Off by default: a coordinator that can edit will do the seats' work itself. |
 | `MD_AGENT_HANDSHAKE_MODEL`| *(orch model, then CLI default)* | Model for the short between-phase handshake turn in a `--journey` run. Falls back to `MD_AGENT_ORCH_MODEL`, then the CLI default. |
 | `MD_AGENT_CHECKPOINT_GRACE`| `120`        | Seconds a checkpoint waits for your input before auto-continuing and arming the next one. `0` = wait indefinitely (block until you respond — the old behavior). |
 | `MD_AGENT_HEARTBEAT_STALL` | `360`        | Seconds a role's claude turn may produce **no stream output** before the watchdog treats it as hung and re-spawns it (resuming its session) + re-issues the work. The session beats a heartbeat on every output chunk, so a busy turn stays fresh; only a genuinely stuck turn (e.g. a tool call that never returns) goes silent this long. A dead (crashed) role is recovered immediately via its exit event regardless. |
@@ -375,7 +426,8 @@ runs/<timestamp>-<name>/
 ├── teams/<name>/channel.md  # huddle transcript (only when sub-teams are used)
 └── sessions/
     ├── <who>.txt        # persisted claude session id — roles only (orchestrator is stateless)
-    └── <who>.cost.json  # accumulated token usage + cost
+    ├── <who>.cost.json  # accumulated token usage + cost
+    └── <who>.window.json # latest plan-window utilization a claude seat saw
 ```
 
 > **`runs/` is gitignored.** Transcripts capture full agent conversations and can

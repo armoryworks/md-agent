@@ -127,7 +127,7 @@ export async function renderSeatLog(
             t.paint(` · ${ev.provider ?? "?"} ${ev.model ?? ""} · ${when}${ev.resume ? " · resumed" : ""}`, "muted")
         );
         const prompt = String(ev.prompt ?? "");
-        out.push(t.paint(`  ▶ prompt (${ev.promptChars ?? prompt.length} chars):`, "teal"));
+        out.push(t.paint(`  ▶ prompt (${ev.promptChars ?? prompt.length} chars${ev.systemChars ? ` + ${ev.systemChars} of mandate` : ""}):`, "teal"));
         for (const l of firstLines(prompt, 14)) out.push(t.paint(`    ${l}`, "dim"));
         continue;
       }

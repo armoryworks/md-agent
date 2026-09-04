@@ -75,6 +75,17 @@ export async function provisionWorkspace(opts: {
   return dir;
 }
 
+/** Whether a worktree holds any change against HEAD — staged, unstaged or untracked. */
+export async function workspaceHasChanges(dir: string): Promise<boolean> {
+  try {
+    if ((await git(dir, ["status", "--porcelain"])).length > 0) return true;
+    const ahead = await git(dir, ["rev-list", "--count", "HEAD@{1}..HEAD"]).catch(() => "0");
+    return Number(ahead) > 0;
+  } catch {
+    return false;
+  }
+}
+
 /** One role's workspace and what it changed, for the end-of-run audit. */
 export interface WorkspaceReport {
   role: string;

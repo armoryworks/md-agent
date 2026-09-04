@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import readline from "node:readline/promises";
 import { ClaudeSession } from "./claude.js";
 import {
+  type BudgetSpec,
   type JourneyRef,
   MODEL_IDS,
   type ModelTier,
@@ -47,6 +48,8 @@ export interface JourneyPhase {
   escalation?: ModelTier[];
   /** Where role edits land for this phase. Default "none". See {@link Isolation}. */
   isolation?: Isolation;
+  /** Spend ceilings for this phase. See {@link BudgetSpec}. */
+  budget?: BudgetSpec;
 }
 
 /** A templated multi-phase run, authored up front before phase 0 executes. */
@@ -197,6 +200,7 @@ export async function runJourney(manifestPath: string, opts: { from?: string } =
       verify: phase.verify,
       escalation: phase.escalation,
       isolation: phase.isolation,
+      budget: phase.budget,
       runDir,
       journey: ref,
     };

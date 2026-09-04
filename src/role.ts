@@ -12,13 +12,16 @@ import {
 } from "./ipc.js";
 import {
   buildRoleHistory,
+  formatUsage,
   logPath,
   normalizeProvider,
   readSessionId,
   readState,
   recordUsage,
   resolveModelFor,
+  usageTokens,
   writeSessionId,
+  writeWindow,
   DEFAULT_ISOLATION,
 } from "./persist.js";
 
@@ -174,8 +177,15 @@ export async function runRole(
     const cacheable = u.cacheReadTokens + u.cacheCreationTokens + u.inputTokens;
     const hitPct = cacheable > 0 ? Math.round((u.cacheReadTokens / cacheable) * 100) : 0;
     console.log(
-      `[role:${roleName}] turn $${u.costUsd.toFixed(4)} · ctx ~${Math.round(cacheable / 1000)}k tok · cache ${hitPct}% hit · run-share $${total.costUsd.toFixed(2)} (${total.turns} turns)`
+      `[role:${roleName}] turn $${u.costUsd.toFixed(4)} · ${formatUsage(u)} · ${Math.round(usageTokens(u) / 1000)}k tok · cache ${hitPct}% hit` +
+        `  ‖  net $${total.costUsd.toFixed(2)} · ${formatUsage(total)} · ${Math.round(usageTokens(total) / 1000)}k tok (${total.turns} turns)`
     );
+    const w = session.lastWindows;
+    if (w) {
+      await writeWindow(runDir, roleName, w);
+      const pct = (x?: { utilization: number }) => (x ? `${Math.round(x.utilization * 100)}%` : "—");
+      console.log(`[role:${roleName}] plan windows · 5h ${pct(w.fiveHour)} · 7d ${pct(w.sevenDay)}`);
+    }
   };
 
   /**

@@ -1,7 +1,7 @@
 import spawn from "cross-spawn";
 import fs from "node:fs";
 import path from "node:path";
-import type { Usage } from "./persist.js";
+import type { Usage, WindowSnapshot } from "./persist.js";
 
 /**
  * Append-only NDJSON tee of one seat's turns. Every line the agent CLI streams
@@ -63,6 +63,8 @@ export interface AgentSession {
   readonly id: string | null;
   /** Point the liveness heartbeat at a file (set once the run dir exists). */
   setHeartbeatPath(p: string): void;
+  /** Plan-window utilization the last turn reported, when the provider exposes it. */
+  readonly lastWindows: WindowSnapshot | null;
 }
 
 /**
@@ -83,6 +85,8 @@ export class ClaudeSession implements AgentSession {
   private permissionMode: string | null;
   private lastBeat = 0;
   private log: TurnLog | null;
+  private disallowedTools: string[];
+  private lastWindowsData: WindowSnapshot | null = null;
 
   constructor(
     opts: {
@@ -122,6 +126,8 @@ export class ClaudeSession implements AgentSession {
       permissionMode?: string;
       /** Append every streamed line of every turn here (see TurnLog). */
       logPath?: string;
+      /** Tools this session may not use (`--disallowedTools`), e.g. to keep a coordinator from editing. */
+      disallowedTools?: string[];
     } = {}
   ) {
     this.systemPrompt = opts.systemPrompt ?? null;
@@ -133,6 +139,11 @@ export class ClaudeSession implements AgentSession {
     this.heartbeatPath = opts.heartbeatPath ?? null;
     this.permissionMode = opts.permissionMode ?? null;
     this.log = opts.logPath ? new TurnLog(opts.logPath) : null;
+    this.disallowedTools = opts.disallowedTools ?? [];
+  }
+
+  get lastWindows(): WindowSnapshot | null {
+    return this.lastWindowsData;
   }
 
   /** Touch the heartbeat file (throttled) to signal this turn is alive + producing. */
@@ -175,6 +186,9 @@ export class ClaudeSession implements AgentSession {
     if (this.permissionMode) {
       args.push("--permission-mode", this.permissionMode);
     }
+    if (this.disallowedTools.length) {
+      args.push("--disallowedTools", ...this.disallowedTools);
+    }
     if (this.sessionId) {
       args.push("--resume", this.sessionId);
     }
@@ -190,7 +204,8 @@ export class ClaudeSession implements AgentSession {
       provider: "claude",
       model: this.model,
       resume: this.sessionId,
-      ...promptExcerpt(fullPrompt),
+      ...promptExcerpt(prompt),
+      systemChars: fullPrompt.length - prompt.length,
     });
     const startedAt = Date.now();
 
@@ -228,6 +243,16 @@ export class ClaudeSession implements AgentSession {
                   assistantText += block.text;
                 }
               }
+            }
+            // The CLI reports the account's plan windows on every turn — the
+            // same numbers the usage page shows. Keep the latest.
+            if (msg.type === "rate_limit_event" && msg.rate_limit_info?.unifiedWindows) {
+              const w = msg.rate_limit_info.unifiedWindows;
+              this.lastWindowsData = {
+                fiveHour: w.five_hour ? { utilization: Number(w.five_hour.utilization) || 0, resetsAt: Number(w.five_hour.resetsAt) || 0 } : undefined,
+                sevenDay: w.seven_day ? { utilization: Number(w.seven_day.utilization) || 0, resetsAt: Number(w.seven_day.resetsAt) || 0 } : undefined,
+                at: Date.now(),
+              };
             }
             if (msg.type === "result") {
               const u = (msg.usage ?? {}) as Record<string, number>;
