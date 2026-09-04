@@ -32,6 +32,8 @@ const { values, positionals } = parseArgs({
     // Open a seat's trace from a run dir: --inspect <run-dir> [--seat <name>]
     inspect: { type: "string" },
     seat: { type: "string" },
+    // With `skill install`: into ./.claude/skills instead of ~/.claude/skills.
+    project: { type: "boolean" },
   },
   allowPositionals: true,
 });
@@ -48,7 +50,7 @@ if (values.from && !values.journey) {
 if (positionals[0] === "init") {
   await runInit();
 } else if (positionals[0] === "skill") {
-  await installSkill(positionals[1]);
+  await installSkill(positionals[1], { scope: values.project ? "project" : "user" });
 } else if (values.inspect) {
   const runDir = path.resolve(values.inspect);
   if (values.seat) {

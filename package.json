@@ -9,7 +9,8 @@
   "files": [
     "dist",
     "NOTICE",
-    "skills"
+    "skills",
+    "scripts/postinstall.mjs"
   ],
   "publishConfig": {
     "access": "public"
@@ -23,7 +24,8 @@
     "start": "node dist/index.js",
     "test": "tsx smoke-team.ts",
     "prepublishOnly": "npm run build && npm test",
-    "smoke:agy": "tsx smoke-agy.ts"
+    "smoke:agy": "tsx smoke-agy.ts",
+    "postinstall": "node scripts/postinstall.mjs"
   },
   "keywords": [
     "claude",

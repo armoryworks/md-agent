@@ -436,14 +436,23 @@ orchestrator, which decides how to propagate it). At a checkpoint you can:
 ## As a Claude Code skill
 
 ```bash
-md-agent skill install      # → ~/.claude/skills/md-agent/SKILL.md
+md-agent skill install            # every project on this machine → ~/.claude/skills/md-agent/
+md-agent skill install --project  # this project only → ./.claude/skills/md-agent/ (commit it to share)
 ```
 
 Teaches Claude Code when a task is a team job (a cheap complete check, parallel
 parts, branches to review, work that outlives the session), how to write a
-launch config, the console commands, and how to read a run. `/md-agent`
-invokes it by name; `md-agent skill uninstall` removes it. The skill ships in
-the npm package under `skills/`.
+launch config, the console commands, and how to read a run. It is picked up at
+the start of the next session, in the CLI, desktop app and IDE extensions;
+`/md-agent <goal>` invokes it by name, or Claude reaches for it on its own when
+a task looks team-sized. `md-agent skill uninstall` removes it, `skill show`
+prints it. The skill ships in the npm package under `skills/`.
+
+You're told about it twice: a notice after `npm install` (where the package
+manager lets install-script output through — npm hides and now gates it by
+default, `--foreground-scripts` shows it), and an offer the **first time the
+home screen opens** on a machine that has Claude Code but not the skill —
+install user-wide, for this project, not now, or don't ask again.
 
 ## Configuration (environment variables)
 

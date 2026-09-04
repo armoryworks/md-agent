@@ -67,16 +67,63 @@ export async function runInit(cwd = process.cwd()): Promise<void> {
   console.log("");
 }
 
-/**
- * `md-agent skill install`: put the bundled Claude Code skill (skills/md-agent/
- * SKILL.md) into ~/.claude/skills/md-agent/, so Claude knows when to reach for
- * a team, how to write a launch config, and how to read a run. `uninstall`
- * removes it; anything else prints the skill.
- */
-export async function installSkill(action = "install"): Promise<void> {
+/** Where the bundled skill file lives in this install. */
+export function bundledSkillPath(): string {
   const here = path.dirname(fileURLToPath(import.meta.url));
-  const src = path.resolve(here, "..", "skills", "md-agent", "SKILL.md");
-  const destDir = path.join(process.env.CLAUDE_SKILLS_DIR?.trim() || path.join(os.homedir(), ".claude", "skills"), "md-agent");
+  return path.resolve(here, "..", "skills", "md-agent", "SKILL.md");
+}
+
+/** Where a skill install lands: user-wide, or this project's .claude/skills. */
+export function skillInstallDir(scope: "user" | "project" = "user"): string {
+  const base =
+    scope === "project"
+      ? path.join(process.cwd(), ".claude", "skills")
+      : process.env.CLAUDE_SKILLS_DIR?.trim() || path.join(os.homedir(), ".claude", "skills");
+  return path.join(base, "md-agent");
+}
+
+export function skillInstalled(scope: "user" | "project" = "user"): boolean {
+  return existsSync(path.join(skillInstallDir(scope), "SKILL.md"));
+}
+
+/** Does this machine look like it has Claude Code? (Its home dir exists.) */
+export function claudeCodePresent(): boolean {
+  return existsSync(path.join(os.homedir(), ".claude"));
+}
+
+/** What the user should know once the skill is in place. */
+export function printSkillWhereItApplies(dest: string, scope: "user" | "project"): void {
+  const dim = (s: string) => t.paint(s, "dim");
+  console.log(` ${t.paint("✔", "green", true)} md-agent skill → ${dest}`);
+  console.log("");
+  console.log(`   ${t.bold("Where it applies")}`);
+  console.log(
+    scope === "user"
+      ? `   Every Claude Code session on this machine — the CLI, the desktop app, the VS Code and JetBrains extensions — in any project.`
+      : `   Claude Code sessions started inside this project (commit .claude/skills/ to share it with the team).`
+  );
+  console.log(`   Picked up at the start of the next session; nothing to restart.`);
+  console.log("");
+  console.log(`   ${t.bold("How it's used")}`);
+  console.log(`   ${dim("·")} Describe a team-sized task — several parts in parallel, a command that can check the result, work that should`);
+  console.log(`     end up as branches to review, or a run that outlives the session — and Claude reaches for md-agent on its own.`);
+  console.log(`   ${dim("·")} Or invoke it by name: ${t.paint("/md-agent", "teal", true)} followed by the goal.`);
+  console.log(`   ${dim("·")} Claude will write the launch config, run it, read the traces, and merge what passed — asking before anything`);
+  console.log(`     that spends money or touches your tree.`);
+  console.log("");
+  console.log(`   ${dim(`md-agent skill uninstall removes it · md-agent skill show prints it`)}`);
+}
+
+/**
+ * `md-agent skill install [--project]`: put the bundled Claude Code skill
+ * (skills/md-agent/SKILL.md) where Claude Code reads skills, so it knows when
+ * to reach for a team, how to write a launch config, and how to read a run.
+ * `uninstall` removes it; `show` prints it.
+ */
+export async function installSkill(action = "install", opts: { scope?: "user" | "project" } = {}): Promise<void> {
+  const scope = opts.scope ?? "user";
+  const src = bundledSkillPath();
+  const destDir = skillInstallDir(scope);
   const dest = path.join(destDir, "SKILL.md");
   if (action === "uninstall") {
     const { rm } = await import("node:fs/promises");
@@ -84,12 +131,15 @@ export async function installSkill(action = "install"): Promise<void> {
     console.log(` ${t.paint("✔", "green", true)} removed ${destDir}`);
     return;
   }
-  if (action !== "install") {
+  if (action === "show") {
     process.stdout.write(await readFile(src, "utf8"));
+    return;
+  }
+  if (action !== "install") {
+    console.log(`usage: md-agent skill install [--project] | uninstall [--project] | show`);
     return;
   }
   await mkdir(destDir, { recursive: true });
   await copyFile(src, dest);
-  console.log(` ${t.paint("✔", "green", true)} installed the md-agent skill → ${dest}`);
-  console.log(`   ${t.paint("Claude Code picks it up on its next session; /md-agent invokes it by name.", "dim")}`);
+  printSkillWhereItApplies(dest, scope);
 }

@@ -39,7 +39,13 @@ const CLONES_DIR = path.join(CONFIG_DIR, "journals");
 const JOURNAL_TOP = new Set(["state.json", "ledger.md", "transcript.md", "context.md", "HALT.txt", "JOURNAL.md", "log", "spill", "teams", "sessions"]);
 const SESSION_KEEP = /\.(cost|window)\.json$/;
 
-export async function readGlobalConfig(): Promise<{ journal?: JournalConfig }> {
+export interface GlobalConfig {
+  journal?: JournalConfig;
+  /** The one-time Claude Code skill offer on the home screen. */
+  skill?: { offeredAt?: string; declined?: boolean };
+}
+
+export async function readGlobalConfig(): Promise<GlobalConfig> {
   try {
     return JSON.parse(await readFile(CONFIG_FILE, "utf8"));
   } catch {
@@ -47,11 +53,18 @@ export async function readGlobalConfig(): Promise<{ journal?: JournalConfig }> {
   }
 }
 
+export async function writeGlobalConfig(patch: Partial<GlobalConfig>): Promise<GlobalConfig> {
+  const cur = await readGlobalConfig();
+  const next = { ...cur, ...patch };
+  await mkdir(CONFIG_DIR, { recursive: true });
+  await writeFile(CONFIG_FILE, JSON.stringify(next, null, 2) + "\n", "utf8");
+  return next;
+}
+
 export async function writeGlobalJournalConfig(patch: Partial<JournalConfig>): Promise<JournalConfig> {
   const cur = await readGlobalConfig();
   const next = { ...(cur.journal ?? {}), ...patch };
-  await mkdir(CONFIG_DIR, { recursive: true });
-  await writeFile(CONFIG_FILE, JSON.stringify({ ...cur, journal: next }, null, 2) + "\n", "utf8");
+  await writeGlobalConfig({ journal: next });
   return next;
 }
 

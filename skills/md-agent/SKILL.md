@@ -39,7 +39,7 @@ Do not use it for judgement-only work with no command to prove the result and no
 | `md-agent --resume runs/<dir> [--quiet]` | Resume a run (seats reattach to sessions). |
 | `md-agent --journey journey.json [--from <phase>]` | Multi-phase run with handshakes between phases; `--from` resumes an unfinished/halted phase in place. |
 | `md-agent --inspect runs/<dir> [--seat <name>]` | A seat's trace: prompts, tool calls, results, denials, cost per turn. |
-| `md-agent skill install` | Put this skill into `~/.claude/skills/`. |
+| `md-agent skill install [--project]` | Put this skill into `~/.claude/skills/` (or the project's `.claude/skills/`). |
 
 In the setup wizard the **goal comes first**, then journals, then a fork: **have Claude plan the team** (a high-tier model reads the goal and the repo and recommends seats, verify, isolation, budget — launch it, save it as the launch file, or adjust by hand) or set it up by hand.
 

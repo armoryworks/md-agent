@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import { checkbox, confirm, select } from "@inquirer/prompts";
 import { resumeOrchestrator, runFromConfig, runOrchestrator } from "./orchestrator.js";
-import { LAUNCH_FILE } from "./init.js";
+import { claudeCodePresent, installSkill, LAUNCH_FILE, skillInstalled } from "./init.js";
 import {
   chooseProjectRemote,
   listRemoteJournals,
@@ -12,6 +12,7 @@ import {
   pushJournal,
   readGlobalConfig,
   resolveJournalConfig,
+  writeGlobalConfig,
   writeGlobalJournalConfig,
 } from "./journal.js";
 import { listSeats, renderSeatLog, showInPager } from "./inspect.js";
@@ -466,7 +467,34 @@ function printCompletionNotes(entries: Entry[]): void {
 
 // ---------- the loop ----------
 
+/**
+ * Once: if Claude Code is on this machine and the skill isn't, offer to
+ * install it — and say where it will apply. "Don't ask again" is remembered;
+ * `md-agent skill install` always works.
+ */
+async function maybeOfferSkill(): Promise<void> {
+  if (!claudeCodePresent() || skillInstalled("user") || skillInstalled("project")) return;
+  const g = await readGlobalConfig();
+  if (g.skill?.declined) return;
+  console.log(` ${t.paint("◆", "amber", true)} ${bold("Claude Code is here.")} ${dim("md-agent can teach it when a task is a team job and how to run one.")}`);
+  const choice = await select<string>({
+    message: "Install the md-agent skill for Claude Code?",
+    choices: [
+      { name: "Yes — for every project on this machine (~/.claude/skills)", value: "user" },
+      { name: "Yes — for this project only (./.claude/skills, shareable with the team)", value: "project" },
+      { name: "Not now", value: "later" },
+      { name: "Don't ask again", value: "never", description: "md-agent skill install still works any time" },
+    ],
+  });
+  await writeGlobalConfig({ skill: { offeredAt: new Date().toISOString(), declined: choice === "never" } });
+  if (choice === "user" || choice === "project") {
+    await installSkill("install", { scope: choice });
+    console.log("");
+  }
+}
+
 export async function runHome(): Promise<void> {
+  await maybeOfferSkill();
   for (;;) {
     const all = await scanRuns("runs");
     const active = all.filter((r) => !r.completedAt);
