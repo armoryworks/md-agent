@@ -181,6 +181,45 @@ don't report them, so for agy-heavy runs use `tokens`. The umbrella shows all
 of it live: per-turn and net spend for each seat and the orchestrator, the run
 total, and `5h 21% · 7d 7%`.
 
+### Journals — a run's record in source control
+
+A run's **journal** is its durable record: `state.json` (goal, seats, context,
+budget, journey reference, end stamp), `ledger.md`, `transcript.md`,
+`context.md`, `log/` (the seat traces), spend files, and a generated
+`JOURNAL.md` cover page. Not the seats' worktrees — those are branches in the
+project repo already — and not the transient inbox/outbox.
+
+Journals never go into the project repo (`runs/` is gitignored there on
+purpose: transcripts and traces carry credentials and internal findings).
+They go to a **private journal repository per project** — `forge-md-agent`,
+`nom-md-agent` — or one shared fallback, configured in
+`~/.config/md-agent/config.json`:
+
+```json
+{ "journal": { "repos": { "forge": "git@github.com:armoryworks/forge-md-agent.git" },
+               "remote": "git@github.com:armoryworks/md-agent-journals.git",
+               "ask": true, "autoPush": false } }
+```
+
+- **At the end of every run** — clean, **interrupted** (ctrl-c), or halted —
+  md-agent asks whether to push the journal. A project with no repo yet is
+  offered `<owner>/<project>-md-agent`, created private with `gh`; or a URL
+  of your own; or the shared repo. Every one of these prompts has **"No, and
+  don't ask again — ever"**, remembered globally; pushing stays available from
+  the home screen. "Yes, and always push" turns on `autoPush`.
+- **Before every push** the remote's visibility is checked (`gh repo view`):
+  a **public** repo is refused outright, an internal or unverifiable one needs
+  an explicit yes. The journal is also scanned for credential shapes (API
+  keys, tokens, private-key blocks) and a hit blocks the push until confirmed.
+- **Home screen → ⇅ Journals**: push runs not yet pushed, pull journals from
+  the repo into `./runs` (they then appear on the home screen — *Continue*,
+  *Look inside a seat*, *Combine* all work on them), change the project's repo,
+  or set the run-end prompt to ask / auto-push / never.
+
+A pulled run's seats can't reattach to sessions from another machine; on
+*Continue* they are re-seeded from the transcript, which is the same fallback
+a local run uses when its session is gone.
+
 ### Looking inside a seat
 
 Every participant's turns are teed verbatim to `runs/<dir>/log/<seat>.jsonl`
@@ -237,7 +276,8 @@ The config is a `LaunchConfig` (see `src/persist.ts`): `goal`, `roles`
 (`{name?, description, model?, provider?, permissionMode?}`), and optional `name`, `context` (path
 to a doc included whole), `inbox` (path to a handshake doc prepended as context),
 `maxMinutes`, `teams`, `budgetMinutes`, `autoComplete`, `kickoff`, `runDir`,
-`verify`, `escalation`, `isolation`, `budget`. Anything omitted (run name, per-role name/model) is filled
+`verify`, `escalation`, `isolation`, `budget`, `journal` (per-run override of
+the journal settings: `{ remote?, autoPush?, ask? }`). Anything omitted (run name, per-role name/model) is filled
 by the one-time bootstrap turn; supply them all and that LLM call is **skipped**,
 so the run starts instantly.
 
@@ -441,6 +481,7 @@ runs/<timestamp>-<name>/
 | `src/index.ts`         | CLI entry / arg parsing (`init`, `--inspect`, …) |
 | `src/home.ts`          | home screen: run discovery, continue/resume/inspect/combine/shelve menus |
 | `src/init.ts`          | `md-agent init` — starter launch config |
+| `src/journal.ts`       | journals: private repo per project, push/pull, visibility + secret checks, the run-end offer |
 | `src/inspect.ts`       | seat traces: render `log/<seat>.jsonl`, pager |
 | `src/theme.ts`         | ArmoryWorks palette, the mark, ANSI helpers |
 | `src/orchestrator.ts`  | setup wizard, run loop, ledger turns, dispatch, checkpoints |

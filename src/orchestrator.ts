@@ -18,6 +18,7 @@ import { parseMarkdown } from "./parse.js";
 import { chooseSelection, renderSelection } from "./select.js";
 import { Dashboard } from "./dashboard.js";
 import { listSeats, ORCH, renderSeatLog, resolveSeat, showInPager } from "./inspect.js";
+import { offerPushAtEnd, type JournalConfig } from "./journal.js";
 import { theme as t } from "./theme.js";
 import { parseTeamBlocks, runHuddle, type TeamIO, type TeamResult, type TeamSpec } from "./team.js";
 import {
@@ -515,6 +516,8 @@ export interface RunSetup {
   journey?: JourneyRef;
   /** Spend ceilings. See {@link BudgetSpec}. */
   budget?: BudgetSpec;
+  /** Journal settings for this run, over the global config. */
+  journal?: JournalConfig;
 }
 
 /**
@@ -630,6 +633,7 @@ export async function launchRun(setup: RunSetup): Promise<void> {
     isolation: setup.isolation,
     journey: setup.journey,
     budget: setup.budget,
+    journal: setup.journal,
   };
   await writeFile(path.join(runDir, "state.json"), JSON.stringify(state, null, 2), "utf8");
 
@@ -691,6 +695,7 @@ export async function launchRun(setup: RunSetup): Promise<void> {
     escalation: state.escalation,
     isolation: state.isolation,
     budget: state.budget,
+    journal: state.journal,
   });
 }
 
@@ -740,6 +745,7 @@ export async function runFromConfig(configPath: string): Promise<void> {
     isolation: cfg.isolation,
     journey: cfg.journey,
     budget: cfg.budget,
+    journal: cfg.journal,
   });
 }
 
@@ -874,6 +880,7 @@ export async function resumeOrchestrator(
     escalation: state.escalation,
     isolation: state.isolation,
     budget: state.budget,
+    journal: state.journal,
   });
 }
 
@@ -916,11 +923,13 @@ interface LoopCtx {
   isolation?: Isolation;
   /** Spend ceilings; checked after every turn. */
   budget?: BudgetSpec;
+  /** Journal settings for this run (the run-end push offer). */
+  journal?: JournalConfig;
 }
 
 /** Shared event loop used by both fresh runs and resumes. */
 async function runLoop(ctx: LoopCtx): Promise<void> {
-  const { runDir, goal, roles, transcript, orch, children, kickoff, teamsEnabled, budgetMinutes, autoComplete, verify, escalation, isolation, budget } = ctx;
+  const { runDir, goal, roles, transcript, orch, children, kickoff, teamsEnabled, budgetMinutes, autoComplete, verify, escalation, isolation, budget, journal } = ctx;
 
   // Give the orchestrator's own claude session a heartbeat file so the watchdog
   // can tell a working turn (recent stream output) from one hung mid-turn. Roles
@@ -1523,6 +1532,16 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     }
     for (const r of roles) {
       await safeWrite(path.join(runDir, "inbox", `${r.name}.txt`), "exit");
+    }
+    // The journal offer — after the audit, before the process goes away. An
+    // interrupted run is exactly the one worth keeping, so this runs on SIGINT
+    // and HALT as well as on a clean end; a second ctrl-c skips it.
+    try {
+      process.stdin.off("keypress", onKeypress);
+      rl.close();
+      await offerPushAtEnd(runDir, journal);
+    } catch (e) {
+      console.warn(`[journal] ${(e as Error).message}`);
     }
     // Give children a moment to exit cleanly
     setTimeout(() => {

@@ -4,6 +4,16 @@ import { readdir, stat } from "node:fs/promises";
 import { checkbox, confirm, select } from "@inquirer/prompts";
 import { resumeOrchestrator, runFromConfig, runOrchestrator } from "./orchestrator.js";
 import { LAUNCH_FILE } from "./init.js";
+import {
+  chooseProjectRemote,
+  listRemoteJournals,
+  projectName,
+  pullJournal,
+  pushJournal,
+  readGlobalConfig,
+  resolveJournalConfig,
+  writeGlobalJournalConfig,
+} from "./journal.js";
 import { listSeats, renderSeatLog, showInPager } from "./inspect.js";
 import { nextPhase, phaseRunDir, readJourney, runJourney, type Journey } from "./journey.js";
 import {
@@ -62,6 +72,8 @@ export interface RunSummary {
   /** `NN-phase-id` when part of a journey, else null. */
   phaseId: string | null;
   journeyRef?: JourneyRef;
+  /** When this run's journal was last pushed, if ever. */
+  journalPushedAt?: string;
 }
 
 /** One selectable row: a standalone run, or a journey grouping its phase runs. */
@@ -128,6 +140,7 @@ export async function scanRuns(baseDir: string): Promise<RunSummary[]> {
         journey: state.journey?.name ?? (m ? m[1] : null),
         phaseId: m ? m[2] : (state.journey ? `${String(state.journey.phaseIndex).padStart(2, "0")}-${state.journey.phaseId}` : null),
         journeyRef: state.journey,
+        journalPushedAt: state.journalPush?.at,
       });
     } catch {
       // not a run dir (or unreadable) — skip silently
@@ -357,6 +370,86 @@ async function inspectRun(runs: RunSummary[]): Promise<void> {
   }
 }
 
+/** Push, pull, and point journals — every prompt carries "never ask again". */
+async function journalsMenu(active: RunSummary[]): Promise<void> {
+  const project = await projectName();
+  let cfg = await resolveJournalConfig(project);
+  const where = cfg.remote ? cfg.remote : t.paint("no repo yet", "amber");
+  const unpushed = active.filter((r) => r.status !== "running" && !r.journalPushedAt);
+  const action = await select<string>({
+    message: `Journals for ${project} → ${where}`,
+    choices: [
+      { name: `⇈ Push ${unpushed.length ? `${unpushed.length} run(s) not yet pushed` : "a run"}`, value: "push" },
+      { name: "⇩ Pull a journal from the repo", value: "pull", description: "copies it into ./runs — Continue and Look inside work on it" },
+      { name: cfg.remote ? "⚙ Change this project's journal repo" : "⚙ Choose or create this project's journal repo", value: "repo" },
+      { name: `⚙ Run-end prompt: ${cfg.ask === false ? "off (never asks)" : cfg.autoPush ? "auto-push" : "ask"}`, value: "ask" },
+      { name: dim("← back"), value: "back" },
+    ],
+  });
+  if (action === "back") return;
+
+  if (action === "repo") {
+    const r = await chooseProjectRemote(project, cfg);
+    if (r && r !== "never") console.log(` ${t.paint("✔", "green", true)} ${project} journals → ${r}`);
+    return;
+  }
+  if (action === "ask") {
+    const mode = await select<string>({
+      message: "At the end of a run (including interrupted ones):",
+      choices: [
+        { name: "Ask whether to push", value: "ask" },
+        { name: "Always push, don't ask", value: "auto" },
+        { name: "Never ask — leave me alone (push from here when I want to)", value: "never" },
+      ],
+    });
+    await writeGlobalJournalConfig(mode === "never" ? { ask: false } : mode === "auto" ? { ask: true, autoPush: true } : { ask: true, autoPush: false });
+    return;
+  }
+  if (!cfg.remote) {
+    const r = await chooseProjectRemote(project, cfg);
+    if (!r || r === "never") return;
+    cfg = await resolveJournalConfig(project);
+  }
+  if (action === "push") {
+    const pool = unpushed.length ? unpushed : active.filter((r) => r.status !== "running");
+    const picked = await checkbox<RunSummary>({
+      message: "Push which runs?",
+      pageSize: 12,
+      choices: pool.map((r) => ({ name: `${r.name}  ${statusTag(r.status)}${r.journalPushedAt ? dim(`  pushed ${timeAgo(Date.parse(r.journalPushedAt))}`) : ""}`, value: r, checked: !r.journalPushedAt })),
+      validate: (items) => items.length > 0 || "pick at least one",
+    });
+    for (const r of picked) {
+      const res = await pushJournal(r.dir, cfg, project, { confirm: (message) => confirm({ message, default: false }) });
+      console.log(` ${res.ok ? t.paint("✔", "green", true) : t.paint("✖", "red", true)} ${r.name}: ${res.detail}`);
+    }
+    return;
+  }
+  if (action === "pull") {
+    const remote = await listRemoteJournals(cfg);
+    const here = new Set(active.map((r) => r.name));
+    const candidates = remote.filter((j) => !here.has(j.run));
+    if (!candidates.length) {
+      console.log(` ${dim("nothing in the journal repo that isn't already here")}`);
+      return;
+    }
+    const picked = await checkbox<(typeof candidates)[number]>({
+      message: "Pull which journals?",
+      pageSize: 12,
+      choices: candidates.map((j) => ({ name: `${j.project}/${j.run}  ${dim(`· ${j.status} · ${ellipsize(j.goal, 60)}`)}`, value: j })),
+      validate: (items) => items.length > 0 || "pick at least one",
+    });
+    for (const j of picked) {
+      try {
+        const dest = await pullJournal(j.dir);
+        console.log(` ${t.paint("✔", "green", true)} ${j.run} → ${path.relative(process.cwd(), dest)}`);
+      } catch (e) {
+        console.log(` ${t.paint("✖", "red", true)} ${j.run}: ${(e as Error).message}`);
+      }
+    }
+    console.log(` ${dim("a pulled run's seats can't reattach to sessions from another machine; on Continue they are re-seeded from the transcript")}`);
+  }
+}
+
 /** What a user should know after shelving runs: where the outputs are. */
 function printCompletionNotes(entries: Entry[]): void {
   console.log("");
@@ -411,6 +504,12 @@ export async function runHome(): Promise<void> {
     if (shelved.length > 0) {
       choices.push({ name: "↺ Restore a shelved run", value: "restore", description: "bring a shelved run back into these menus" });
     }
+    const unpushed = active.filter((r) => r.status !== "running" && !r.journalPushedAt);
+    choices.push({
+      name: `⇅ Journals${unpushed.length ? `  ${t.paint(`${unpushed.length} not pushed`, "amber")}` : ""}`,
+      value: "journals",
+      description: "push run records to this project's private journal repo, pull them from it, or change where they go",
+    });
     if (!hasLaunch) {
       choices.push({ name: dim("⚙ Write a starter launch config (init)"), value: "init", description: `drops ${LAUNCH_FILE} here so the next run skips the wizard` });
     }
@@ -500,6 +599,11 @@ export async function runHome(): Promise<void> {
       const stamp = new Date().toISOString();
       for (const e of picked) for (const r of e.runs) await updateState(r.dir, { completedAt: stamp });
       printCompletionNotes(picked);
+      continue;
+    }
+
+    if (action === "journals") {
+      await journalsMenu(active);
       continue;
     }
 

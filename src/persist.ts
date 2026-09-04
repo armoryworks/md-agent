@@ -253,6 +253,8 @@ export interface RunState {
   verify?: VerifySpec;
   /** Spend ceilings; see {@link BudgetSpec}. */
   budget?: BudgetSpec;
+  /** Journal settings for this run (see journal.ts); merged over the global config. */
+  journal?: { remote?: string; autoPush?: boolean; ask?: boolean };
   /** Where role edits land. Default "none" (shared cwd). See {@link Isolation}. */
   isolation?: Isolation;
   /**
@@ -266,6 +268,10 @@ export interface RunState {
   escalation?: ModelTier[];
   /** Set when this run is one phase of a journey — enough to resume it from the home screen. */
   journey?: JourneyRef;
+  /** Last successful journal push of this run (see journal.ts). */
+  journalPush?: { at: string; remote: string };
+  /** Set when this run dir was pulled from the journal repo rather than created here. */
+  journalPulledAt?: string;
   /** ISO timestamp of the run's clean teardown; absent while running or after a crash. */
   endedAt?: string;
   /** Why the run ended (the stopAll reason), e.g. "phase complete: …", "user typed exit". */
@@ -321,6 +327,8 @@ export interface LaunchConfig {
   isolation?: Isolation;
   /** Spend ceilings; see {@link BudgetSpec}. */
   budget?: BudgetSpec;
+  /** Journal settings for this run, over the global ~/.config/md-agent/config.json. */
+  journal?: { remote?: string; autoPush?: boolean; ask?: boolean };
   /** Set by the journey driver; recorded into state.json for home-screen resume. */
   journey?: JourneyRef;
 }
