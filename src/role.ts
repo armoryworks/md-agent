@@ -17,6 +17,10 @@ import {
   appendSessionRecord,
   buildRoleHistory,
   DEFAULT_SEAT_TOOLS,
+  DEFAULT_TURN_BUDGET_USD,
+  normalizeTier,
+  READ_ONLY_SEAT_TOOLS,
+  type RoleSpec,
   formatUsage,
   logPath,
   normalizeProvider,
@@ -69,7 +73,9 @@ const RECYCLE_TURNS = (() => {
  */
 const RECYCLE_TOKENS = (() => {
   const raw = process.env.MD_AGENT_ROLE_RECYCLE_TOKENS;
-  if (raw == null) return 200_000;
+  // 120k, down from 200k: two review runs re-read 45M tokens of context across
+  // their calls; the resident context is what every call of a turn pays for.
+  if (raw == null) return 120_000;
   const n = Number(raw);
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
 })();
@@ -89,6 +95,21 @@ function roleContextBlock(context: string | undefined, runDir: string): string {
     "Opening excerpt:",
     context.slice(0, 600) + (context.length > 600 ? "\n…[truncated — full text in the file]" : ""),
   ].join("\n");
+}
+
+/** The built-in tools a seat gets: read-only set, its own list, or the default. */
+export function seatTools(me: Pick<RoleSpec, "readOnly" | "tools">): string[] {
+  if (me.readOnly) return READ_ONLY_SEAT_TOOLS;
+  return me.tools ?? DEFAULT_SEAT_TOOLS;
+}
+
+/** A claude seat's per-turn USD cap: its own, else the tier default; 0 = none. */
+export function seatTurnBudget(me: Pick<RoleSpec, "turnBudgetUsd" | "model">): number | undefined {
+  if (me.turnBudgetUsd != null) return me.turnBudgetUsd > 0 ? me.turnBudgetUsd : undefined;
+  const env = Number(process.env.MD_AGENT_TURN_BUDGET_USD);
+  if (Number.isFinite(env)) return env > 0 ? env : undefined;
+  const tier = me.model && me.model in DEFAULT_TURN_BUDGET_USD ? normalizeTier(me.model) : null;
+  return tier ? DEFAULT_TURN_BUDGET_USD[tier] : undefined;
 }
 
 export async function runRole(
@@ -159,6 +180,7 @@ export async function runRole(
       ? ["This seat produces no artifact the run's verify command checks; report findings, not passes."]
       : [];
 
+  const turnBudget = provider === "claude" ? seatTurnBudget(me) : undefined;
   let systemPrompt = [
     `You are the "${roleName}" agent.`,
     `Your role: ${me.description}`,
@@ -176,7 +198,14 @@ export async function runRole(
     "TURN DISCIPLINE (a turn is one agentic loop; every call in it re-reads everything so far — long turns are where quota goes):",
     "- Do ONE slice of the ask per turn: a few files, one change, one check. Run the verify or test once, then REPORT. You will be dispatched again for the next slice.",
     "- Never re-read the whole repository or re-run the full suite to \"confirm\" something you already established this run — trust your earlier turn's finding and say so.",
-    `- A turn is capped at ${turnCapSec}s; if you are near it, stop and report what is done and what is next.`,
+    `- A turn is capped at ${turnCapSec}s${turnBudget ? ` and $${turnBudget}` : ""}; if you are near it, stop and report what is done and what is next.`,
+    "",
+    "READ DISCIPLINE (tool output is three quarters of what you re-read on every call — what you print, you pay for on every later call this turn):",
+    "- Never print a whole file. Read with an offset and a limit, or grep -n with a line budget (`| head -40`); open only the lines a finding needs.",
+    "- Never dump a listing or a log: `wc -l`, `head`, `grep -c` first, then the slice that matters.",
+    "- Checking many items (citations, anchors, rows): BATCH them — one grep with an alternation, or one script over the list that prints only pass/fail per item — never one call per item.",
+    "- Write big content to files with one command, not in pieces; do not echo it back.",
+    ...(me.readOnly ? ["- This seat is READ-ONLY: Read, Grep and Glob only — no shell, no writes. Report findings in your reply; cite file:line."] : []),
     roleContextBlock(state.context, runDir),
   ]
     .filter(Boolean)
@@ -269,10 +298,10 @@ export async function runRole(
       resumeSessionId: resumeId,
       sessionId,
       onSessionId,
-      tools: me.tools ?? DEFAULT_SEAT_TOOLS,
+      tools: seatTools(me),
       noMcp: (me.mcp ?? "none") === "none",
       noSkills: me.skills !== true,
-      maxBudgetUsd: me.turnBudgetUsd,
+      maxBudgetUsd: seatTurnBudget(me),
       fallbackModel: me.fallbackModel,
       addDirs: isolated ? [siblingsDir] : undefined,
       settingSources: me.projectInstructions === false ? "user" : undefined,

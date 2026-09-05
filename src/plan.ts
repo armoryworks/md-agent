@@ -151,6 +151,7 @@ Reply with ONE JSON object and nothing else — no preamble, no fence:
       "model": "opus|sonnet|haiku", "permissionMode": "acceptEdits|bypassPermissions|plan", "escalate": true|false,
       "verify": false | { "cmd": "..." } | omitted (omit = the run's command; false for a review-only seat),
       "fallback": [{ "provider": "claude", "model": "haiku|sonnet" }] | omitted (auto-heal: where the seat moves when its provider runs dry; give every agy seat one),
+      "readOnly": true | omitted (a judging seat — reviewer, challenger, auditor — gets Read/Grep/Glob only; pair with "verify": false),
       "why": "one sentence: why THIS provider and tier for THIS seat — what the work's check is, and what would go wrong on a cheaper or a pricier choice" }
   ],
   "verify": { "cmd": "shell command, exit 0 = pass", "maxFailures": 2, "timeoutSec": 600 } | null,
@@ -206,6 +207,7 @@ export async function planTeam(goal: string, opts: { cwd?: string; model?: strin
     ...(r.escalate === false ? { escalate: false } : {}),
     ...(r.verify === false ? { verify: false as const } : r.verify && typeof r.verify.cmd === "string" ? { verify: { cmd: r.verify.cmd, maxFailures: r.verify.maxFailures ?? 2, timeoutSec: r.verify.timeoutSec ?? 600 } } : {}),
     ...(typeof r.why === "string" && r.why.trim() ? { why: r.why.trim() } : {}),
+    ...(r.readOnly === true ? { readOnly: true } : {}),
     ...(Array.isArray(r.fallback) && r.fallback.length
       ? { fallback: r.fallback.filter((f: unknown) => f && typeof f === "object").map((f: { provider?: string; model?: string }) => ({ provider: normalizeProvider(f.provider ?? "claude"), ...(typeof f.model === "string" ? { model: f.model } : {}) })) }
       : {}),

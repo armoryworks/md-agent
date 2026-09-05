@@ -232,6 +232,17 @@ session carries all of it into the next turn. Three things hold that down:
 - **Per-turn caps** — `roles[].turnBudgetUsd` (claude, `--max-budget-usd`) and
   `roles[].turnMaxSteps` (agy, default 80 tool steps) bound a turn
   deterministically where the wall-clock cap only approximates it.
+- **Read discipline** — tool output is three quarters of what a seat re-reads
+  on every call of a turn (measured across two review runs: 76% of the chars
+  entering seat context were grep/cat/Read output; the seats' own reports were
+  3%). Every seat's mandate now says: never print a whole file, read with
+  offsets and line budgets, batch many checks into one grep or one script.
+  `roles[].readOnly: true` gives a judging seat Read/Grep/Glob only, so it
+  cannot dump files or run suites at all. The recycle-by-size default is 120k
+  resident tokens (was 200k), and a claude seat's turn has a per-tier USD cap
+  by default (opus 5, sonnet 2.5, haiku 1; `roles[].turnBudgetUsd`, 0 = none,
+  `MD_AGENT_TURN_BUDGET_USD` for all) — a capped turn keeps its work on disk
+  and comes back as `[TURN CAPPED]`.
 - **A lean prefix** — every model call re-reads the CLI's fixed prefix (tool
   schemas, MCP servers, skills: ~23k tokens on a typical machine). Seats get the
   built-in tools they need (`roles[].tools`, default Bash/Read/Edit/Write/Glob/
@@ -566,6 +577,8 @@ config/journey path supplies `provider` directly and skips the prompt.
   by md-agent when a seat moves.
 - **`roles[].skills`**, **`roles[].projectInstructions`** — see *Keeping a
   seat's turns small*.
+- **`roles[].readOnly`** — a judging seat: Read, Grep and Glob only (no shell,
+  no writes). Pair with `verify: false`. See *Keeping a seat's turns small*.
 
 `autoComplete` lets the orchestrator **end the run itself** — once the goal is
 met, every role is idle, and all work is committed it emits `[[PHASE-COMPLETE]]`

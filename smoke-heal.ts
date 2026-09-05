@@ -15,7 +15,7 @@ import path from "node:path";
 import { applyFallback, fallbackLadder, nextRung, preflightHeal } from "./src/heal.js";
 import { safeWrite } from "./src/ipc.js";
 import type { RoleSpec, RunState } from "./src/persist.js";
-import { runRole } from "./src/role.js";
+import { runRole, seatTools, seatTurnBudget } from "./src/role.js";
 
 let failures = 0;
 function check(name: string, cond: boolean, detail = ""): void {
@@ -73,6 +73,17 @@ async function main(): Promise<void> {
     let err: unknown;
     try { preflightHeal(stuck, "agy", "quota"); } catch (e) { err = e; }
     check("a dry seat with no ladder still fails the launch, naming the seat", /Seat\(s\) x have no fallback/.test(String(err)), String(err));
+  }
+
+  console.log("seat tool set + turn budget defaults:");
+  {
+    check("readOnly seat gets Read/Grep/Glob only", seatTools({ readOnly: true, tools: ["Bash"] }).join(",") === "Read,Grep,Glob");
+    check("explicit tools otherwise", seatTools({ tools: ["Bash", "Read"] }).join(",") === "Bash,Read");
+    check("default tools when unset", seatTools({}).length === 8);
+    delete process.env.MD_AGENT_TURN_BUDGET_USD;
+    check("tier default budget: opus 5 / sonnet 2.5 / haiku 1", seatTurnBudget({ model: "opus" }) === 5 && seatTurnBudget({ model: "sonnet" }) === 2.5 && seatTurnBudget({ model: "haiku" }) === 1);
+    check("explicit wins; 0 disables", seatTurnBudget({ model: "opus", turnBudgetUsd: 3 }) === 3 && seatTurnBudget({ model: "opus", turnBudgetUsd: 0 }) === undefined);
+    check("a concrete model id has no tier default", seatTurnBudget({ model: "claude-opus-5" }) === undefined);
   }
 
   console.log("live seat heals mid-turn:");

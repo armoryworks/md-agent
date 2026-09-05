@@ -177,8 +177,20 @@ export interface RoleSpec {
   tools?: string[];
   /** Whether the seat sees the user's configured MCP servers. Default "none". */
   mcp?: "inherit" | "none";
-  /** Hard USD cap on one claude turn (`--max-budget-usd`). */
+  /**
+   * Hard USD cap on one claude turn (`--max-budget-usd`). Unset → a per-tier
+   * default (opus 5, sonnet 2.5, haiku 1 — see DEFAULT_TURN_BUDGET_USD); 0 = no
+   * cap. A capped turn is reported as [TURN CAPPED] with its partial work on
+   * disk, so the cap bounds a runaway turn without losing what it did.
+   */
   turnBudgetUsd?: number;
+  /**
+   * A seat that judges rather than produces: it gets Read, Grep and Glob only
+   * (no Bash, no Write), so it cannot dump whole files or run suites by
+   * accident — tool output is three quarters of what a seat re-reads on every
+   * call. It can still read sibling worktrees. Overrides `tools`.
+   */
+  readOnly?: boolean;
   /** Hard cap on tool steps in one agy turn. Default 80. */
   turnMaxSteps?: number;
   /** claude `--fallback-model`: used when the primary is overloaded. */
@@ -216,6 +228,12 @@ export interface RoleSpec {
  * concrete id). Unset → the sonnet tier: coordination re-reads a ledger and
  * routes; it should not inherit whatever premium model the CLI defaults to.
  */
+/** Per-tier default for a claude seat's turn budget (USD), when the seat sets none. */
+export const DEFAULT_TURN_BUDGET_USD: Record<ModelTier, number> = { opus: 5, sonnet: 2.5, haiku: 1 };
+
+/** Tools a read-only (judging) seat gets. */
+export const READ_ONLY_SEAT_TOOLS = ["Read", "Grep", "Glob"];
+
 export function resolveOrchModel(): string {
   const m = process.env.MD_AGENT_ORCH_MODEL?.trim();
   if (!m) return MODEL_IDS.sonnet;
