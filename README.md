@@ -209,6 +209,8 @@ session carries all of it into the next turn. Three things hold that down:
   Grep/WebFetch/WebSearch) and none of the user's MCP servers (`roles[].mcp:
   "inherit"` restores them); the orchestrator gets Read/Glob/Grep and no skills.
   `roles[].effort` and `roles[].fallbackModel` pass through to the CLI.
+- **A fallback ladder** — `roles[].fallback` (or a run-level `fallback`) is
+  where a seat moves when its provider runs dry; see *When a provider runs dry*.
 
 Large shared briefs reach seats the way they reach the orchestrator: a pointer
 to `context.md` plus an excerpt, read on demand rather than resident every turn.
@@ -223,6 +225,33 @@ the orchestrator through its outbox (`[SEAT STOPPED] … OUT OF QUOTA … resets
 a seat that still has quota or drops it. Any other turn error is reported to
 the orchestrator the same way (`[ROLE ERROR] …`) instead of leaving it waiting
 on a seat that will never answer.
+
+**Auto-heal.** A seat with a `fallback` ladder does not stop when its provider
+runs dry — it moves. Each rung is `{ "provider", "model" }` (provider defaults
+to claude, model to the seat's own tier, resolved on that provider); a run-level
+`fallback` is the default for every seat without its own. Two moments heal:
+
+- **At preflight.** If a role provider fails its probe (agy's weekly quota is
+  the usual case), every seat on it is moved to its first usable rung before
+  the run dir exists, the rung's provider is probed too, and the launch goes
+  ahead: `[preflight] seat "sweeper" falls back: agy·gemini-3.8-flash-medium →
+  claude·claude-haiku-4-5`. A seat on the dry provider with no rung still fails
+  the launch, naming the seat. The orchestrator's claude has no stand-in.
+- **Mid-run.** A seat whose turn raises the provider's out-of-quota error
+  records the move in `state.json` (`healed[]`, with the reset time), reseeds a
+  fresh session on the new provider from its mandate plus its transcript
+  history — the dead provider cannot be asked for a handoff — and re-runs the
+  same dispatch. Its reply opens with `[SEAT HEALED] "sweeper" moved from
+  agy·… to claude·… — agy ran out of quota (resets …)`, the umbrella and
+  `--watch` show `← healed from agy·…`, and the orchestrator keeps dispatching to
+  it as normal. Rungs on the provider that just failed are skipped (a quota is
+  per account, not per model), and each rung is used once, so a ladder cannot
+  loop. With no rung left the seat stops itself as above.
+
+```json
+{ "name": "sweeper", "provider": "agy", "model": "sonnet", "escalate": false,
+  "fallback": [{ "provider": "claude", "model": "haiku" }, { "model": "sonnet" }] }
+```
 
 A **loop guard** watches for one seat being dispatched to over and over with
 nothing verified in between — the shape that spends a week of quota on cache
@@ -478,6 +507,9 @@ config/journey path supplies `provider` directly and skips the prompt.
 - **`roles[].tools`, `roles[].mcp`, `roles[].turnBudgetUsd`,
   `roles[].turnMaxSteps`, `roles[].effort`, `roles[].fallbackModel`** — see
   *Keeping a seat's turns small* above.
+- **`roles[].fallback`** / **`fallback`** — the auto-heal ladder, per seat or as
+  the run's default; see *When a provider runs dry*. `roles[].healed` is written
+  by md-agent when a seat moves.
 
 `autoComplete` lets the orchestrator **end the run itself** — once the goal is
 met, every role is idle, and all work is committed it emits `[[PHASE-COMPLETE]]`

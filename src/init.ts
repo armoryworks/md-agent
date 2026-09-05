@@ -26,6 +26,7 @@ export async function runInit(cwd = process.cwd()): Promise<void> {
       goal: "What the team is trying to achieve. Concrete and checkable beats broad.",
       roles: "One seat per role. provider: claude for judgement/review/anything that can be quietly wrong; agy for enumeration, extraction, repeated known edits behind a verifier (content goes to Google). model: opus|sonnet|haiku, or a concrete id.",
       escalate: "false pins a seat at its tier so a verify failure elsewhere can't promote it — keep the cheap seat cheap.",
+      fallback: "Auto-heal: where a seat moves when its provider runs dry (quota, rate limit, not ready at preflight). A ladder of {provider, model}; the seat is reseeded there and the orchestrator is told. Per seat, or run-level as the default.",
       verify: "A shell command that proves the result (tests, build, lint). Exit 0 = pass. Gates completion AND judges each seat's worktree at teardown.",
       isolation: "worktree gives every seat its own branch under runs/<run>/workspaces/<role>; audit with git diff, merge what passes, drop what doesn't.",
       permissionMode: "Headless seats auto-deny tools the host doesn't allow. acceptEdits for file edits; bypassPermissions if the seat must run commands.",
@@ -43,6 +44,7 @@ export async function runInit(cwd = process.cwd()): Promise<void> {
         model: "sonnet",
         escalate: false,
         permissionMode: "acceptEdits",
+        fallback: [{ provider: "claude", model: "haiku" }],
       },
       {
         name: "reviewer",

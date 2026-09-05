@@ -2,6 +2,7 @@ import path from "node:path";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { ClaudeSession, ProviderExhaustedError, type AgentSession } from "./claude.js";
+import { applyFallback, identity, nextRung } from "./heal.js";
 import { AgySession } from "./agy.js";
 import { provisionWorkspace, workspaceBranch } from "./workspace.js";
 import { findSessionByMarker, markerFor, mintSessionId } from "./sessions.js";
@@ -103,9 +104,16 @@ export async function runRole(
   const outbox = path.join(runDir, "outbox", `${roleName}.txt`);
   const transcript = path.join(runDir, "transcript.md");
 
-  const provider = normalizeProvider(me.provider);
-  const model = resolveModelFor(provider, me.model);
-  const turnCapSec = me.turnTimeoutSec ?? (provider === "agy" ? 300 : 600);
+  // The seat's identity can change mid-run (auto-heal onto a fallback provider),
+  // so these are recomputed from `me` rather than fixed at spawn.
+  let provider = normalizeProvider(me.provider);
+  let model = resolveModelFor(provider, me.model);
+  let turnCapSec = me.turnTimeoutSec ?? (provider === "agy" ? 300 : 600);
+  const refreshIdentity = (): void => {
+    provider = normalizeProvider(me.provider);
+    model = resolveModelFor(provider, me.model);
+    turnCapSec = me.turnTimeoutSec ?? (provider === "agy" ? 300 : 600);
+  };
   const runName = path.basename(runDir);
   const repoDir = process.cwd();
 
@@ -362,7 +370,64 @@ export async function runRole(
       return true;
     }
 
-    await safeWrite(outbox, reply);
+    await safeWrite(outbox, healNote ? `${healNote}\n\n${reply}` : reply);
+    healNote = null;
+    return true;
+  };
+
+  /** Prepended to the next reply so the orchestrator learns the seat moved. */
+  let healNote: string | null = null;
+
+  /**
+   * Auto-heal: the provider ran dry mid-turn. Move down the seat's fallback
+   * ladder (its own, else the run's), record the move in state.json so a resume
+   * and the orchestrator see the new identity, and reseed a FRESH session on the
+   * new provider from the mandate plus this seat's transcript history — the old
+   * session cannot be asked for a handoff, its provider is the thing that failed.
+   * Returns false when there is no rung left, and the seat stops itself as before.
+   */
+  const healSelf = async (err: ProviderExhaustedError): Promise<boolean> => {
+    const rung = nextRung(me, err.provider, state.fallback);
+    if (!rung) return false;
+    const rec = applyFallback(me, rung, err.message, err.resetsAt);
+    try {
+      const cur = await readState(runDir);
+      const mine = cur.roles.find((r) => r.name === roleName);
+      if (mine) {
+        mine.provider = me.provider;
+        mine.model = me.model;
+        mine.healed = me.healed;
+        mine.turnTimeoutSec = me.turnTimeoutSec;
+        mine.turnMaxSteps = me.turnMaxSteps;
+        await updateState(runDir, { roles: cur.roles });
+      }
+    } catch {
+      // state is best-effort; the reply's heal note still reaches the orchestrator
+    }
+    refreshIdentity();
+    const resetNote = err.resetsAt
+      ? ` (it resets ${new Date(err.resetsAt * 1000).toISOString()})`
+      : "";
+    console.warn(
+      `[role:${roleName}] ${rec.from.provider} ran dry${resetNote} — healing onto ${identity(rec.to)} (rung ${me.healed?.length ?? 1})`
+    );
+    gen++;
+    let seed = baseSystemPrompt +
+      `\n\nYOU WERE MOVED HERE MID-RUN: your previous session ran on ${identity(rec.from)}, which ran out of quota. ` +
+      "You are a fresh session of the same role on a different provider. Nothing of the previous session's working memory survives except what is below and what is on disk in your workspace — re-read files rather than assume.";
+    try {
+      const history = buildRoleHistory(await readFile(transcript, "utf8"), roleName);
+      if (history) {
+        seed += "\n\n----- PRIOR CONVERSATION (your memory of the run so far) -----\n" + history + "\n----- END PRIOR CONVERSATION -----";
+      }
+    } catch {
+      // no transcript yet — the mandate alone seeds the new session
+    }
+    session = makeSession(seed);
+    turnsSinceSpawn = 0;
+    healNote =
+      `[SEAT HEALED] "${roleName}" moved from ${identity(rec.from)} to ${identity(rec.to)} — ${rec.from.provider} ran out of quota${resetNote}. ` +
+      "It was reseeded from its transcript history; this reply is from the new seat. Keep dispatching to it as before.";
     return true;
   };
 
@@ -407,7 +472,17 @@ export async function runRole(
     try {
       while (content !== null && !stopped) {
         pendingRecheck = false;
-        await processOne(content);
+        // A dry provider is healed and the same dispatch re-run on the new seat;
+        // the ladder is consumed one rung per failure, so this cannot loop.
+        for (;;) {
+          try {
+            await processOne(content);
+            break;
+          } catch (err) {
+            if (err instanceof ProviderExhaustedError && (await healSelf(err))) continue;
+            throw err;
+          }
+        }
         if (pendingRecheck) {
           content = await readIfReady(inbox);
         } else {

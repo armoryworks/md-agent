@@ -69,7 +69,7 @@ export interface WatchFrame {
   spend: { usd: number; tokens: number; turns: number };
   windows: { fiveHour?: number; sevenDay?: number };
   orchestrator: { turns: number; last: string; sinceMs: number };
-  seats: { name: string; provider: string; model: string; state: SeatState; sinceMs: number; turns: number; usd: number; tokens: number; handoffTo?: string; stoppedReason?: string }[];
+  seats: { name: string; provider: string; model: string; state: SeatState; sinceMs: number; turns: number; usd: number; tokens: number; handoffTo?: string; stoppedReason?: string; healedFrom?: string }[];
   events: Event[];
 }
 
@@ -147,6 +147,7 @@ export async function readFrame(runDir: string): Promise<WatchFrame> {
       tokens: usageTokens(cost),
       handoffTo: r.stopped?.handoffTo,
       stoppedReason: r.stopped?.reason,
+      healedFrom: r.healed?.length ? `${r.healed[0].from.provider}·${r.healed[0].from.model}` : undefined,
     });
   }
 
@@ -400,7 +401,7 @@ export async function runDigest(runDir: string): Promise<Digest> {
       s.state === "stopped" ? `stopped${s.handoffTo ? ` → ${s.handoffTo}` : ""}${s.stoppedReason ? ` (${s.stoppedReason.slice(0, 60)})` : ""}` :
       s.state === "working" ? `working ${ago(s.sinceMs)}` :
       s.state === "replied" ? `replied ${ago(s.sinceMs)} ago` : s.state;
-    lines.push(`  ${s.name} [${s.provider}·${s.model.replace(/^claude-|^gemini-/, "")}]: ${stateText} · ${s.turns}t · $${s.usd.toFixed(2)} · ${Math.round(s.tokens / 1000)}k tok${calls ? ` · ${calls}` : ""}`);
+    lines.push(`  ${s.name} [${s.provider}·${s.model.replace(/^claude-|^gemini-/, "")}${s.healedFrom ? ` ← healed from ${s.healedFrom.replace(/claude-|gemini-/, "")}` : ""}]: ${stateText} · ${s.turns}t · $${s.usd.toFixed(2)} · ${Math.round(s.tokens / 1000)}k tok${calls ? ` · ${calls}` : ""}`);
     if (d.current && s.state === "working") lines.push(`      on: ${d.current}`);
     if (d.lastSaid) lines.push(`      last: ${d.lastSaid}`);
   }

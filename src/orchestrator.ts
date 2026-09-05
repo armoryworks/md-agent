@@ -1,3 +1,4 @@
+import { identity, preflightHeal, type FallbackRung } from "./heal.js";
 import path from "node:path";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -235,26 +236,47 @@ function probeProvider(p: Provider): Promise<{ ok: boolean; detail: string; usag
  * mid-run. Skip with MD_AGENT_SKIP_PREFLIGHT=1 (offline / fast iteration). Resolves
  * with what the probes cost, for the run's books.
  */
-async function preflightAgents(providers: Set<Provider>): Promise<Usage[]> {
+async function preflightAgents(
+  roles: RoleSpec[],
+  runFallback?: FallbackRung | FallbackRung[]
+): Promise<{ usage: Usage[]; healed: number }> {
   if (/^(1|true|on|yes)$/i.test(process.env.MD_AGENT_SKIP_PREFLIGHT ?? "")) {
     console.log("[preflight] skipped (MD_AGENT_SKIP_PREFLIGHT)");
-    return [];
+    return { usage: [], healed: 0 };
   }
   const spent: Usage[] = [];
-  for (const p of providers) {
+  let healed = 0;
+  const probed = new Set<Provider>();
+  // Providers a heal moves seats onto are probed too, so a fallback that is
+  // itself dry fails here rather than one turn into the run.
+  const queue = [...runProviders(roles)];
+  while (queue.length) {
+    const p = queue.shift()!;
+    if (probed.has(p)) continue;
+    probed.add(p);
     process.stdout.write(`[preflight] probing ${p}… `);
     const { ok, detail, usage } = await probeProvider(p);
     if (!ok) {
       console.log("FAIL");
-      throw new Error(
-        `[preflight] agent "${p}" is not ready — ${detail}\n` +
-          `Fix it (auth / install / rate limit) or set MD_AGENT_SKIP_PREFLIGHT=1 to bypass.`
-      );
+      if (p === "claude") {
+        // The orchestrator itself runs on claude; nothing can stand in for it.
+        throw new Error(
+          `[preflight] agent "${p}" is not ready — ${detail}\n` +
+            `Fix it (auth / install / rate limit) or set MD_AGENT_SKIP_PREFLIGHT=1 to bypass.`
+        );
+      }
+      const heal = preflightHeal(roles, p, detail, runFallback);
+      for (const { role, rec } of heal.healed) {
+        console.log(`[preflight] seat "${role.name}" falls back: ${identity(rec.from)} → ${identity(rec.to)}`);
+        healed++;
+      }
+      for (const np of heal.needProviders) if (!probed.has(np)) queue.push(np);
+      continue;
     }
     if (usage) spent.push(usage);
     console.log("ok");
   }
-  return spent;
+  return { usage: spent, healed };
 }
 
 /** Collect the distinct providers a run uses: the orchestrator (claude) + role providers. */
@@ -334,7 +356,9 @@ function buildOrchSystem(state: RunState, runDir: string | null): string {
         `  ${i + 1}. ${r.name ? `(name: ${r.name}) ` : "(name: ?) "}${r.description}` +
         (r.stopped
           ? `  [STOPPED by the user${r.stopped.handoffTo ? `; its work went to ${r.stopped.handoffTo}` : ""} — never dispatch to it]`
-          : "")
+          : r.healed?.length
+            ? `  [now on ${identity(r.healed[r.healed.length - 1].to)} — its ${r.healed[r.healed.length - 1].from.provider} ran out of quota; dispatch to it as normal]`
+            : "")
     ),
     orchContextBlock(state.context, runDir),
     ...orchHarnessLines(state),
@@ -774,6 +798,8 @@ export interface RunSetup {
   journey?: JourneyRef;
   /** Spend ceilings. See {@link BudgetSpec}. */
   budget?: BudgetSpec;
+  /** Default auto-heal ladder for seats without their own `fallback`. */
+  fallback?: FallbackRung | FallbackRung[];
   /** Journal settings for this run, over the global config. */
   journal?: JournalConfig;
   /** What the planner turn cost, when one ran — booked into the run once it has a dir. */
@@ -794,10 +820,10 @@ export async function launchRun(setup: RunSetup): Promise<void> {
   const roles = setup.roles.map((r) => ({ ...r }));
   // P4: fail fast if a configured agent isn't authed/responsive — before the
   // bootstrap turn, the run dir, or any role spawn.
-  const preflightUsage = await preflightAgents(runProviders(roles));
+  const preflight = await preflightAgents(roles, setup.fallback);
   // Turns taken before the run dir exists are booked once it does, so the
   // run's Σ (and its journal) carries what the setup actually cost.
-  const earlyUsage: { who: string; u: Usage }[] = preflightUsage.map((u) => ({ who: "preflight", u }));
+  const earlyUsage: { who: string; u: Usage }[] = preflight.usage.map((u) => ({ who: "preflight", u }));
   if (setup.plannerUsage) earlyUsage.push({ who: "planner", u: setup.plannerUsage });
 
   let runName = setup.runName ? slug(setup.runName) : "";
@@ -913,6 +939,7 @@ export async function launchRun(setup: RunSetup): Promise<void> {
     isolation: setup.isolation,
     journey: setup.journey,
     budget: setup.budget,
+    fallback: setup.fallback,
     journal: setup.journal,
   };
   await writeFile(path.join(runDir, "state.json"), JSON.stringify(state, null, 2), "utf8");
@@ -1031,6 +1058,7 @@ export async function runFromConfig(configPath: string): Promise<void> {
     isolation: cfg.isolation,
     journey: cfg.journey,
     budget: cfg.budget,
+    fallback: cfg.fallback,
     journal: cfg.journal,
   });
 }
@@ -1145,7 +1173,11 @@ export async function resumeOrchestrator(
   await appendTranscript(transcript, "RUN RESUMED", `Resumed from ${runDir}`);
 
   // P4: probe agents before re-spawning roles (resume is a common post-rate-limit path).
-  for (const u of await preflightAgents(runProviders(roles))) await recordUsage(runDir, "preflight", u);
+  {
+    const pre = await preflightAgents(roles, state.fallback);
+    for (const u of pre.usage) await recordUsage(runDir, "preflight", u);
+    if (pre.healed) await updateState(runDir, { roles });
+  }
 
   // A seat the user stopped stays stopped across a resume; the orchestrator is
   // told about it in its system prompt and refused if it dispatches there.
@@ -1921,6 +1953,27 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
       await appendTranscript(transcript, `← ${r.name}`, content); // full reply → permanent record
       await clearFile(outbox);
       printRoleReply(r.name, content);
+      // Auto-heal: the seat moved to a fallback provider mid-run and wrote the
+      // new identity to state.json; mirror it here so the panel, the prompt's
+      // role list and any later escalation see the seat as it now is.
+      if (content.startsWith("[SEAT HEALED]")) {
+        try {
+          const fresh = await readState(runDir);
+          const mine = fresh.roles.find((x) => x.name === r.name);
+          if (mine) {
+            r.provider = mine.provider;
+            r.model = mine.model;
+            r.healed = mine.healed;
+            r.turnTimeoutSec = mine.turnTimeoutSec;
+            r.turnMaxSteps = mine.turnMaxSteps;
+            const prov = normalizeProvider(mine.provider);
+            dash.setSeatModel(r.name, prov, resolveModelFor(prov, mine.model));
+            console.warn(`[orchestrator] seat "${r.name}" healed onto ${prov}·${resolveModelFor(prov, mine.model)}`);
+          }
+        } catch {
+          // the note itself still reaches the orchestrator as an event
+        }
+      }
       // P2: choke-point. The transcript keeps the full reply, but a pathologically
       // large one is spilled to a file and the orchestrator gets a head excerpt +
       // pointer, so a misbehaving role can't blow up its resident context.

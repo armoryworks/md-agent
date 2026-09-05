@@ -150,6 +150,7 @@ Reply with ONE JSON object and nothing else — no preamble, no fence:
     { "name": "kebab-name", "description": "what this seat owns and how it reports", "provider": "claude|agy",
       "model": "opus|sonnet|haiku", "permissionMode": "acceptEdits|bypassPermissions|plan", "escalate": true|false,
       "verify": false | { "cmd": "..." } | omitted (omit = the run's command; false for a review-only seat),
+      "fallback": [{ "provider": "claude", "model": "haiku|sonnet" }] | omitted (auto-heal: where the seat moves when its provider runs dry; give every agy seat one),
       "why": "one sentence: why THIS provider and tier for THIS seat — what the work's check is, and what would go wrong on a cheaper or a pricier choice" }
   ],
   "verify": { "cmd": "shell command, exit 0 = pass", "maxFailures": 2, "timeoutSec": 600 } | null,
@@ -205,6 +206,9 @@ export async function planTeam(goal: string, opts: { cwd?: string; model?: strin
     ...(r.escalate === false ? { escalate: false } : {}),
     ...(r.verify === false ? { verify: false as const } : r.verify && typeof r.verify.cmd === "string" ? { verify: { cmd: r.verify.cmd, maxFailures: r.verify.maxFailures ?? 2, timeoutSec: r.verify.timeoutSec ?? 600 } } : {}),
     ...(typeof r.why === "string" && r.why.trim() ? { why: r.why.trim() } : {}),
+    ...(Array.isArray(r.fallback) && r.fallback.length
+      ? { fallback: r.fallback.filter((f: unknown) => f && typeof f === "object").map((f: { provider?: string; model?: string }) => ({ provider: normalizeProvider(f.provider ?? "claude"), ...(typeof f.model === "string" ? { model: f.model } : {}) })) }
+      : {}),
   }));
   if (!roles.length) throw new Error("planner proposed no seats");
   const plan: TeamPlan = {

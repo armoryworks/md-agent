@@ -25,6 +25,7 @@ Do not use it for judgement-only work with no command to prove the result and no
 - **Seats**: `provider: "claude"` for judgement, review, anything that can be quietly wrong, customer-facing or legal surfaces; `provider: "agy"` for enumeration, extraction to a schema, applying a known change repeatedly, first-pass drafts a verifier will check. agy content goes to Google — never health, client, or confidential data. Tiers `opus | sonnet | haiku` map per provider (agy: `gemini-3.1-pro-low` / `3.8-flash-medium` / `3.8-flash-low` — low/medium reasoning on purpose; Antigravity's individual plan is a **weekly** cap); a concrete model id passes through. A seat's turn is a long agentic loop inside its CLI, so give agy seats small, well-scoped asks; `turnTimeoutSec` caps a turn (300 agy / 600 claude). `escalate: false` pins a cheap seat so a verify failure elsewhere can't promote it.
 - **Isolation**: `"worktree"` gives each seat its own git worktree + branch `md-agent/<run>/<seat>`; nothing lands in the user's tree until merged. Needs a git repo.
 - **Verify**: `{ "cmd": "npm test", "maxFailures": 2 }`. Every seat reply that changed its workspace is checked **there**; a seat that claims done while it fails gets the output straight back. An untouched workspace is not judged. A review-only seat gets `"verify": false` (or its own `{cmd}`), so it is never bounced for an artifact another seat owns. The run completes only when every changed workspace passes. `escalation: ["sonnet","opus"]` promotes unpinned seats on repeated failure.
+- **Auto-heal**: give every agy seat a `fallback` ladder — `"fallback": [{"provider":"claude","model":"haiku"}]` (or a run-level `fallback` as the default). If agy fails its preflight probe the seat is moved to the rung before launch; if it runs dry mid-run the seat reseeds itself on the rung from its transcript history, re-runs the dispatch, and its reply opens with `[SEAT HEALED]`. With no ladder the seat stops itself and the orchestrator reassigns. Rungs on the failed provider are skipped; each rung is used once.
 - **Turn caps**: `turnBudgetUsd` (claude) and `turnMaxSteps` (agy, default 80) bound one turn; `tools` (default Bash/Read/Edit/Write/Glob/Grep/WebFetch/WebSearch) and `mcp: "none"` (default) keep the per-call prefix lean; `effort`, `fallbackModel` pass through.
 - **Admit**: teardown prints each seat's branch, diffstat and PASS/FAIL; the user merges what passed (`git merge <branch>`) and drops the rest (`git worktree remove <dir>`).
 - Seats that edit need `permissionMode: "acceptEdits"`; seats that run commands need `"bypassPermissions"` (headless agents can't prompt).
@@ -60,7 +61,7 @@ Before launching, **put each seat to the user** — never pick a provider or tie
   - `agy · pro-low` — Gemini Pro at low reasoning; breadth with some judgement, behind a verifier. 1.5× Antigravity units, weekly cap.
   - `agy · flash-medium` — enumeration, extraction, applying a known change, first drafts a command checks. 1× units, weekly cap.
   - `agy · flash-low` — the cheapest seat: bulk, mechanical, fully verifiable. 1× units, weekly cap.
-- The user's pick replaces the recommendation. For an agy seat, also ask whether escalation may promote it (default no — keep the cheap seat cheap), and note that `acceptEdits` on agy grants edits but not commands.
+- The user's pick replaces the recommendation. For an agy seat, also ask whether escalation may promote it (default no — keep the cheap seat cheap), and note that `acceptEdits` on agy grants edits but not commands. Always give an agy seat a claude fallback rung (haiku for enumeration, sonnet for sweeps that read code) so a dry Antigravity quota heals instead of stopping the seat; say which rung in the same question.
 
 The wizard's *Review each seat* step does the same thing interactively; the rule here is for when Claude writes the launch config itself.
 
@@ -71,7 +72,7 @@ The wizard's *Review each seat* step does the same thing interactively; the rule
   "name": "lint-sweep",
   "goal": "Fix every lint:standards violation in src/ without changing behavior; keep the ratchet green.",
   "roles": [
-    { "name": "worker",   "description": "Enumerate violations, fix each, run the check, report file paths.", "provider": "agy",    "model": "sonnet", "escalate": false, "permissionMode": "acceptEdits" },
+    { "name": "worker",   "description": "Enumerate violations, fix each, run the check, report file paths.", "provider": "agy",    "model": "sonnet", "escalate": false, "permissionMode": "acceptEdits", "fallback": [{ "provider": "claude", "model": "haiku" }] },
     { "name": "reviewer", "description": "Read the worker's diff for behavior drift; say no when it should.",     "provider": "claude", "model": "opus",   "permissionMode": "acceptEdits", "verify": false }
   ],
   "verify": { "cmd": "npm run lint:standards && npm test", "maxFailures": 2 },

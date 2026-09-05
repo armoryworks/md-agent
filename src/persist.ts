@@ -1,3 +1,4 @@
+import type { FallbackRung, HealRecord } from "./heal.js";
 import path from "node:path";
 import { existsSync } from "node:fs";
 import { appendFile, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
@@ -182,6 +183,16 @@ export interface RoleSpec {
   turnMaxSteps?: number;
   /** claude `--fallback-model`: used when the primary is overloaded. */
   fallbackModel?: string;
+  /**
+   * Auto-heal ladder: where this seat moves when its provider runs dry (quota
+   * reached, rate-limited, not ready at preflight). Each rung names a provider
+   * (default claude) and a model (default this seat's tier, resolved on that
+   * provider). Rungs on the provider that just failed are skipped. Unset → the
+   * run's `fallback`, else the seat stops itself as before.
+   */
+  fallback?: FallbackRung | FallbackRung[];
+  /** Moves this seat has made down its ladder, oldest first. Written by md-agent. */
+  healed?: HealRecord[];
   /** Reasoning effort for the seat's CLI (`--effort low|medium|high`; claude also xhigh|max). */
   effort?: string;
 }
@@ -268,6 +279,8 @@ export interface VerifySpec {
 export interface RunState {
   goal: string;
   roles: RoleSpec[];
+  /** Default auto-heal ladder (see LaunchConfig.fallback); seats read it at heal time. */
+  fallback?: FallbackRung | FallbackRung[];
   context?: string;
   /**
    * Set (ISO timestamp) when the user marks the run complete from the home
@@ -373,6 +386,8 @@ export interface LaunchConfig {
   isolation?: Isolation;
   /** Spend ceilings; see {@link BudgetSpec}. */
   budget?: BudgetSpec;
+  /** Default auto-heal ladder for every seat without its own `fallback`. */
+  fallback?: FallbackRung | FallbackRung[];
   /** Journal settings for this run, over the global ~/.config/md-agent/config.json. */
   journal?: { remote?: string; autoPush?: boolean; ask?: boolean };
   /** Set by the journey driver; recorded into state.json for home-screen resume. */

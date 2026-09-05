@@ -1,3 +1,4 @@
+import type { FallbackRung } from "./heal.js";
 import path from "node:path";
 import { existsSync } from "node:fs";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
@@ -51,6 +52,8 @@ export interface JourneyPhase {
   isolation?: Isolation;
   /** Spend ceilings for this phase. See {@link BudgetSpec}. */
   budget?: BudgetSpec;
+  /** Default auto-heal ladder for the phase's seats (see LaunchConfig.fallback). */
+  fallback?: FallbackRung | FallbackRung[];
 }
 
 /** A templated multi-phase run, authored up front before phase 0 executes. */
@@ -202,6 +205,7 @@ export async function runJourney(manifestPath: string, opts: { from?: string } =
       escalation: phase.escalation,
       isolation: phase.isolation,
       budget: phase.budget,
+      fallback: phase.fallback,
       runDir,
       journey: ref,
     };

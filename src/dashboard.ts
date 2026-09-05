@@ -240,6 +240,15 @@ export class Dashboard {
     if (detail?.handoffTo) s.handoffTo = detail.handoffTo;
   }
 
+  /** A seat healed onto another provider/model mid-run. */
+  setSeatModel(name: string, provider: string, model: string): void {
+    const s = this.seat(name);
+    if (!s) return;
+    s.provider = provider;
+    s.model = model;
+    this.redraw();
+  }
+
   /** Override a seat's state outside the send/reply flow (watchdog, huddles, stops). */
   setSeatState(name: string, state: SeatState, detail?: { handoffTo?: string }): void {
     const s = this.seat(name);
