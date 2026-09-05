@@ -12,6 +12,7 @@ import {
   readState,
   recentCheckpoints,
   recordUsage,
+  resolveOrchModel,
   type RoleSpec,
   type RunState,
   type VerifySpec,
@@ -406,6 +407,10 @@ async function writeHandshakes(
       systemPrompt: sys,
       model: resolveHandshakeModel(),
       stateless: true,
+      tools: [],
+      noMcp: true,
+      noSkills: true,
+      noPersist: true,
     });
     reply = await session.send(event);
     const u = session.lastUsage;
@@ -456,9 +461,9 @@ function parseHandshakes(text: string): HandshakeBlock[] {
   return out;
 }
 
-/** Model for the short handshake turn — its own knob, else the orch model, else CLI default. */
-function resolveHandshakeModel(): string | undefined {
-  const m = (process.env.MD_AGENT_HANDSHAKE_MODEL ?? process.env.MD_AGENT_ORCH_MODEL)?.trim();
-  if (!m) return undefined;
+/** Model for the short handshake turn — its own knob, else the orchestrator's (never the CLI default, which may be a premium model). */
+function resolveHandshakeModel(): string {
+  const m = process.env.MD_AGENT_HANDSHAKE_MODEL?.trim();
+  if (!m) return resolveOrchModel();
   return m in MODEL_IDS ? MODEL_IDS[m as ModelTier] : m;
 }

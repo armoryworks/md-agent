@@ -171,8 +171,10 @@ dropped and reported back.
 
 ### Verify where the work is
 
-With a `verify` command set, **every seat reply is checked in that seat's own
-workspace** before the orchestrator sees it. A reply that claims to be done
+With a `verify` command set, **every seat reply that changed its workspace is
+checked there** before the orchestrator sees it (an isolated workspace with no
+changes is not judged — the same rule the completion gate uses — and a seat can
+carry its own `verify`, or `verify: false` for a review-only seat). A reply that claims to be done
 while the check fails is sent straight back to the seat with the output — no
 orchestrator turn is spent relaying it — up to `maxFailures` times; after that
 (or for replies that are not completion claims) the result is attached to the
@@ -194,9 +196,19 @@ session carries all of it into the next turn. Three things hold that down:
 - **A turn cap** — `roles[].turnTimeoutSec`, default 300 for agy and 600 for
   claude. A turn that runs past it is stopped and reported to the orchestrator
   as an ask that was too big for one turn, so it re-scopes rather than repeats.
-- **Recycling by size** — a session whose last turn processed more than
-  `MD_AGENT_ROLE_RECYCLE_TOKENS` (default 200k) tokens is reseeded from a
-  handoff note before its next dispatch, in addition to the every-8-turns rule.
+- **Recycling by size** — a session whose *resident context* (what its last
+  model call read, and so what every call of the next turn would re-read) is
+  over `MD_AGENT_ROLE_RECYCLE_TOKENS` (default 200k) is reseeded from a handoff
+  note before its next dispatch, in addition to the every-8-turns rule.
+- **Per-turn caps** — `roles[].turnBudgetUsd` (claude, `--max-budget-usd`) and
+  `roles[].turnMaxSteps` (agy, default 80 tool steps) bound a turn
+  deterministically where the wall-clock cap only approximates it.
+- **A lean prefix** — every model call re-reads the CLI's fixed prefix (tool
+  schemas, MCP servers, skills: ~23k tokens on a typical machine). Seats get the
+  built-in tools they need (`roles[].tools`, default Bash/Read/Edit/Write/Glob/
+  Grep/WebFetch/WebSearch) and none of the user's MCP servers (`roles[].mcp:
+  "inherit"` restores them); the orchestrator gets Read/Glob/Grep and no skills.
+  `roles[].effort` and `roles[].fallbackModel` pass through to the CLI.
 
 Large shared briefs reach seats the way they reach the orchestrator: a pointer
 to `context.md` plus an excerpt, read on demand rather than resident every turn.
@@ -286,6 +298,20 @@ They go to a **private journal repository per project** — `forge-md-agent`,
 A pulled run's seats can't reattach to sessions from another machine; on
 *Continue* they are re-seeded from the transcript, which is the same fallback
 a local run uses when its session is gone.
+
+### Finding a seat's session again
+
+Every seat's first prompt opens with a marker line `[md-agent <run>/<seat>#<gen>]`
+(`gen` is 0 for the first session and +1 per recycle), and a claude seat starts
+on an id md-agent mints from the same string (`--session-id`), recorded in
+`sessions/` before the first turn runs. On resume a seat reattaches to its stored
+id; with no stored id it searches the CLI's own store for its marker
+(`~/.claude/projects/*/<id>.jsonl`, `~/.gemini/antigravity-cli/brain/<conversation>/`)
+and reattaches to the latest generation it finds; only then does it fall back to
+replaying its transcript history. A journal carries the claude session files under
+`sessions/claude/`, and a pull puts them where that machine's CLI will look, so a
+run continued elsewhere reattaches too (paths inside the old conversation are
+stale there; the resume kickoff says so).
 
 ### Looking inside a seat
 
@@ -445,6 +471,13 @@ config/journey path supplies `provider` directly and skips the prompt.
   dispatch) before the circuit breaker HALTs.
 - **`roles[].permissionMode`** — claude CLI `--permission-mode` for that role's
   session (e.g. `acceptEdits`). See `MD_AGENT_ROLE_PERMISSION_MODE` below.
+- **`roles[].verify`** — this seat's own check over the run's: a `{cmd, …}`
+  spec, or `false` for a seat that produces nothing the command can check (a
+  reviewer). The seat's mandate names the command it is judged by, and its
+  workspace and branch.
+- **`roles[].tools`, `roles[].mcp`, `roles[].turnBudgetUsd`,
+  `roles[].turnMaxSteps`, `roles[].effort`, `roles[].fallbackModel`** — see
+  *Keeping a seat's turns small* above.
 
 `autoComplete` lets the orchestrator **end the run itself** — once the goal is
 met, every role is idle, and all work is committed it emits `[[PHASE-COMPLETE]]`
@@ -542,7 +575,7 @@ npm hides install-script output and flags packages that have one.)
 | `MD_AGENT_ORCH_MODEL`     | `sonnet`     | The orchestrator's model — a tier (`opus`/`sonnet`/`haiku`) or a concrete model id. It re-reads a ledger and routes, so it does not inherit the CLI's default model; set `opus` when there is no `verify` and judgement is the whole job. |
 | `MD_AGENT_PLANNER_MODEL`  | `claude-fable-5-1` | The model that plans a team in the wizard's *Have Claude plan it* fork — a tier or a concrete id. |
 | `MD_AGENT_ORCH_TOOLS`     | unset        | `all` gives the orchestrator its edit tools back (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Bash`). Off by default: a coordinator that can edit will do the seats' work itself. |
-| `MD_AGENT_HANDSHAKE_MODEL`| *(orch model, then CLI default)* | Model for the short between-phase handshake turn in a `--journey` run. Falls back to `MD_AGENT_ORCH_MODEL`, then the CLI default. |
+| `MD_AGENT_HANDSHAKE_MODEL`| *(orch model)* | Model for the short between-phase handshake turn in a `--journey` run. Falls back to `MD_AGENT_ORCH_MODEL` (never the CLI default, which may be a premium model). |
 | `MD_AGENT_CHECKPOINT_GRACE`| `120`        | Seconds a checkpoint waits for your input before auto-continuing and arming the next one. `0` = wait indefinitely (block until you respond — the old behavior). |
 | `MD_AGENT_HEARTBEAT_STALL` | `360`        | Seconds a role's claude turn may produce **no stream output** before the watchdog treats it as hung and re-spawns it (resuming its session) + re-issues the work. The session beats a heartbeat on every output chunk, so a busy turn stays fresh; only a genuinely stuck turn (e.g. a tool call that never returns) goes silent this long. A dead (crashed) role is recovered immediately via its exit event regardless. |
 | `MD_AGENT_TEAMS`          | off          | Pre-sets the **"allow sub-teams?"** setup-wizard prompt to "yes". Sub-teams are opt-in **per run** — the wizard asks at setup and the choice is stored in `state.json`. When allowed, the orchestrator may send two roles into a 1:1 **huddle** (`TEAM: <name> members=a,b`): they iterate directly and only one consolidated result returns to the orchestrator — the back-and-forth never enters its context. |
@@ -550,10 +583,10 @@ npm hides install-script output and flags packages that have one.)
 | `MD_AGENT_ORCH_STALL`     | `600`        | Seconds the orchestrator may sit idle with **no role work pending and no turn** before the progress watchdog nudges it (and, after `MD_AGENT_ORCH_MAX_NUDGES`, HALTs). Catches the orchestrator-side deadlock the role watchdog can't see. |
 | `MD_AGENT_ORCH_HANG`      | `360`        | Seconds the orchestrator's own claude turn may produce no output before it's treated as hung mid-turn → HALT (no self-recovery, which would re-enter the stuck path). |
 | `MD_AGENT_ORCH_MAX_NUDGES`| `2`          | Consecutive progress-watchdog nudges with no advance before the run HALTs. |
-| `MD_AGENT_SKIP_PREFLIGHT` | unset        | Skip the launch-time agent readiness probe (P4). Set for offline / fast-iteration runs. |
+| `MD_AGENT_SKIP_PREFLIGHT` | unset        | Skip the launch-time agent readiness probe (P4). Set for offline / fast-iteration runs. The claude probe runs on haiku with no tools, MCP or session file, and its cost (like the bootstrap's and the planner's) is booked into the run as `sessions/preflight.cost.json` etc. |
 | `MD_AGENT_MAX_EVENT_CHARS`| `16000`      | Choke-point (P2): a role reply longer than this is spilled to `runs/<dir>/spill/<role>-<ts>.md` and the orchestrator gets a head excerpt + pointer. `0` disables. |
 | `MD_AGENT_MAX_LEDGER_CHARS`| `8000`      | Ledger size target. The ledger is re-read AND re-emitted every turn, so bloat taxes every later turn twice; past this size the next turn carries a deterministic compact-now nudge. `0` disables. |
-| `MD_AGENT_ROLE_RECYCLE_TOKENS` | `200000` | Recycle a role session when its last turn processed this many tokens (input + cache reads + output) — it would re-read all of them next turn. `0` disables. |
+| `MD_AGENT_ROLE_RECYCLE_TOKENS` | `200000` | Recycle a role session when its resident context — what its last model call read (input + cache read + cache write), i.e. what every call of the next turn re-reads — reaches this many tokens. Measured per call, not summed over the turn. `0` disables. |
 | `MD_AGENT_ROLE_RECYCLE_TURNS` | `8`      | Role-session recycling: after N turns, a role writes a ≤300-word handoff note and is reseeded as a fresh session (mandate + handoff), bounding its ever-growing resident context (and cache-read cost per turn) on long runs. `0` disables. The per-turn `ctx ~Nk tok · cache X% hit` role log, and the live per-seat cost shown in the dashboard, are the data for tuning N. |
 | `MD_AGENT_ROLE_PERMISSION_MODE` | unset  | Default `--permission-mode` for claude-backed roles (e.g. `acceptEdits`, `bypassPermissions`). Headless `-p` sessions auto-deny tools the host settings don't allow, so roles that edit files need this (or a per-role `permissionMode` in the launch config, which takes precedence) on hosts without a global allowlist. |
 | `MD_AGENT_ESCALATION_FRESH` | off        | Escalation (P1c) re-spawns roles on the stronger tier **resuming their sessions** by default (they keep everything learned attempting the fix). Set to discard that context and start the upgraded team fresh instead. |
@@ -590,9 +623,11 @@ runs/<timestamp>-<name>/
 ├── outbox/<role>.txt    # role → orchestrator
 ├── teams/<name>/channel.md  # huddle transcript (only when sub-teams are used)
 └── sessions/
-    ├── <who>.txt        # persisted claude session id — roles only (orchestrator is stateless)
-    ├── <who>.cost.json  # accumulated token usage + cost
-    └── <who>.window.json # latest plan-window utilization a claude seat saw
+    ├── <who>.txt        # the seat's current session id (claude ids are minted up front — uuid v5 of run/seat#generation)
+    ├── <who>.sessions.jsonl # the seat's session lineage: one line per generation (+1 per recycle)
+    ├── <who>.cost.json  # accumulated token usage + cost (also preflight/bootstrap/planner)
+    ├── <who>.window.json # latest plan-window utilization a claude seat saw
+    └── claude/<id>.jsonl # (journals only) the claude CLI's own session transcripts, restored on pull
 ```
 
 > **`runs/` is gitignored.** Transcripts capture full agent conversations and can

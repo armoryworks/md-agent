@@ -116,11 +116,13 @@ export async function reportWorkspaces(opts: {
   runName: string;
   roles: string[];
   /**
-   * Run the configured verify command against one workspace. Injected rather
-   * than reimplemented so it is the same runner, timeout and output-tailing the
-   * completion gate uses — only the working directory differs.
+   * Run the verify command a role is judged by against its workspace. Injected
+   * rather than reimplemented so it is the same runner, timeout and
+   * output-tailing the completion gate uses — only the working directory
+   * differs. Resolving undefined means the role has no check. Not called for a
+   * workspace with nothing changed: an untouched branch has nothing to admit.
    */
-  verifyIn?: (dir: string) => Promise<{ ok: boolean; tail: string }>;
+  verifyIn?: (dir: string, role: string) => Promise<{ ok: boolean; tail: string } | undefined>;
 }): Promise<WorkspaceReport[]> {
   const out: WorkspaceReport[] = [];
   for (const role of opts.roles) {
@@ -151,9 +153,9 @@ export async function reportWorkspaces(opts: {
       // A workspace we cannot read is still worth listing; leave the counts at 0.
     }
     let verify: { ok: boolean; tail: string } | undefined;
-    if (opts.verifyIn) {
+    if (opts.verifyIn && (changedFiles > 0 || commits > 0)) {
       try {
-        verify = await opts.verifyIn(dir);
+        verify = await opts.verifyIn(dir, role);
       } catch (e) {
         verify = { ok: false, tail: `(verify could not run: ${(e as Error).message})` };
       }

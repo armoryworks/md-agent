@@ -56,6 +56,10 @@ export class AgySession implements AgentSession {
     logPath?: string;
     /** Kill the turn after this many seconds (default 300). */
     turnTimeoutSec?: number;
+    /** Kill the turn after this many tool steps (default 80; 0 = no cap). */
+    turnMaxSteps?: number;
+    /** `--effort low|medium|high`. */
+    effort?: string;
   }) {
     this.systemPrompt = opts.systemPrompt ?? null;
     this.model = opts.model ?? null;
@@ -66,9 +70,14 @@ export class AgySession implements AgentSession {
     this.onSessionId = opts.onSessionId ?? null;
     this.log = opts.logPath ? new TurnLog(opts.logPath) : null;
     this.turnTimeoutMs = Math.max(30, opts.turnTimeoutSec ?? 300) * 1000;
+    this.maxSteps = opts.turnMaxSteps ?? 80;
+    this.effort = opts.effort ?? null;
   }
 
   private readonly turnTimeoutMs: number;
+  private readonly maxSteps: number;
+  private readonly effort: string | null;
+  private lastContextData: number | null = null;
 
   get id(): string | null {
     return this.conversationId;
@@ -76,6 +85,10 @@ export class AgySession implements AgentSession {
 
   get lastUsage(): Usage | null {
     return this.lastUsageData;
+  }
+
+  get lastContextTokens(): number | null {
+    return this.lastContextData;
   }
 
   /** Antigravity reports token counts only — no window utilization. */
@@ -145,6 +158,7 @@ export class AgySession implements AgentSession {
     // turn to the seat's directory; repeating it per turn is idempotent.
     args.push("--add-dir", this.cwd ?? process.cwd());
     args.push(...this.permissionArgs());
+    if (this.effort) args.push("--effort", this.effort);
     // Keep agy's own print timeout above ours so OUR timer is the one that fires
     // and produces a diagnosable error rather than an opaque CLI kill.
     args.push("--print-timeout", `${Math.floor(timeoutMs / 1000) + 60}s`);
@@ -166,6 +180,14 @@ export class AgySession implements AgentSession {
       let out = "";
       let err = "";
       let lineBuf = "";
+      // The `result` envelope's usage is CUMULATIVE for the conversation (a
+      // 17-second second turn reported 5.7M cache reads), so the turn's own
+      // usage is the sum of its step_update usages; the last step's input +
+      // cache read is the resident context the next call starts from.
+      const steps = new Set<number>();
+      const stepSum = { input: 0, output: 0, cacheRead: 0 };
+      let sawStepUsage = false;
+      let stepsExceeded = false;
       // Streamed lines beat on arrival; the timer covers a long silent tool call
       // (agy emits nothing between step updates), so the watchdog stays fed.
       const beatTimer = setInterval(() => this.beat(), 3000);
@@ -178,6 +200,26 @@ export class AgySession implements AgentSession {
         clearInterval(beatTimer);
         reject(new Error(`agy turn exceeded its ${Math.round(timeoutMs / 1000)}s cap and was stopped — the ask was too big for one turn; re-scope it smaller`));
       }, timeoutMs);
+      const onStep = (su: Record<string, any>): void => {
+        if (typeof su.step_index === "number") steps.add(su.step_index);
+        const u = su.usage;
+        if (u && typeof u === "object") {
+          const n = (v: unknown) => Number(v ?? 0) || 0;
+          sawStepUsage = true;
+          stepSum.input += n(u.input_tokens);
+          stepSum.output += n(u.output_tokens) + n(u.thinking_tokens);
+          stepSum.cacheRead += n(u.cache_read_tokens);
+          this.lastContextData = n(u.input_tokens) + n(u.cache_read_tokens);
+        }
+        if (this.maxSteps > 0 && steps.size > this.maxSteps && !stepsExceeded) {
+          stepsExceeded = true;
+          try {
+            child.kill();
+          } catch {
+            // already gone
+          }
+        }
+      };
       child.stdout!.on("data", (b: Buffer) => {
         this.beat();
         const text = b.toString("utf8");
@@ -187,7 +229,16 @@ export class AgySession implements AgentSession {
         while ((nl = lineBuf.indexOf("\n")) !== -1) {
           const line = lineBuf.slice(0, nl).trim();
           lineBuf = lineBuf.slice(nl + 1);
-          if (line) this.log?.raw(line);
+          if (!line) continue;
+          this.log?.raw(line);
+          if (line.startsWith("{") && line.includes('"step_update"')) {
+            try {
+              const ev = JSON.parse(line);
+              if (ev.event === "step_update" && ev.step_update) onStep(ev.step_update);
+            } catch {
+              // not a full JSON line
+            }
+          }
         }
       });
       child.stderr!.on("data", (b: Buffer) => {
@@ -203,17 +254,30 @@ export class AgySession implements AgentSession {
         clearTimeout(timer);
         if (lineBuf.trim()) this.log?.raw(lineBuf.trim());
         const obj = this.parseResult(out);
+        const turnUsage: Usage | null = sawStepUsage
+          ? { inputTokens: stepSum.input, outputTokens: stepSum.output, cacheReadTokens: stepSum.cacheRead, cacheCreationTokens: 0, costUsd: 0 }
+          : obj
+            ? this.extractUsage(obj)
+            : null;
         this.log?.mark("end", {
           code,
           ms: Date.now() - startedAt,
           status: obj?.status ?? null,
-          usage: obj ? this.extractUsage(obj) : null,
+          steps: steps.size,
+          usage: turnUsage,
+          ...(stepsExceeded ? { stepsExceeded: true } : {}),
           ...(code === 0 ? {} : { stderr: err.slice(-1500) }),
         });
 
         if (obj && typeof obj.conversation_id === "string" && !this.conversationId) {
           this.conversationId = obj.conversation_id;
           this.onSessionId?.(obj.conversation_id);
+        }
+
+        if (stepsExceeded) {
+          if (turnUsage) this.lastUsageData = turnUsage;
+          reject(new Error(`agy turn exceeded its ${this.maxSteps}-step cap and was stopped — the ask was too big for one turn; re-scope it smaller`));
+          return;
         }
 
         const tail = (s: string) => {
@@ -276,7 +340,7 @@ export class AgySession implements AgentSession {
           );
           return;
         }
-        this.lastUsageData = this.extractUsage(obj);
+        this.lastUsageData = turnUsage ?? this.extractUsage(obj);
         resolve(this.extractText(obj, out).trim());
       });
     });
@@ -315,8 +379,10 @@ export class AgySession implements AgentSession {
   }
 
   /**
-   * agy reports flat token counts. thinking_tokens is folded into output because
-   * that is how reasoning tokens bill; cost is not computed here (no price table).
+   * The envelope's flat token counts — cumulative for the conversation, so
+   * only a fallback for a stream whose steps carried no usage. thinking_tokens
+   * is folded into output because that is how reasoning tokens bill; cost is
+   * not computed here (no price table).
    */
   private extractUsage(obj: Record<string, any> | null): Usage {
     const u = obj?.usage ?? {};

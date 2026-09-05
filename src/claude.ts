@@ -80,6 +80,13 @@ export interface AgentSession {
   send(prompt: string): Promise<string>;
   /** Token usage + cost of the most recent send(), or null before any turn. */
   readonly lastUsage: Usage | null;
+  /**
+   * The resident context after the most recent send(): what the LAST model
+   * call of the turn read (input + cache read + cache write), i.e. what the
+   * next call will start from. This — not the turn's summed usage — is what
+   * recycling should measure. Null before any turn.
+   */
+  readonly lastContextTokens: number | null;
   /** Persisted session id when the provider supports resume; else null. */
   readonly id: string | null;
   /** Point the liveness heartbeat at a file (set once the run dir exists). */
@@ -151,6 +158,27 @@ export class ClaudeSession implements AgentSession {
       disallowedTools?: string[];
       /** Kill the turn after this many seconds; 0 = no cap (the orchestrator's own turns). */
       turnTimeoutSec?: number;
+      /**
+       * Start the FIRST turn on this id (`--session-id`) instead of letting the CLI
+       * mint one, so the id is known before the turn runs. Ignored when resuming.
+       */
+      sessionId?: string;
+      /** Built-in tools to expose (`--tools`); `["default"]` or unset = the CLI's full set. */
+      tools?: string[];
+      /** Drop the user's MCP servers (`--strict-mcp-config` with none configured). */
+      noMcp?: boolean;
+      /** `--disable-slash-commands`: no skills in the prompt. */
+      noSkills?: boolean;
+      /** `--no-session-persistence`: nothing written under ~/.claude/projects (stateless turns). */
+      noPersist?: boolean;
+      /** `--max-budget-usd`: the CLI stops the turn at this spend. */
+      maxBudgetUsd?: number;
+      /** `--fallback-model`. */
+      fallbackModel?: string;
+      /** `--effort`. */
+      effort?: string;
+      /** `--json-schema`: structured output; the reply text is the JSON. */
+      jsonSchema?: string;
     } = {}
   ) {
     this.systemPrompt = opts.systemPrompt ?? null;
@@ -164,12 +192,31 @@ export class ClaudeSession implements AgentSession {
     this.log = opts.logPath ? new TurnLog(opts.logPath) : null;
     this.disallowedTools = opts.disallowedTools ?? [];
     this.turnTimeoutMs = (opts.turnTimeoutSec ?? 0) * 1000;
+    this.mintId = opts.resumeSessionId ? null : (opts.sessionId ?? null);
+    this.extraArgs = [];
+    if (opts.tools && !(opts.tools.length === 1 && opts.tools[0] === "default")) {
+      this.extraArgs.push("--tools", opts.tools.join(","));
+    }
+    if (opts.noMcp) this.extraArgs.push("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}');
+    if (opts.noSkills) this.extraArgs.push("--disable-slash-commands");
+    if (opts.noPersist) this.extraArgs.push("--no-session-persistence");
+    if (opts.maxBudgetUsd && opts.maxBudgetUsd > 0) this.extraArgs.push("--max-budget-usd", String(opts.maxBudgetUsd));
+    if (opts.fallbackModel) this.extraArgs.push("--fallback-model", opts.fallbackModel);
+    if (opts.effort) this.extraArgs.push("--effort", opts.effort);
+    if (opts.jsonSchema) this.extraArgs.push("--json-schema", opts.jsonSchema);
   }
 
   private readonly turnTimeoutMs: number;
+  private mintId: string | null;
+  private readonly extraArgs: string[];
+  private lastContextData: number | null = null;
 
   get lastWindows(): WindowSnapshot | null {
     return this.lastWindowsData;
+  }
+
+  get lastContextTokens(): number | null {
+    return this.lastContextData;
   }
 
   /** Touch the heartbeat file (throttled) to signal this turn is alive + producing. */
@@ -217,7 +264,10 @@ export class ClaudeSession implements AgentSession {
     }
     if (this.sessionId) {
       args.push("--resume", this.sessionId);
+    } else if (this.mintId && !this.stateless) {
+      args.push("--session-id", this.mintId);
     }
+    args.push(...this.extraArgs);
 
     // First turn: prepend the system prompt as part of the user message
     // (more robust than passing --append-system-prompt through arg quoting).
@@ -243,7 +293,12 @@ export class ClaudeSession implements AgentSession {
 
       let stdoutBuf = "";
       let stderrBuf = "";
+      // Every text block of every assistant message, in order (the seat's
+      // narration between tool calls included); `lastText` is the final
+      // message's text and `resultText` the CLI's own `result` — the report.
       let assistantText = "";
+      let lastText = "";
+      let resultText: string | null = null;
       let rawStdout = ""; // full stdout, kept so a non-zero exit can surface the real error
       let limited: { message: string; resetsAt?: number } | null = null;
       let timedOut = false;
@@ -277,10 +332,18 @@ export class ClaudeSession implements AgentSession {
               this.onSessionId?.(msg.session_id);
             }
             if (msg.type === "assistant" && msg.message?.content) {
+              let own = "";
               for (const block of msg.message.content) {
                 if (block.type === "text" && typeof block.text === "string") {
                   assistantText += block.text;
+                  own += block.text;
                 }
+              }
+              if (own.trim()) lastText = own;
+              const cu = msg.message.usage;
+              if (cu && typeof cu === "object") {
+                const n = (v: unknown) => Number(v ?? 0) || 0;
+                this.lastContextData = n(cu.input_tokens) + n(cu.cache_read_input_tokens) + n(cu.cache_creation_input_tokens);
               }
             }
             // The CLI reports the account's plan windows on every turn — the
@@ -311,9 +374,7 @@ export class ClaudeSession implements AgentSession {
                 cacheCreationTokens: u.cache_creation_input_tokens ?? 0,
                 costUsd: typeof msg.total_cost_usd === "number" ? msg.total_cost_usd : 0,
               };
-              if (typeof msg.result === "string" && !assistantText) {
-                assistantText = msg.result;
-              }
+              if (typeof msg.result === "string") resultText = msg.result;
             }
           } catch {
             // Non-JSON line — ignore.
@@ -328,6 +389,11 @@ export class ClaudeSession implements AgentSession {
       child.on("error", reject);
       child.on("exit", (code) => {
         if (turnTimer) clearTimeout(turnTimer);
+        // The reply is the final report, not the narration that led to it:
+        // the CLI's `result` (the last message's text), else that last
+        // message, else everything — in the traces `result` was always the
+        // last block, and the concatenation carried 15–20% of "Now I'll…".
+        const assistantOut = resultText?.trim() ? resultText : lastText.trim() ? lastText : assistantText;
         if (timedOut) {
           this.log?.mark("end", { code, ms: Date.now() - startedAt, timedOut: true });
           reject(new Error(`claude turn exceeded its ${Math.round(this.turnTimeoutMs / 1000)}s cap and was stopped — the ask was too big for one turn; re-scope it smaller`));
@@ -339,12 +405,12 @@ export class ClaudeSession implements AgentSession {
           usage: this.lastUsageData,
           ...(code === 0 ? {} : { stderr: stderrBuf.slice(-1500) }),
         });
-        if (code === 0 && limited && !assistantText.trim()) {
+        if (code === 0 && limited && !assistantOut.trim()) {
           reject(new ProviderExhaustedError("claude", limited.message, limited.resetsAt));
           return;
         }
         if (code === 0) {
-          resolve(assistantText.trim());
+          resolve(assistantOut.trim());
         } else if (limited || looksExhausted(stderrBuf + rawStdout)) {
           reject(new ProviderExhaustedError("claude", limited?.message ?? `claude reports its limit is reached: ${(stderrBuf || rawStdout).trim().slice(-300)}`, limited?.resetsAt));
         } else {

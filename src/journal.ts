@@ -5,7 +5,8 @@ import { cp, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises"
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { confirm, input, select } from "@inquirer/prompts";
-import { readLedger, readRunCost, readState, updateState, type RunState } from "./persist.js";
+import { readLedger, readRunCost, readSessionRecords, readState, updateState, type RunState } from "./persist.js";
+import { claudeProjectDirFor, findClaudeSessionFile } from "./sessions.js";
 import { theme as t } from "./theme.js";
 
 const run = promisify(execFile);
@@ -39,7 +40,10 @@ const CLONES_DIR = path.join(CONFIG_DIR, "journals");
 const JOURNAL_TOP = new Set(["state.json", "ledger.md", "transcript.md", "context.md", "HALT.txt", "JOURNAL.md", "log", "spill", "teams", "sessions", "inbox", "outbox"]);
 const INDEX_JSON = "index.json";
 const INDEX_MD = "JOURNALS.md";
-const SESSION_KEEP = /\.(cost|window)\.json$/;
+// Per-participant spend and windows, the seat's current session id, its
+// session lineage, and (under sessions/claude/) the claude CLI's own session
+// transcripts — what lets a pulled run's seats reattach on another machine.
+const SESSION_KEEP = /\.(cost|window)\.json$|\.txt$|\.sessions\.jsonl$|^claude(\/|$)/;
 
 export interface GlobalConfig {
   journal?: JournalConfig;
@@ -260,7 +264,7 @@ export async function writeCoverPage(runDir: string): Promise<string> {
     "- `ledger.md` — the orchestrator's final memory",
     "- `transcript.md` — every message, checkpoints, verify results",
     ...(traces.length ? [`- \`log/\` — seat traces: ${traces.map((f) => f.replace(/\.jsonl$/, "")).join(", ")}`] : []),
-    "- `sessions/*.cost.json` — spend per participant",
+    "- `sessions/*.cost.json` — spend per participant; `sessions/<seat>.sessions.jsonl` — each seat's session lineage; `sessions/claude/` — the claude CLI's own transcripts, restored on pull so seats reattach",
     "",
     "_Journals hold transcripts and traces. Keep this repository private._",
     "",
@@ -282,7 +286,7 @@ async function fileRun(runDir: string, clone: string, project: string): Promise<
       if (!rel) return true;
       const top = rel.split(path.sep)[0];
       if (!JOURNAL_TOP.has(top)) return false;
-      if (top === "sessions" && rel !== "sessions") return SESSION_KEEP.test(rel);
+      if (top === "sessions" && rel !== "sessions") return SESSION_KEEP.test(path.relative(path.join(runDir, "sessions"), src));
       return true;
     },
   });
@@ -292,7 +296,47 @@ async function fileRun(runDir: string, clone: string, project: string): Promise<
   delete state.journalPush;
   delete state.journalPulledAt;
   await writeFile(path.join(dest, "state.json"), JSON.stringify(state, null, 2), "utf8");
+  await fileClaudeSessions(runDir, dest, state);
   return dest;
+}
+
+/**
+ * The claude CLI keeps a seat's conversation under ~/.claude/projects, not in
+ * the run dir. Copy each seat's session transcripts into the journal so a run
+ * pulled elsewhere can put them back where that machine's CLI will look.
+ */
+async function fileClaudeSessions(runDir: string, dest: string, state: RunState): Promise<void> {
+  for (const r of state.roles) {
+    for (const rec of await readSessionRecords(runDir, r.name)) {
+      if (rec.provider !== "claude") continue;
+      const src = await findClaudeSessionFile(rec.id);
+      if (!src) continue;
+      const out = path.join(dest, "sessions", "claude", `${rec.id}.jsonl`);
+      await mkdir(path.dirname(out), { recursive: true });
+      await cp(src, out, { force: true });
+    }
+  }
+}
+
+/** Put journaled claude sessions where this machine's CLI files the seat's workspace, so `--resume` finds them. */
+async function restoreClaudeSessions(runDir: string): Promise<number> {
+  const state = await readState(runDir);
+  let n = 0;
+  for (const r of state.roles) {
+    const cwd = r.cwd ?? (state.isolation === "worktree" ? path.join(runDir, "workspaces", r.name) : process.cwd());
+    const projDir = claudeProjectDirFor(cwd);
+    for (const rec of await readSessionRecords(runDir, r.name)) {
+      if (rec.provider !== "claude") continue;
+      const src = path.join(runDir, "sessions", "claude", `${rec.id}.jsonl`);
+      if (!existsSync(src)) continue;
+      const target = path.join(projDir, `${rec.id}.jsonl`);
+      if (existsSync(target) || (await findClaudeSessionFile(rec.id))) continue;
+      await mkdir(projDir, { recursive: true });
+      await cp(src, target);
+      n++;
+    }
+  }
+  return n;
 }
 
 export interface PushResult {
@@ -448,6 +492,12 @@ export async function pullJournal(journalDir: string, runsDir = path.resolve("ru
     const d = path.join(dest, box);
     await mkdir(d, { recursive: true });
     for (const f of await readdir(d)) await writeFile(path.join(d, f), "", "utf8");
+  }
+  try {
+    const n = await restoreClaudeSessions(dest);
+    if (n) console.log(` ${t.paint("▸", "amber", true)} ${n} claude session(s) restored — seats will reattach on Continue`);
+  } catch (e) {
+    console.warn(`[journal] could not restore seat sessions: ${(e as Error).message}`);
   }
   await updateState(dest, { journalPulledAt: new Date().toISOString() });
   return dest;

@@ -1,6 +1,6 @@
 import path from "node:path";
 import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 
 /** Model tiers the orchestrator may assign to a role. */
 export type ModelTier = "opus" | "sonnet" | "haiku";
@@ -162,7 +162,44 @@ export interface RoleSpec {
    * one and the reason for the split is lost.
    */
   escalate?: boolean;
+  /**
+   * This seat's own check, over the run's `verify`. `false` = never verify this
+   * seat's replies or workspace (a review-only seat that produces no artifact);
+   * a spec = run that command instead of the run-wide one.
+   */
+  verify?: VerifySpec | false;
+  /**
+   * Built-in tools this seat may use (claude `--tools`). Default: Bash, Read,
+   * Edit, Write, Glob, Grep, WebFetch, WebSearch — the schemas of the rest ride
+   * in every call of every turn otherwise. `["default"]` = the CLI's full set.
+   */
+  tools?: string[];
+  /** Whether the seat sees the user's configured MCP servers. Default "none". */
+  mcp?: "inherit" | "none";
+  /** Hard USD cap on one claude turn (`--max-budget-usd`). */
+  turnBudgetUsd?: number;
+  /** Hard cap on tool steps in one agy turn. Default 80. */
+  turnMaxSteps?: number;
+  /** claude `--fallback-model`: used when the primary is overloaded. */
+  fallbackModel?: string;
+  /** Reasoning effort for the seat's CLI (`--effort low|medium|high`; claude also xhigh|max). */
+  effort?: string;
 }
+
+/**
+ * Concrete model for the orchestrator (and the other coordination turns:
+ * bootstrap, handshake). MD_AGENT_ORCH_MODEL pins it (a tier name or a
+ * concrete id). Unset → the sonnet tier: coordination re-reads a ledger and
+ * routes; it should not inherit whatever premium model the CLI defaults to.
+ */
+export function resolveOrchModel(): string {
+  const m = process.env.MD_AGENT_ORCH_MODEL?.trim();
+  if (!m) return MODEL_IDS.sonnet;
+  return m in MODEL_IDS ? MODEL_IDS[m as ModelTier] : m;
+}
+
+/** The tools a seat gets unless its RoleSpec says otherwise. */
+export const DEFAULT_SEAT_TOOLS = ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch"];
 
 /**
  * Where a role's file edits land.
@@ -272,7 +309,7 @@ export interface RunState {
    * `verify.maxFailures`, bump every role to the next tier (fresh, stronger
    * sessions) and retry with the failure context; HALT only once the ladder is
    * exhausted. e.g. ["sonnet","opus"]. Each role keeps its provider; tiers map per
-   * provider (claude haiku/sonnet/opus, agy flash-low/flash-high/pro-high).
+   * provider (claude haiku/sonnet/opus, agy flash-low/flash-medium/pro-low).
    */
   escalation?: ModelTier[];
   /** Set when this run is one phase of a journey — enough to resume it from the home screen. */
@@ -437,6 +474,40 @@ export async function readSessionId(
   if (!existsSync(file)) return null;
   const id = (await readFile(file, "utf8")).trim();
   return id.length > 0 ? id : null;
+}
+
+/** One session a seat has run on: its generation (0 = first, +1 per recycle), provider and id. */
+export interface SessionRecord {
+  gen: number;
+  provider: Provider;
+  id: string;
+  at: string;
+}
+
+function sessionHistoryFile(runDir: string, who: string): string {
+  return path.join(runDir, "sessions", `${who}.sessions.jsonl`);
+}
+
+/** Append a seat's session to its lineage; the journal carries this so a pulled run can find the sessions again. */
+export async function appendSessionRecord(runDir: string, who: string, rec: SessionRecord): Promise<void> {
+  const file = sessionHistoryFile(runDir, who);
+  await mkdir(path.dirname(file), { recursive: true });
+  await appendFile(file, JSON.stringify(rec) + "\n", "utf8");
+}
+
+export async function readSessionRecords(runDir: string, who: string): Promise<SessionRecord[]> {
+  const file = sessionHistoryFile(runDir, who);
+  if (!existsSync(file)) return [];
+  const out: SessionRecord[] = [];
+  for (const line of (await readFile(file, "utf8")).split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      out.push(JSON.parse(line) as SessionRecord);
+    } catch {
+      // a torn line — skip
+    }
+  }
+  return out;
 }
 
 // -------- token usage + cost accounting --------

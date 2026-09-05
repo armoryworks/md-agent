@@ -1,6 +1,6 @@
 import path from "node:path";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { open, readFile } from "node:fs/promises";
 import { Dashboard, type SeatState } from "./dashboard.js";
 import {
   normalizeProvider,
@@ -282,13 +282,44 @@ interface SeatDigest {
   lastSaid: string;
 }
 
+// A seat's trace only grows, so each digest parses the bytes appended since
+// the last one and carries the tallies forward (a long agy seat's trace runs
+// to tens of MB; re-reading it every tick was the watcher's whole cost).
+interface DigestCursor {
+  offset: number;
+  toolCalls: Record<string, number>;
+  current: string;
+  lastSaid: string;
+  inTurn: boolean;
+  partial: string;
+}
+const digestCursors = new Map<string, DigestCursor>();
+
 async function seatDigest(runDir: string, seat: WatchFrame["seats"][number]): Promise<SeatDigest> {
-  const toolCalls: Record<string, number> = {};
-  let current = "";
-  let lastSaid = "";
-  let inTurn = false;
+  const file = path.join(runDir, "log", `${seat.name}.jsonl`);
+  let cur = digestCursors.get(file);
+  const size = statSync(file, { throwIfNoEntry: false })?.size ?? 0;
+  if (!cur || size < cur.offset) {
+    cur = { offset: 0, toolCalls: {}, current: "", lastSaid: "", inTurn: false, partial: "" };
+    digestCursors.set(file, cur);
+  }
+  const { toolCalls } = cur;
+  let { current, lastSaid, inTurn } = cur;
   try {
-    const lines = (await readFile(path.join(runDir, "log", `${seat.name}.jsonl`), "utf8")).split("\n");
+    let lines: string[] = [];
+    if (size > cur.offset) {
+      const fh = await open(file, "r");
+      try {
+        const buf = Buffer.alloc(size - cur.offset);
+        const { bytesRead } = await fh.read(buf, 0, buf.length, cur.offset);
+        cur.offset += bytesRead;
+        const text = cur.partial + buf.subarray(0, bytesRead).toString("utf8");
+        lines = text.split("\n");
+        cur.partial = lines.pop() ?? "";
+      } finally {
+        await fh.close();
+      }
+    }
     for (const line of lines) {
       if (!line.trim()) continue;
       let ev: any;
@@ -325,6 +356,7 @@ async function seatDigest(runDir: string, seat: WatchFrame["seats"][number]): Pr
   } catch {
     // no trace yet
   }
+  Object.assign(cur, { current, lastSaid, inTurn });
   return {
     name: seat.name,
     state: seat.state,
@@ -332,7 +364,7 @@ async function seatDigest(runDir: string, seat: WatchFrame["seats"][number]): Pr
     turns: seat.turns,
     usd: seat.usd,
     tokens: seat.tokens,
-    toolCalls,
+    toolCalls: { ...toolCalls },
     current: inTurn ? current : "",
     lastSaid,
   };

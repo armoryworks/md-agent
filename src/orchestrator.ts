@@ -1,7 +1,8 @@
 import path from "node:path";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { spawn, ChildProcess } from "node:child_process";
+import { execFile, spawn, ChildProcess } from "node:child_process";
+import { promisify } from "node:util";
 import crossSpawn from "cross-spawn";
 import readline from "node:readline";
 import { checkbox, confirm, input, number, select } from "@inquirer/prompts";
@@ -63,9 +64,11 @@ import {
   readRunCost,
   readState,
   recordUsage,
+  resolveOrchModel,
   type RoleSpec,
   type RunState,
   updateState,
+  type Usage,
   type VerifySpec,
   writeLedger,
 } from "./persist.js";
@@ -129,40 +132,39 @@ const ORCH_CONTEXT_INLINE_MAX = 2000;
 const TEAMS_DEFAULT = /^(1|true|on|yes)$/i.test(process.env.MD_AGENT_TEAMS ?? "");
 
 /**
- * Concrete model for the orchestrator session. MD_AGENT_ORCH_MODEL pins it (a
- * tier name like "opus"/"haiku" or a concrete id). Unset → the sonnet tier: the
- * orchestrator re-reads a ledger and routes; it should not inherit whatever
- * premium model the CLI happens to default to on this machine.
- */
-function resolveOrchModel(): string {
-  const m = process.env.MD_AGENT_ORCH_MODEL?.trim();
-  if (!m) return MODEL_IDS.sonnet;
-  return m in MODEL_IDS ? MODEL_IDS[m as ModelTier] : m;
-}
-
-/**
  * The orchestrator coordinates; it does not do the work. Left with edit tools
  * it will — a run was seen writing a seat's deliverable itself to get a verify
  * command to pass, which quietly defeats isolation. Read tools stay so it can
- * consult the context brief. MD_AGENT_ORCH_TOOLS=all restores everything.
+ * consult the context brief. It also gets none of the user's MCP servers or
+ * skills: every one of them rides in every turn's prefix otherwise.
+ * MD_AGENT_ORCH_TOOLS=all restores the CLI's full set.
  */
 const ORCH_EDIT_TOOLS = ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"];
-function orchDisallowedTools(): string[] {
-  return /^(all|full)$/i.test(process.env.MD_AGENT_ORCH_TOOLS ?? "") ? [] : ORCH_EDIT_TOOLS;
+const ORCH_TOOLS = ["Read", "Glob", "Grep"];
+function orchFullTools(): boolean {
+  return /^(all|full)$/i.test(process.env.MD_AGENT_ORCH_TOOLS ?? "");
 }
+function orchDisallowedTools(): string[] {
+  return orchFullTools() ? [] : ORCH_EDIT_TOOLS;
+}
+
+/** Flags for a one-shot coordination turn that needs no tools at all (bootstrap, probe). */
+const BARE_TURN = { tools: [] as string[], noMcp: true, noSkills: true, noPersist: true };
 
 /**
  * P4 — launch-time readiness probe. Spawn the agent CLI with a trivial prompt and a
  * short timeout; success = present + authed + responsive (not rate-limited). Returns
- * a reason on failure. Configuration-based: callers only probe the providers the run
- * is configured to use — there is no system scan.
+ * a reason on failure, and what the probe cost when the CLI says. Configuration-based:
+ * callers only probe the providers the run is configured to use — there is no system
+ * scan. The claude probe runs on haiku with no tools, no MCP and no session file: it
+ * used to inherit the CLI's default model and full prefix on every launch and resume.
  */
-function probeProvider(p: Provider): Promise<{ ok: boolean; detail: string }> {
+function probeProvider(p: Provider): Promise<{ ok: boolean; detail: string; usage?: Usage }> {
   const cmd = p === "agy" ? "agy" : "claude";
   const args =
     p === "agy"
       ? ["-p", "reply with: ok", "--output-format", "json", "--model", AGY_MODEL_IDS.haiku]
-      : ["-p", "reply with: ok", "--output-format", "json"];
+      : ["-p", "reply with: ok", "--output-format", "json", "--model", MODEL_IDS.haiku, "--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-session-persistence"];
   const timeoutMs = 60_000;
   return new Promise((resolve) => {
     let out = "";
@@ -203,7 +205,23 @@ function probeProvider(p: Provider): Promise<{ ok: boolean; detail: string }> {
         return;
       }
       if (code === 0) {
-        resolve({ ok: true, detail: "" });
+        let usage: Usage | undefined;
+        if (p === "claude") {
+          try {
+            const o = JSON.parse(out.slice(out.indexOf("{")));
+            const u = o.usage ?? {};
+            usage = {
+              inputTokens: u.input_tokens ?? 0,
+              outputTokens: u.output_tokens ?? 0,
+              cacheReadTokens: u.cache_read_input_tokens ?? 0,
+              cacheCreationTokens: u.cache_creation_input_tokens ?? 0,
+              costUsd: typeof o.total_cost_usd === "number" ? o.total_cost_usd : 0,
+            };
+          } catch {
+            // the probe passed; its cost is just unknown
+          }
+        }
+        resolve({ ok: true, detail: "", usage });
         return;
       }
       resolve({ ok: false, detail: tail(err) || tail(out) || `exit ${code}` });
@@ -214,16 +232,18 @@ function probeProvider(p: Provider): Promise<{ ok: boolean; detail: string }> {
 /**
  * Probe every agent CLI the run will use (orchestrator's claude + any role
  * providers), failing fast with a readable reason rather than an empty-ledger crash
- * mid-run. Skip with MD_AGENT_SKIP_PREFLIGHT=1 (offline / fast iteration).
+ * mid-run. Skip with MD_AGENT_SKIP_PREFLIGHT=1 (offline / fast iteration). Resolves
+ * with what the probes cost, for the run's books.
  */
-async function preflightAgents(providers: Set<Provider>): Promise<void> {
+async function preflightAgents(providers: Set<Provider>): Promise<Usage[]> {
   if (/^(1|true|on|yes)$/i.test(process.env.MD_AGENT_SKIP_PREFLIGHT ?? "")) {
     console.log("[preflight] skipped (MD_AGENT_SKIP_PREFLIGHT)");
-    return;
+    return [];
   }
+  const spent: Usage[] = [];
   for (const p of providers) {
     process.stdout.write(`[preflight] probing ${p}… `);
-    const { ok, detail } = await probeProvider(p);
+    const { ok, detail, usage } = await probeProvider(p);
     if (!ok) {
       console.log("FAIL");
       throw new Error(
@@ -231,8 +251,10 @@ async function preflightAgents(providers: Set<Provider>): Promise<void> {
           `Fix it (auth / install / rate limit) or set MD_AGENT_SKIP_PREFLIGHT=1 to bypass.`
       );
     }
+    if (usage) spent.push(usage);
     console.log("ok");
   }
+  return spent;
 }
 
 /** Collect the distinct providers a run uses: the orchestrator (claude) + role providers. */
@@ -247,13 +269,34 @@ function runProviders(roles: RoleSpec[]): Set<Provider> {
  * other seat in the run. md-agent never talks to the API directly.
  */
 function createOrchSession(systemPrompt: string, runDir: string): AgentSession {
+  const full = orchFullTools();
   return new ClaudeSession({
     systemPrompt,
     model: resolveOrchModel(),
     stateless: true,
     logPath: logPath(runDir, ORCH),
     disallowedTools: orchDisallowedTools(),
+    ...(full ? {} : { tools: ORCH_TOOLS, noMcp: true, noSkills: true }),
+    noPersist: true,
   });
+}
+
+/** The verify + isolation facts the orchestrator coordinates against — it used to learn the command only from a failure. */
+function orchHarnessLines(state: RunState): string[] {
+  const out: string[] = [];
+  if (state.verify) {
+    out.push(`VERIFY: the run's check is \`${state.verify.cmd}\` (exit 0 = pass). Every seat reply that changed its workspace is checked with it there; the run completes only when every changed workspace passes.`);
+    const own = state.roles.filter((r) => r.verify !== undefined);
+    if (own.length) {
+      out.push(
+        `  Per-seat exceptions: ${own.map((r) => `${r.name} → ${r.verify === false ? "not verified (produces no checkable artifact)" : `\`${(r.verify as VerifySpec).cmd}\``}`).join("; ")}.`
+      );
+    }
+  }
+  if ((state.isolation ?? DEFAULT_ISOLATION) === "worktree") {
+    out.push("ISOLATION: each seat edits its own git worktree on branch md-agent/<run>/<seat>; seats do not see each other's edits until the user merges. Coordinate through files a seat commits and reports by path, or by asking a seat to read another's workspace.");
+  }
+  return out;
 }
 
 /**
@@ -294,6 +337,7 @@ function buildOrchSystem(state: RunState, runDir: string | null): string {
           : "")
     ),
     orchContextBlock(state.context, runDir),
+    ...orchHarnessLines(state),
     "",
     "HOW YOUR MEMORY WORKS — READ CAREFULLY:",
     "You are STATELESS between turns. You do NOT remember previous turns. Each turn you are handed:",
@@ -424,10 +468,12 @@ export async function runOrchestrator(opts: {
     ],
   });
   let prefill: TeamPlan | undefined;
+  let plannerUsage: Usage | undefined;
   if (how === "plan") {
     console.log(dim(`\n  planning with ${resolvePlannerModel()}…\n`));
     try {
-      const { plan, costUsd } = await planTeam(goal);
+      const { plan, costUsd, usage } = await planTeam(goal);
+      plannerUsage = usage;
       console.log(renderPlan(plan, costUsd) + "\n");
       let next = await select<string>({
         message: "Go with this?",
@@ -485,6 +531,7 @@ export async function runOrchestrator(opts: {
           runName: plan.name,
           journal,
           kickoff: "Begin the run.",
+          plannerUsage,
         });
         return;
       }
@@ -602,6 +649,7 @@ export async function runOrchestrator(opts: {
     runName: prefill?.name,
     journal,
     kickoff: "Begin the run.",
+    plannerUsage,
   });
 }
 
@@ -728,6 +776,8 @@ export interface RunSetup {
   budget?: BudgetSpec;
   /** Journal settings for this run, over the global config. */
   journal?: JournalConfig;
+  /** What the planner turn cost, when one ran — booked into the run once it has a dir. */
+  plannerUsage?: Usage;
 }
 
 /**
@@ -744,7 +794,11 @@ export async function launchRun(setup: RunSetup): Promise<void> {
   const roles = setup.roles.map((r) => ({ ...r }));
   // P4: fail fast if a configured agent isn't authed/responsive — before the
   // bootstrap turn, the run dir, or any role spawn.
-  await preflightAgents(runProviders(roles));
+  const preflightUsage = await preflightAgents(runProviders(roles));
+  // Turns taken before the run dir exists are booked once it does, so the
+  // run's Σ (and its journal) carries what the setup actually cost.
+  const earlyUsage: { who: string; u: Usage }[] = preflightUsage.map((u) => ({ who: "preflight", u }));
+  if (setup.plannerUsage) earlyUsage.push({ who: "planner", u: setup.plannerUsage });
 
   let runName = setup.runName ? slug(setup.runName) : "";
   const needBootstrap =
@@ -780,9 +834,24 @@ export async function launchRun(setup: RunSetup): Promise<void> {
 
     console.log("\n[orchestrator] bootstrapping run name + role names...");
     // A bare one-shot session: the naming task doesn't need the (large)
-    // orchestrator system prompt, so don't pay for it here.
-    const boot = new ClaudeSession({ model: resolveOrchModel(), stateless: true });
+    // orchestrator system prompt, tools, MCP or a session file — and the CLI
+    // enforces the JSON shape.
+    const boot = new ClaudeSession({
+      model: resolveOrchModel(),
+      stateless: true,
+      ...BARE_TURN,
+      jsonSchema: JSON.stringify({
+        type: "object",
+        properties: {
+          run_name: { type: "string" },
+          role_names: { type: "object", additionalProperties: { type: "string" } },
+          role_models: { type: "object", additionalProperties: { type: "string", enum: ["opus", "sonnet", "haiku"] } },
+        },
+        required: ["run_name", "role_names", "role_models"],
+      }),
+    });
     const bootReply = await boot.send(bootstrap);
+    if (boot.lastUsage) earlyUsage.push({ who: "bootstrap", u: boot.lastUsage });
     console.log(`[orchestrator] bootstrap reply (raw):\n${bootReply}\n`);
     try {
       const parsed = JSON.parse(extractJson(bootReply));
@@ -830,6 +899,7 @@ export async function launchRun(setup: RunSetup): Promise<void> {
   await mkdir(path.join(runDir, "inbox"), { recursive: true });
   await mkdir(path.join(runDir, "outbox"), { recursive: true });
   await mkdir(path.join(runDir, "sessions"), { recursive: true });
+  for (const { who, u } of earlyUsage) await recordUsage(runDir, who, u);
   const state: RunState = {
     goal: setup.goal,
     roles,
@@ -1075,7 +1145,7 @@ export async function resumeOrchestrator(
   await appendTranscript(transcript, "RUN RESUMED", `Resumed from ${runDir}`);
 
   // P4: probe agents before re-spawning roles (resume is a common post-rate-limit path).
-  await preflightAgents(runProviders(roles));
+  for (const u of await preflightAgents(runProviders(roles))) await recordUsage(runDir, "preflight", u);
 
   // A seat the user stopped stays stopped across a resume; the orchestrator is
   // told about it in its system prompt and refused if it dispatches there.
@@ -1336,7 +1406,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     try {
       const ledger = await readLedger(runDir);
       dash.orchThinking();
-      const reply = await orch.send(composeOrchPrompt(ledger, eventText));
+      const reply = await orch.send(composeOrchPrompt(ledger, eventText, await spendLine()));
       dash.orchTurn();
       const u = orch.lastUsage;
       if (u) {
@@ -1587,8 +1657,29 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     );
   }
 
-  function composeOrchPrompt(ledger: string, eventText: string): string {
+  /**
+   * What each seat has cost so far, one line — so a soft budget can be met by
+   * routing the remaining mechanical work to the cheap seat, not only by
+   * winding down. ~30 tokens; skipped while nothing has been spent.
+   */
+  async function spendLine(): Promise<string> {
+    try {
+      const parts: string[] = [];
+      for (const r of roles) {
+        const c = await readCost(runDir, r.name);
+        if (c.turns) parts.push(`${r.name} $${c.costUsd.toFixed(2)}/${c.turns}t (${normalizeProvider(r.provider)} ${r.model ?? DEFAULT_TIER})`);
+      }
+      const o = await readCost(runDir, "orchestrator");
+      if (o.turns) parts.push(`you $${o.costUsd.toFixed(2)}/${o.turns}t`);
+      return parts.length ? `💵 spend so far: ${parts.join(" · ")}` : "";
+    } catch {
+      return "";
+    }
+  }
+
+  function composeOrchPrompt(ledger: string, eventText: string, spend = ""): string {
     const lines = [timeStatus()];
+    if (spend) lines.push(spend);
     if (ledgerOversized) {
       lines.push(
         `⚠ LEDGER OVERSIZED: your ledger is ~${Math.round(ledger.length / 1000)} KB (target ≤ ${Math.round(MAX_LEDGER_CHARS / 1000)} KB). COMPACT it this turn — prune resolved items, replace anything verbose with a one-line summary + pointer. Keep '## Artifacts produced' intact.`
@@ -1726,15 +1817,21 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
           runDir,
           runName: path.basename(runDir),
           roles: roles.map((r) => r.name),
-          // Same runner, timeout and output tail as the completion gate — only
-          // the working directory changes. A seat's branch is judged by the same
-          // command that judges the run.
-          verifyIn: verify ? (dir) => runVerify({ ...verify, cwd: dir }) : undefined,
+          // Same runner, timeout and output tail as the completion gate — and
+          // the gate's result itself when the tree has not changed since. A
+          // seat's branch is judged by the same command that judges the run,
+          // or by its own when it has one.
+          verifyIn: verify
+            ? async (dir, role) => {
+                const spec = verifyFor(role);
+                return spec ? verifyWorkspace(spec, dir) : undefined;
+              }
+            : undefined,
         });
         if (reports.length) {
           console.log("\n[orchestrator] role workspaces — review, then keep or drop:\n");
           for (const rep of reports) {
-            const mark = rep.verify ? (rep.verify.ok ? "PASS" : "FAIL") : "     ";
+            const mark = rep.verify ? (rep.verify.ok ? "PASS" : "FAIL") : rep.changedFiles === 0 && rep.commits === 0 ? "  —  " : "     ";
             console.log(`  ${mark}  ${rep.role}  (${rep.changedFiles} file(s) changed, ${rep.commits} commit(s))`);
             console.log(`        dir:    ${rep.dir}`);
             console.log(`        branch: ${rep.branch}`);
@@ -1833,38 +1930,46 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
       // a seat that claims done while it fails gets the output straight back —
       // no orchestrator turn spent relaying it. The orchestrator only sees the
       // reply once it passes, isn't a completion claim, or has failed too often.
-      if (verify && !wasStopped && !stopping) {
+      // Same rule as the gate: an isolated workspace with no changes is not
+      // judged (a reviewer's clean worktree failed 3 of 3 replies before this).
+      const seatVerify = verifyFor(r.name);
+      if (seatVerify && !wasStopped && !stopping) {
         const ws = seatWorkspaceDir(r.name);
         const where = ws ? `${r.name}'s workspace` : "the shared tree";
-        dash.setStatus(`verifying ${r.name}: ${verify.cmd}`);
-        const res = await runVerify({ ...verify, cwd: ws ?? verify.cwd ?? process.cwd() });
-        dash.setStatus("running");
-        if (res.ok) {
-          seatVerifyFails.delete(r.name);
-          resetPingPong();
-          console.log(`[verify] ${r.name}'s reply: PASS in ${where}`);
-          event = `[verify PASS in ${where}: \`${verify.cmd}\`]\n${event}`;
+        const judged = !ws || (await workspaceHasChanges(ws));
+        if (!judged) {
+          console.log(`[verify] ${r.name}'s reply: workspace unchanged — not verified`);
         } else {
-          const n = (seatVerifyFails.get(r.name) ?? 0) + 1;
-          seatVerifyFails.set(r.name, n);
-          const max = verify.maxFailures ?? 2;
-          await appendTranscript(transcript, `VERIFY FAIL ${r.name} ${n}`, res.tail);
-          const sameAsLast = seatLastFailTail.get(r.name) === res.tail;
-          seatLastFailTail.set(r.name, res.tail);
-          const tailForSeat = sameAsLast ? "(the same failure output as last time — nothing changed)" : res.tail;
-          if (claimsDone(content) && n <= max && !stopping) {
-            console.warn(`[verify] ${r.name} reported done but \`${verify.cmd}\` fails in ${where} (${n}/${max}) — sending the output straight back`);
-            await sendToRole({
-              role: r.name,
-              body:
-                `[VERIFY FAIL ${n}/${max} — \`${verify.cmd}\` in ${where}]\n` +
-                `You reported done, but the check fails where your work is. Fix the cause in your own workspace, run the check yourself, then report again — and if you are not sure why it fails, say exactly what you tried so another seat can take it from there.\n\n` +
-                tailForSeat,
-            });
-            return;
+          dash.setStatus(`verifying ${r.name}: ${seatVerify.cmd}`);
+          const res = await verifyWorkspace(seatVerify, ws);
+          dash.setStatus("running");
+          if (res.ok) {
+            seatVerifyFails.delete(r.name);
+            resetPingPong();
+            console.log(`[verify] ${r.name}'s reply: PASS in ${where}`);
+            event = `[verify PASS in ${where}: \`${seatVerify.cmd}\`]\n${event}`;
+          } else {
+            const n = (seatVerifyFails.get(r.name) ?? 0) + 1;
+            seatVerifyFails.set(r.name, n);
+            const max = seatVerify.maxFailures ?? 2;
+            await appendTranscript(transcript, `VERIFY FAIL ${r.name} ${n}`, res.tail);
+            const sameAsLast = seatLastFailTail.get(r.name) === res.tail;
+            seatLastFailTail.set(r.name, res.tail);
+            const tailForSeat = sameAsLast ? "(the same failure output as last time — nothing changed)" : res.tail;
+            if (claimsDone(content) && n <= max && !stopping) {
+              console.warn(`[verify] ${r.name} reported done but \`${seatVerify.cmd}\` fails in ${where} (${n}/${max}) — sending the output straight back`);
+              await sendToRole({
+                role: r.name,
+                body:
+                  `[VERIFY FAIL ${n}/${max} — \`${seatVerify.cmd}\` in ${where}]\n` +
+                  `You reported done, but the check fails where your work is. Fix the cause in your own workspace, run the check yourself, then report again — and if you are not sure why it fails, say exactly what you tried so another seat can take it from there.\n\n` +
+                  tailForSeat,
+              });
+              return;
+            }
+            console.warn(`[verify] ${r.name}'s reply: FAIL in ${where} (${n}) — attached to the event`);
+            event = `[verify FAIL in ${where}: \`${seatVerify.cmd}\` — attempt ${n}; output tail:]\n${res.tail}\n\n${event}`;
           }
-          console.warn(`[verify] ${r.name}'s reply: FAIL in ${where} (${n}) — attached to the event`);
-          event = `[verify FAIL in ${where}: \`${verify.cmd}\` — attempt ${n}; output tail:]\n${res.tail}\n\n${event}`;
         }
       }
       await postEvent(event);
@@ -1873,6 +1978,47 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
 
   const seatVerifyFails = new Map<string, number>();
   const seatLastFailTail = new Map<string, string>();
+
+  /** The check a seat is judged by: its own, none, or the run's. */
+  function verifyFor(name: string): VerifySpec | undefined {
+    const r = roles.find((x) => x.name === name);
+    if (r?.verify === false) return undefined;
+    return r?.verify ?? verify;
+  }
+
+  // Verify results by workspace, keyed on what the tree looked like: the gate
+  // and the teardown audit ask the same question of the same tree minutes
+  // apart, and a 90-second suite per seat twice over is the whole teardown.
+  const verifyMemo = new Map<string, { key: string; result: { ok: boolean; tail: string } }>();
+  const gitOut = promisify(execFile);
+  async function treeKey(dir: string): Promise<string> {
+    try {
+      const head = (await gitOut("git", ["rev-parse", "HEAD"], { cwd: dir })).stdout.trim();
+      const status = (await gitOut("git", ["status", "--porcelain"], { cwd: dir })).stdout;
+      const stamps: string[] = [];
+      for (const line of status.split("\n")) {
+        const f = line.slice(3).trim();
+        if (!f) continue;
+        try {
+          stamps.push(`${f}@${statSync(path.join(dir, f)).mtimeMs}`);
+        } catch {
+          stamps.push(`${f}@gone`);
+        }
+      }
+      return `${head}|${stamps.join(",")}`;
+    } catch {
+      return `${Date.now()}`; // unknowable — never reuse
+    }
+  }
+  async function verifyWorkspace(spec: VerifySpec, dir: string | undefined): Promise<{ ok: boolean; tail: string }> {
+    const cwd = dir ?? spec.cwd ?? process.cwd();
+    const key = `${spec.cmd}|${await treeKey(cwd)}`;
+    const hit = verifyMemo.get(cwd);
+    if (hit && hit.key === key) return hit.result;
+    const result = await runVerify({ ...spec, cwd });
+    verifyMemo.set(cwd, { key, result });
+    return result;
+  }
 
   /** A reply that presents itself as finished — the only kind verify-on-reply bounces. */
   function claimsDone(reply: string): boolean {
@@ -1898,20 +2044,19 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
    */
   async function runGate(): Promise<{ ok: boolean; tail: string }> {
     const spec = verify!;
-    const dirty: { name: string; dir: string }[] = [];
+    const dirty: { name: string; dir: string; spec: VerifySpec }[] = [];
     for (const r of roles) {
       if (stoppedRoles.has(r.name)) continue;
+      const own = verifyFor(r.name);
+      if (!own) continue;
       const dir = seatWorkspaceDir(r.name);
-      if (dir && (await workspaceHasChanges(dir))) dirty.push({ name: r.name, dir });
+      if (dir && (await workspaceHasChanges(dir))) dirty.push({ name: r.name, dir, spec: own });
     }
-    if (!dirty.length) return runVerify(spec);
-    let ok = true;
-    const tails: string[] = [];
-    for (const { name, dir } of dirty) {
-      const res = await runVerify({ ...spec, cwd: dir });
-      if (!res.ok) ok = false;
-      tails.push(`--- ${name} (${dir}): ${res.ok ? "PASS" : "FAIL"}${res.ok ? "" : `\n${res.tail}`}`);
-    }
+    if (!dirty.length) return verifyWorkspace(spec, undefined);
+    // Independent trees, independent processes: judge them at once.
+    const results = await Promise.all(dirty.map(async (d) => ({ ...d, res: await verifyWorkspace(d.spec, d.dir) })));
+    const ok = results.every((r) => r.res.ok);
+    const tails = results.map((r) => `--- ${r.name} (${r.dir}): ${r.res.ok ? "PASS" : "FAIL"}${r.res.ok ? "" : `\n${r.res.tail}`}`);
     return { ok, tail: tails.join("\n") };
   }
 

@@ -3,7 +3,8 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { ClaudeSession, ProviderExhaustedError, type AgentSession } from "./claude.js";
 import { AgySession } from "./agy.js";
-import { provisionWorkspace } from "./workspace.js";
+import { provisionWorkspace, workspaceBranch } from "./workspace.js";
+import { findSessionByMarker, markerFor, mintSessionId } from "./sessions.js";
 import {
   clearFile,
   isSafeWord,
@@ -12,11 +13,14 @@ import {
   watchFile,
 } from "./ipc.js";
 import {
+  appendSessionRecord,
   buildRoleHistory,
+  DEFAULT_SEAT_TOOLS,
   formatUsage,
   logPath,
   normalizeProvider,
   readSessionId,
+  readSessionRecords,
   readState,
   recordUsage,
   resolveModelFor,
@@ -55,10 +59,11 @@ const RECYCLE_TURNS = (() => {
 })();
 
 /**
- * Recycle by size as well: a turn that processed this many tokens (input +
- * cache reads + output) leaves a session that will re-read all of it next
- * turn. One observed turn reached 6M tokens inside the CLI's own loop; the
- * next turn on that session would have started there. MD_AGENT_ROLE_RECYCLE_TOKENS
+ * Recycle by size as well: when the session's RESIDENT context — what the last
+ * model call read, and so what every call of the next turn will re-read — is
+ * this large. Measured per call, not summed over the turn: a 40-call turn on a
+ * 30k context is busy, not fat, and an earlier version that summed the turn
+ * recycled after every substantive turn. MD_AGENT_ROLE_RECYCLE_TOKENS
  * overrides; 0 disables.
  */
 const RECYCLE_TOKENS = (() => {
@@ -101,11 +106,46 @@ export async function runRole(
   const provider = normalizeProvider(me.provider);
   const model = resolveModelFor(provider, me.model);
   const turnCapSec = me.turnTimeoutSec ?? (provider === "agy" ? 300 : 600);
+  const runName = path.basename(runDir);
+  const repoDir = process.cwd();
+
+  // Where this seat's file edits land. An explicit RoleSpec.cwd wins; otherwise
+  // isolation decides — "worktree" hands the seat its own checkout so its output
+  // can be reviewed and kept or dropped, "none" shares md-agent's cwd.
+  const workspaceDir =
+    me.cwd ??
+    (await provisionWorkspace({
+      isolation: state.isolation ?? DEFAULT_ISOLATION,
+      repoDir,
+      runDir,
+      runName,
+      role: roleName,
+    }));
+  if (workspaceDir) console.log(`[role:${roleName}] workspace: ${workspaceDir}`);
+
+  // The seat is told the same check the gate runs and where its tree is — a
+  // seat that runs a different command, or edits the repo root from a
+  // worktree, is the failure both of these lines exist to prevent.
+  const verifySpec = me.verify === false ? undefined : (me.verify ?? state.verify);
+  const placeLines = workspaceDir
+    ? [
+        `Your workspace: ${workspaceDir}` +
+          ((state.isolation ?? DEFAULT_ISOLATION) === "worktree" && !me.cwd ? ` (git branch ${workspaceBranch(runName, roleName)}, a worktree of ${repoDir})` : "") +
+          `. Every file you read or edit and every command you run is there. Never edit ${repoDir} itself.`,
+      ]
+    : [];
+  const verifyLines = verifySpec
+    ? [`The run's check is exactly: \`${verifySpec.cmd}\` — run that (in your workspace) before reporting done; it is what your reply will be judged by.`]
+    : me.verify === false
+      ? ["This seat produces no artifact the run's verify command checks; report findings, not passes."]
+      : [];
 
   let systemPrompt = [
     `You are the "${roleName}" agent.`,
     `Your role: ${me.description}`,
     `The overall goal: ${state.goal}`,
+    ...placeLines,
+    ...verifyLines,
     "",
     "You receive messages from an orchestrator. Reply with the content you want sent back to the orchestrator. Do not include role tags or routing headers — just your answer.",
     "",
@@ -134,16 +174,38 @@ export async function runRole(
       (permissionMode ? `, permission-mode: ${permissionMode}` : "")
   );
 
+  // Session lineage: generation 0 is the first session, +1 per recycle. Each
+  // generation has a marker in its first prompt and (claude) a minted id, so a
+  // resume can name the session — or find it in the CLI's store by the marker.
+  const records = await readSessionRecords(runDir, roleName);
+  let gen = records.length ? records[records.length - 1].gen : 0;
+  if (!opts.resume && records.length) gen++; // a deliberately fresh session after earlier ones (escalation with MD_AGENT_ESCALATION_FRESH)
+  const recorded = new Set(records.map((r) => r.id));
+  const noteSession = (id: string, g: number): void => {
+    void writeSessionId(runDir, roleName, id);
+    if (recorded.has(id)) return;
+    recorded.add(id);
+    void appendSessionRecord(runDir, roleName, { gen: g, provider, id, at: new Date().toISOString() });
+  };
+
   // Both providers are stateful (claude --resume, agy --conversation), so the
   // resume handling is shared: reattach the stored session id when there is one,
-  // otherwise replay this role's prior turns into its mandate as memory.
+  // else search the provider's own store for this seat's marker, else replay
+  // this role's prior turns into its mandate as memory.
   let resumeSessionId: string | undefined;
   if (opts.resume) {
     const stored = await readSessionId(runDir, roleName);
+    const found = stored ? null : await findSessionByMarker(provider, runName, roleName).catch(() => null);
     if (stored) {
       resumeSessionId = stored;
       console.log(`[role:${roleName}] resuming ${provider} session ${stored}`);
+    } else if (found) {
+      resumeSessionId = found.id;
+      gen = found.gen;
+      noteSession(found.id, found.gen);
+      console.log(`[role:${roleName}] no stored id — found ${provider} session ${found.id} by its marker (gen ${found.gen})`);
     } else {
+      gen = records.length ? gen + 1 : 0;
       const history = buildRoleHistory(await readFile(transcript, "utf8"), roleName);
       if (history) {
         systemPrompt +=
@@ -160,25 +222,14 @@ export async function runRole(
     }
   }
 
-  // Where this seat's file edits land. An explicit RoleSpec.cwd wins; otherwise
-  // isolation decides — "worktree" hands the seat its own checkout so its output
-  // can be reviewed and kept or dropped, "none" shares md-agent's cwd.
-  const workspaceDir =
-    me.cwd ??
-    (await provisionWorkspace({
-      isolation: state.isolation ?? DEFAULT_ISOLATION,
-      repoDir: process.cwd(),
-      runDir,
-      runName: path.basename(runDir),
-      role: roleName,
-    }));
-  if (workspaceDir) console.log(`[role:${roleName}] workspace: ${workspaceDir}`);
-
   /**
    * Build a seat for this role. Used for both the initial session and recycling,
-   * so the two cannot drift on provider, model or permission posture.
+   * so the two cannot drift on provider, model or permission posture. The
+   * prompt opens with this generation's marker; a claude seat also starts on
+   * its minted id, recorded before the turn runs.
    */
   const makeSession = (prompt: string, resumeId?: string): AgentSession => {
+    const marker = markerFor(runName, roleName, gen);
     const common = {
       model,
       heartbeatPath,
@@ -186,16 +237,25 @@ export async function runRole(
       cwd: workspaceDir,
       logPath: logPath(runDir, roleName),
       turnTimeoutSec: turnCapSec,
+      effort: me.effort,
     };
-    const onSessionId = (id: string) => void writeSessionId(runDir, roleName, id);
-    return provider === "agy"
-      ? new AgySession({ systemPrompt: prompt, resumeId, onSessionId, ...common })
-      : new ClaudeSession({
-          systemPrompt: prompt,
-          resumeSessionId: resumeId,
-          onSessionId,
-          ...common,
-        });
+    const onSessionId = (id: string) => noteSession(id, gen);
+    if (provider === "agy") {
+      return new AgySession({ systemPrompt: `${marker}\n${prompt}`, resumeId, onSessionId, turnMaxSteps: me.turnMaxSteps, ...common });
+    }
+    const sessionId = resumeId ? undefined : mintSessionId(runName, roleName, gen);
+    if (sessionId) noteSession(sessionId, gen);
+    return new ClaudeSession({
+      systemPrompt: `${marker}\n${prompt}`,
+      resumeSessionId: resumeId,
+      sessionId,
+      onSessionId,
+      tools: me.tools ?? DEFAULT_SEAT_TOOLS,
+      noMcp: (me.mcp ?? "none") === "none",
+      maxBudgetUsd: me.turnBudgetUsd,
+      fallbackModel: me.fallbackModel,
+      ...common,
+    });
   };
 
   let session: AgentSession = makeSession(systemPrompt, resumeSessionId);
@@ -247,6 +307,7 @@ export async function runRole(
         "Reply with ONLY the note."
     );
     await logTurn();
+    gen++;
     session = makeSession(
       baseSystemPrompt +
         "\n\nHANDOFF FROM YOUR PREVIOUS SESSION (treat as your memory of the run so far):\n" +
@@ -270,11 +331,11 @@ export async function runRole(
     await clearFile(inbox);
 
     // Both providers are stateful now, so recycling is no longer claude-only.
-    // By turn count, or by size: a session whose last turn read more than
-    // RECYCLE_TOKENS would carry all of that into this turn as well.
-    const lastRead = session.lastUsage ? usageTokens(session.lastUsage) : 0;
-    if ((RECYCLE_TURNS > 0 && turnsSinceSpawn >= RECYCLE_TURNS) || (RECYCLE_TOKENS > 0 && lastRead >= RECYCLE_TOKENS)) {
-      if (lastRead >= RECYCLE_TOKENS) console.log(`[role:${roleName}] last turn processed ${Math.round(lastRead / 1000)}k tokens (≥ ${Math.round(RECYCLE_TOKENS / 1000)}k) — recycling before this one`);
+    // By turn count, or by size: the resident context every call of this turn
+    // would re-read.
+    const resident = session.lastContextTokens ?? 0;
+    if ((RECYCLE_TURNS > 0 && turnsSinceSpawn >= RECYCLE_TURNS) || (RECYCLE_TOKENS > 0 && resident >= RECYCLE_TOKENS)) {
+      if (resident >= RECYCLE_TOKENS) console.log(`[role:${roleName}] resident context is ${Math.round(resident / 1000)}k tokens (≥ ${Math.round(RECYCLE_TOKENS / 1000)}k) — recycling before this turn`);
       await recycleSession();
     }
 

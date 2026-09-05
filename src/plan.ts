@@ -13,6 +13,7 @@ import {
   normalizeProvider,
   normalizeTier,
   type RoleSpec,
+  type Usage,
   type VerifySpec,
 } from "./persist.js";
 import { Theme, theme as t } from "./theme.js";
@@ -45,7 +46,7 @@ The harness is delegate → isolate → verify → admit:
   provider "agy" (Antigravity/Gemini): breadth and volume behind a verifier — enumeration across many files, extraction to a schema, applying a known change repeatedly, first-pass drafts a command will check. Tiers: opus (${AGY_MODEL_IDS.opus}), sonnet (${AGY_MODEL_IDS.sonnet}), haiku (${AGY_MODEL_IDS.haiku}) — deliberately low/medium reasoning; a "-high" id spends ~60k thinking tokens per turn. Antigravity quota is a WEEKLY cap on the individual plan and a seat's turn is a long agentic loop that re-reads its conversation on every call, so agy seats must be given SMALL, well-scoped asks. Content goes to Google: never for health, client, or confidential data. An agreeable wrong answer is its expensive failure, so it needs a verify command or a claude reviewer behind it.
   The split that matters is NOT smart-vs-cheap: it is whether the work has a cheap, complete CHECK. Where a command can prove the result, delegate; where the only check is judgement, keep it on claude.
 - ISOLATE: isolation "worktree" gives every seat its own git worktree and branch; nothing lands in the user's tree until they merge. Requires the target to be a git repo. "none" = seats edit the shared tree directly (only when seats are advisory or fully trusted).
-- VERIFY: a shell command (exit 0 = pass) — tests, build, lint, a grep. Every seat reply is checked in that seat's workspace; a seat that claims done while it fails gets the output straight back. The run only completes when every changed workspace passes. maxFailures (default 2) is the circuit breaker; an escalation ladder (e.g. ["sonnet","opus"]) promotes seats on repeated failure, except seats pinned with escalate:false — pin deliberately cheap seats so a failure elsewhere does not erase the cost split.
+- VERIFY: a shell command (exit 0 = pass) — tests, build, lint, a grep. Every seat reply that changed its workspace is checked there; a seat that claims done while it fails gets the output straight back. The run only completes when every changed workspace passes. maxFailures (default 2) is the circuit breaker; an escalation ladder (e.g. ["sonnet","opus"]) promotes seats on repeated failure, except seats pinned with escalate:false — pin deliberately cheap seats so a failure elsewhere does not erase the cost split. A seat may carry its own "verify" (a spec, or false for a review-only seat that produces nothing the run's command can check).
 - ADMIT: the user merges the branches that passed.
 Seats that edit files need permissionMode "acceptEdits"; seats that must run commands need "bypassPermissions" (headless agents cannot prompt). Budgets: usd / tokens / plan-window percentages, each with soft (wind down) and hard (halt) lines. Checkpoints every maxMinutes let the user steer. Sub-team huddles (teams:true) let two seats iterate 1:1 without the orchestrator in the loop.
 
@@ -148,6 +149,7 @@ Reply with ONE JSON object and nothing else — no preamble, no fence:
   "roles": [
     { "name": "kebab-name", "description": "what this seat owns and how it reports", "provider": "claude|agy",
       "model": "opus|sonnet|haiku", "permissionMode": "acceptEdits|bypassPermissions|plan", "escalate": true|false,
+      "verify": false | { "cmd": "..." } | omitted (omit = the run's command; false for a review-only seat),
       "why": "one sentence: why THIS provider and tier for THIS seat — what the work's check is, and what would go wrong on a cheaper or a pricier choice" }
   ],
   "verify": { "cmd": "shell command, exit 0 = pass", "maxFailures": 2, "timeoutSec": 600 } | null,
@@ -163,7 +165,7 @@ Rules: propose the FEWEST seats that cover the goal; include a claude reviewer w
 `.trim();
 
 /** Ask the planner for a team. Reads the repo (read-only tools) to ground the verify command. */
-export async function planTeam(goal: string, opts: { cwd?: string; model?: string } = {}): Promise<{ plan: TeamPlan; raw: string; costUsd: number }> {
+export async function planTeam(goal: string, opts: { cwd?: string; model?: string } = {}): Promise<{ plan: TeamPlan; raw: string; costUsd: number; usage?: Usage }> {
   const cwd = opts.cwd ?? process.cwd();
   const facts = await repoFacts(cwd);
   const session = new ClaudeSession({
@@ -179,10 +181,15 @@ export async function planTeam(goal: string, opts: { cwd?: string; model?: strin
     model: opts.model ?? resolvePlannerModel(),
     stateless: true,
     cwd,
-    disallowedTools: ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"],
+    tools: ["Read", "Glob", "Grep"],
+    noMcp: true,
+    noSkills: true,
+    noPersist: true,
+    jsonSchema: JSON.stringify({ type: "object", properties: { name: { type: "string" }, roles: { type: "array" } }, required: ["name", "roles"] }),
   });
   const raw = await session.send(["GOAL:", goal.trim(), "", "REPOSITORY:", facts].join("\n"));
-  const costUsd = session.lastUsage?.costUsd ?? 0;
+  const usage = session.lastUsage ?? undefined;
+  const costUsd = usage?.costUsd ?? 0;
   let parsed: Record<string, any>;
   try {
     parsed = JSON.parse(extractJson(raw));
@@ -196,6 +203,7 @@ export async function planTeam(goal: string, opts: { cwd?: string; model?: strin
     model: typeof r.model === "string" && r.model in MODEL_IDS ? normalizeTier(r.model) : normalizeTier(undefined),
     permissionMode: typeof r.permissionMode === "string" ? r.permissionMode : "acceptEdits",
     ...(r.escalate === false ? { escalate: false } : {}),
+    ...(r.verify === false ? { verify: false as const } : r.verify && typeof r.verify.cmd === "string" ? { verify: { cmd: r.verify.cmd, maxFailures: r.verify.maxFailures ?? 2, timeoutSec: r.verify.timeoutSec ?? 600 } } : {}),
     ...(typeof r.why === "string" && r.why.trim() ? { why: r.why.trim() } : {}),
   }));
   if (!roles.length) throw new Error("planner proposed no seats");
@@ -212,7 +220,7 @@ export async function planTeam(goal: string, opts: { cwd?: string; model?: strin
     rationale: Array.isArray(parsed.rationale) ? parsed.rationale.map(String) : [],
     openQuestions: Array.isArray(parsed.openQuestions) ? parsed.openQuestions.map(String) : [],
   };
-  return { plan, raw, costUsd };
+  return { plan, raw, costUsd, usage };
 }
 
 /** The plan, for a human to read before deciding. */

@@ -24,7 +24,8 @@ Do not use it for judgement-only work with no command to prove the result and no
 
 - **Seats**: `provider: "claude"` for judgement, review, anything that can be quietly wrong, customer-facing or legal surfaces; `provider: "agy"` for enumeration, extraction to a schema, applying a known change repeatedly, first-pass drafts a verifier will check. agy content goes to Google — never health, client, or confidential data. Tiers `opus | sonnet | haiku` map per provider (agy: `gemini-3.1-pro-low` / `3.8-flash-medium` / `3.8-flash-low` — low/medium reasoning on purpose; Antigravity's individual plan is a **weekly** cap); a concrete model id passes through. A seat's turn is a long agentic loop inside its CLI, so give agy seats small, well-scoped asks; `turnTimeoutSec` caps a turn (300 agy / 600 claude). `escalate: false` pins a cheap seat so a verify failure elsewhere can't promote it.
 - **Isolation**: `"worktree"` gives each seat its own git worktree + branch `md-agent/<run>/<seat>`; nothing lands in the user's tree until merged. Needs a git repo.
-- **Verify**: `{ "cmd": "npm test", "maxFailures": 2 }`. Every seat reply is checked **in that seat's workspace**; a seat that claims done while it fails gets the output straight back. The run completes only when every changed workspace passes. `escalation: ["sonnet","opus"]` promotes unpinned seats on repeated failure.
+- **Verify**: `{ "cmd": "npm test", "maxFailures": 2 }`. Every seat reply that changed its workspace is checked **there**; a seat that claims done while it fails gets the output straight back. An untouched workspace is not judged. A review-only seat gets `"verify": false` (or its own `{cmd}`), so it is never bounced for an artifact another seat owns. The run completes only when every changed workspace passes. `escalation: ["sonnet","opus"]` promotes unpinned seats on repeated failure.
+- **Turn caps**: `turnBudgetUsd` (claude) and `turnMaxSteps` (agy, default 80) bound one turn; `tools` (default Bash/Read/Edit/Write/Glob/Grep/WebFetch/WebSearch) and `mcp: "none"` (default) keep the per-call prefix lean; `effort`, `fallbackModel` pass through.
 - **Admit**: teardown prints each seat's branch, diffstat and PASS/FAIL; the user merges what passed (`git merge <branch>`) and drops the rest (`git worktree remove <dir>`).
 - Seats that edit need `permissionMode: "acceptEdits"`; seats that run commands need `"bypassPermissions"` (headless agents can't prompt).
 - **Budget**: `{ "usd": {"soft":5,"hard":15}, "fiveHourPct": {"soft":70,"hard":90} }` — the window percentages are read live from the claude CLI. Soft = wind down, hard = clean HALT, resumable.
@@ -71,7 +72,7 @@ The wizard's *Review each seat* step does the same thing interactively; the rule
   "goal": "Fix every lint:standards violation in src/ without changing behavior; keep the ratchet green.",
   "roles": [
     { "name": "worker",   "description": "Enumerate violations, fix each, run the check, report file paths.", "provider": "agy",    "model": "sonnet", "escalate": false, "permissionMode": "acceptEdits" },
-    { "name": "reviewer", "description": "Read the worker's diff for behavior drift; say no when it should.",     "provider": "claude", "model": "opus",   "permissionMode": "acceptEdits" }
+    { "name": "reviewer", "description": "Read the worker's diff for behavior drift; say no when it should.",     "provider": "claude", "model": "opus",   "permissionMode": "acceptEdits", "verify": false }
   ],
   "verify": { "cmd": "npm run lint:standards && npm test", "maxFailures": 2 },
   "isolation": "worktree",
@@ -105,6 +106,7 @@ A run's record (state, ledger, transcript, traces, spend, `JOURNAL.md`) can be p
 - `runs/<dir>/transcript.md` — every message, checkpoints, verify results.
 - `runs/<dir>/log/<seat>.jsonl` — the seat's verbatim stream; read it with `--inspect`.
 - `runs/<dir>/state.json` — goal, seats, status (`endedAt`, `HALT.txt` alongside means halted), journey ref.
+- `runs/<dir>/sessions/<seat>.sessions.jsonl` — the seat's session lineage. Every seat's first prompt opens with `[md-agent <run>/<seat>#<gen>]`; claude ids are minted from that string, so a resume reattaches by id, else finds the session in the CLI's store by the marker, else replays the transcript. Journals carry the claude session files and restore them on pull.
 
 ## Env
 
