@@ -195,6 +195,19 @@ export interface RoleSpec {
   healed?: HealRecord[];
   /** Reasoning effort for the seat's CLI (`--effort low|medium|high`; claude also xhigh|max). */
   effort?: string;
+  /**
+   * Whether the seat's claude session loads the user's skills (slash commands).
+   * Default false: every skill's description rides in every call's prefix
+   * otherwise (53 of them on a typical machine), and a seat seldom needs one.
+   */
+  skills?: boolean;
+  /**
+   * Whether the seat's claude session loads the project's instructions
+   * (CLAUDE.md and project settings). Default true — a seat editing a repo
+   * usually should follow them; set false for a seat that only reads or
+   * enumerates, where a large CLAUDE.md is pure prefix cost on every call.
+   */
+  projectInstructions?: boolean;
 }
 
 /**

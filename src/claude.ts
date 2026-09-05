@@ -43,6 +43,22 @@ export class TurnLog {
  * The provider will not serve this seat again for a while: a plan window or
  * quota is exhausted. The seat stops itself on this rather than looping.
  */
+/**
+ * The turn was stopped by one of md-agent's own caps (a USD budget, a wall-clock
+ * cap): not a crash, and the work done before the cap may be on disk. Carries the
+ * turn's usage so it is booked even though the turn did not complete.
+ */
+export class TurnCappedError extends Error {
+  constructor(
+    readonly kind: "budget" | "timeout" | "turns",
+    message: string,
+    readonly calls?: number
+  ) {
+    super(message);
+    this.name = "TurnCappedError";
+  }
+}
+
 export class ProviderExhaustedError extends Error {
   constructor(
     readonly provider: "claude" | "agy",
@@ -179,6 +195,10 @@ export class ClaudeSession implements AgentSession {
       effort?: string;
       /** `--json-schema`: structured output; the reply text is the JSON. */
       jsonSchema?: string;
+      /** Extra directories the seat may read (`--add-dir`), e.g. sibling workspaces. */
+      addDirs?: string[];
+      /** `--setting-sources`: which settings/instructions load (e.g. "user" drops the project's CLAUDE.md). */
+      settingSources?: string;
     } = {}
   ) {
     this.systemPrompt = opts.systemPrompt ?? null;
@@ -204,6 +224,8 @@ export class ClaudeSession implements AgentSession {
     if (opts.fallbackModel) this.extraArgs.push("--fallback-model", opts.fallbackModel);
     if (opts.effort) this.extraArgs.push("--effort", opts.effort);
     if (opts.jsonSchema) this.extraArgs.push("--json-schema", opts.jsonSchema);
+    if (opts.addDirs?.length) this.extraArgs.push("--add-dir", ...opts.addDirs);
+    if (opts.settingSources) this.extraArgs.push("--setting-sources", opts.settingSources);
   }
 
   private readonly turnTimeoutMs: number;
@@ -299,6 +321,8 @@ export class ClaudeSession implements AgentSession {
       let assistantText = "";
       let lastText = "";
       let resultText: string | null = null;
+      let resultSubtype: string | null = null;
+      let resultCalls: number | null = null;
       let rawStdout = ""; // full stdout, kept so a non-zero exit can surface the real error
       let limited: { message: string; resetsAt?: number } | null = null;
       let timedOut = false;
@@ -375,6 +399,8 @@ export class ClaudeSession implements AgentSession {
                 costUsd: typeof msg.total_cost_usd === "number" ? msg.total_cost_usd : 0,
               };
               if (typeof msg.result === "string") resultText = msg.result;
+              if (typeof msg.subtype === "string") resultSubtype = msg.subtype;
+              if (typeof msg.num_turns === "number") resultCalls = msg.num_turns;
             }
           } catch {
             // Non-JSON line — ignore.
@@ -395,8 +421,18 @@ export class ClaudeSession implements AgentSession {
         // last block, and the concatenation carried 15–20% of "Now I'll…".
         const assistantOut = resultText?.trim() ? resultText : lastText.trim() ? lastText : assistantText;
         if (timedOut) {
-          this.log?.mark("end", { code, ms: Date.now() - startedAt, timedOut: true });
-          reject(new Error(`claude turn exceeded its ${Math.round(this.turnTimeoutMs / 1000)}s cap and was stopped — the ask was too big for one turn; re-scope it smaller`));
+          this.log?.mark("end", { code, ms: Date.now() - startedAt, timedOut: true, usage: this.lastUsageData });
+          reject(new TurnCappedError("timeout", `claude turn exceeded its ${Math.round(this.turnTimeoutMs / 1000)}s cap and was stopped — the ask was too big for one turn; re-scope it smaller`));
+          return;
+        }
+        // The CLI's own caps end the turn with a typed result subtype and a
+        // non-zero exit; the usage on that result is real spend and is kept.
+        if (code !== 0 && resultSubtype && /^error_max_(budget_usd|turns)$/.test(resultSubtype)) {
+          const kind = resultSubtype === "error_max_turns" ? "turns" : "budget";
+          this.log?.mark("end", { code, ms: Date.now() - startedAt, capped: kind, usage: this.lastUsageData });
+          reject(new TurnCappedError(kind, kind === "budget"
+            ? `claude turn hit its --max-budget-usd cap after ${resultCalls ?? "?"} calls ($${this.lastUsageData?.costUsd.toFixed(2) ?? "?"} spent) — the ask was too big for one turn's budget; re-scope it smaller`
+            : `claude turn hit its --max-turns cap after ${resultCalls ?? "?"} calls`, resultCalls ?? undefined));
           return;
         }
         this.log?.mark("end", {

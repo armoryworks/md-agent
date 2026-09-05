@@ -288,7 +288,11 @@ export class AgySession implements AgentSession {
         // Out of quota is not a failed turn to retry — it is a seat that cannot
         // work until the window resets. Surface it as its own error so the seat
         // stops itself instead of looping on empty replies.
-        const everything = `${String(obj?.response ?? "")}\n${err}\n${out.slice(-2000)}`;
+        // The seat's own response text is excluded on a SUCCESS envelope: a
+        // report that *mentions* quota is not a seat that is out of it. On any
+        // other status the response is where agy puts its own error.
+        const status0 = typeof obj?.status === "string" ? obj.status : null;
+        const everything = `${status0 === "SUCCESS" ? "" : String(obj?.response ?? "")}\n${String(obj?.error ?? "")}\n${err}\n${out.replace(/"response"\s*:\s*"(?:[^"\\]|\\.)*"/g, "").slice(-2000)}`;
         if (looksExhausted(everything)) {
           const line = everything.split("\n").find((l) => looksExhausted(l))?.trim() ?? "quota reached";
           reject(new ProviderExhaustedError("agy", `agy: ${line.slice(0, 300)}`, parseResetsIn(everything)));

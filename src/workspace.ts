@@ -86,6 +86,24 @@ export async function workspaceHasChanges(dir: string): Promise<boolean> {
   }
 }
 
+/**
+ * Commit everything in a seat's worktree on its branch, as the harness. Returns
+ * the short SHA, or null when there was nothing to commit (or no git). A
+ * verified reply that stays uncommitted is invisible to every other seat and
+ * to the completion gate's branch head — this is what makes a seat's work
+ * reachable by `git show md-agent/<run>/<seat>:<path>` from a sibling.
+ */
+export async function commitWorkspace(dir: string, message: string): Promise<string | null> {
+  try {
+    await git(dir, ["add", "-A"]);
+    if (!(await git(dir, ["status", "--porcelain"])).trim()) return null;
+    await git(dir, ["-c", "user.name=md-agent", "-c", "user.email=md-agent@armoryworks.local", "commit", "-q", "--no-verify", "-m", message]);
+    return (await git(dir, ["rev-parse", "--short", "HEAD"])).trim();
+  } catch {
+    return null;
+  }
+}
+
 /** One role's workspace and what it changed, for the end-of-run audit. */
 export interface WorkspaceReport {
   role: string;

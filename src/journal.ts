@@ -577,7 +577,10 @@ export async function offerPushAtEnd(runDir: string, runOverride?: JournalConfig
     say(r.ok ? `journal pushed: ${r.detail}` : `journal NOT pushed — ${r.detail}`);
     return r.ok ? "pushed" : "failed";
   }
-  if (!process.stdin.isTTY || !process.stdout.isTTY) return "skipped";
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.log(`journal: not offered (no terminal) — push this run later from the home screen (⇅ Journals → push), or set journal.autoPush with a remote in ~/.config/md-agent/config.json.`);
+    return "skipped";
+  }
 
   try {
     if (!cfg.remote) {

@@ -169,6 +169,35 @@ through the normal path, so it re-plans instead of waiting on a seat that is
 gone. A stopped seat stays stopped across resumes; dispatches to it are
 dropped and reported back.
 
+### Seats can reach each other's work
+
+Under `isolation: "worktree"` a seat's files live only in its own worktree, and
+a claude seat cannot read outside its cwd — so, before 1.10, a reviewer asked to
+"check the sweeper's table" answered that the file did not exist. Now:
+
+- **Verified replies are committed.** When a seat's reply passes its check, the
+  harness commits its workspace on the seat's branch (`md-agent(<seat>): <first
+  line of the reply>`) and the orchestrator's event says so: `[verify PASS in
+  sweeper's workspace: … — committed 3f2a9c1 on md-agent/<run>/sweeper]`. The
+  completion gate commits every changed workspace before judging it, so a
+  branch head is exactly the tree that passed.
+- **Sibling worktrees are readable.** Every claude seat gets
+  `--add-dir runs/<run>/workspaces`, and its mandate names the path and the
+  branch form (`git show md-agent/<run>/<seat>:<path>`), read-only.
+- **The orchestrator is told** that seats' work is not in each other's trees and
+  to hand a consumer the producer's branch or path — and to dispatch the
+  consumer only after the producer's reply has landed.
+
+### Readiness is explicit
+
+A seat that works in slices reports after each one; only a reply that presents
+the *deliverable* should be judged by the verify command. The seat's mandate
+asks it to end such a reply with the line `VERIFY-READY`; that line is what
+bounces on failure. A reply without it that still reads as finished ("done",
+"complete") is judged too, unless it also reads as interim ("slice 2 done",
+"notes at …", "continuing"), in which case the verify result is attached to the
+event rather than bounced.
+
 ### Verify where the work is
 
 With a `verify` command set, **every seat reply that changed its workspace is
@@ -211,6 +240,14 @@ session carries all of it into the next turn. Three things hold that down:
   `roles[].effort` and `roles[].fallbackModel` pass through to the CLI.
 - **A fallback ladder** — `roles[].fallback` (or a run-level `fallback`) is
   where a seat moves when its provider runs dry; see *When a provider runs dry*.
+- **No skills, optionally no project instructions.** Seats load no skills by
+  default (`roles[].skills: true` restores them — 53 descriptions rode in every
+  call before). `roles[].projectInstructions: false` runs the seat with
+  `--setting-sources user`, dropping the project's CLAUDE.md and settings from
+  its prefix: on a repo with a 70 KB CLAUDE.md that is ~20k tokens per call,
+  three times the rest of the prefix. Leave it on for seats that edit the repo;
+  turn it off for seats that only read or enumerate. The orchestrator never
+  loads it (`MD_AGENT_ORCH_PROJECT_INSTRUCTIONS=1` to restore).
 
 Large shared briefs reach seats the way they reach the orchestrator: a pointer
 to `context.md` plus an excerpt, read on demand rather than resident every turn.
@@ -252,6 +289,23 @@ to claude, model to the seat's own tier, resolved on that provider); a run-level
 { "name": "sweeper", "provider": "agy", "model": "sonnet", "escalate": false,
   "fallback": [{ "provider": "claude", "model": "haiku" }, { "model": "sonnet" }] }
 ```
+
+**A capped turn is not a crash.** A seat stopped by its own `turnBudgetUsd`,
+`turnTimeoutSec` or `turnMaxSteps` reports `[TURN CAPPED] … was stopped by its
+per-turn budget … files it wrote before the cap are on disk (possibly partial,
+uncommitted). Re-dispatch it with a SMALLER ask` — and the spend of that turn
+is booked, so the run's Σ stays true. Any other turn error is `[ROLE ERROR] …`.
+
+**Idle turns re-invoke.** Under `autoComplete`, an orchestrator turn that ends
+with nothing dispatched and no seat working is re-invoked five seconds later
+(three times at most, then the watchdog's ten-minute nudge takes over) instead
+of waiting ten minutes for the watchdog — the shape that cost a 45-minute run
+ten idle minutes.
+
+**The gate waits for busy seats.** A completion request while a seat is
+mid-turn waits for its reply (bounded by the longest turn cap in play) before
+judging, so a commit landing seconds after RUN END cannot slip past the gate
+unjudged and unbooked.
 
 A **loop guard** watches for one seat being dispatched to over and over with
 nothing verified in between — the shape that spends a week of quota on cache
@@ -510,6 +564,8 @@ config/journey path supplies `provider` directly and skips the prompt.
 - **`roles[].fallback`** / **`fallback`** — the auto-heal ladder, per seat or as
   the run's default; see *When a provider runs dry*. `roles[].healed` is written
   by md-agent when a seat moves.
+- **`roles[].skills`**, **`roles[].projectInstructions`** — see *Keeping a
+  seat's turns small*.
 
 `autoComplete` lets the orchestrator **end the run itself** — once the goal is
 met, every role is idle, and all work is committed it emits `[[PHASE-COMPLETE]]`

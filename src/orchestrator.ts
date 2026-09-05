@@ -8,7 +8,7 @@ import crossSpawn from "cross-spawn";
 import readline from "node:readline";
 import { checkbox, confirm, input, number, select } from "@inquirer/prompts";
 import { ClaudeSession, type AgentSession } from "./claude.js";
-import { reportWorkspaces, workspaceBranch, workspaceHasChanges } from "./workspace.js";
+import { commitWorkspace, reportWorkspaces, workspaceBranch, workspaceHasChanges } from "./workspace.js";
 import {
   appendTranscript,
   clearFile,
@@ -150,7 +150,13 @@ function orchDisallowedTools(): string[] {
 }
 
 /** Flags for a one-shot coordination turn that needs no tools at all (bootstrap, probe). */
-const BARE_TURN = { tools: [] as string[], noMcp: true, noSkills: true, noPersist: true };
+const BARE_TURN = { tools: [] as string[], noMcp: true, noSkills: true, noPersist: true, settingSources: "user" };
+/**
+ * The orchestrator coordinates and never touches the code, so the project's
+ * CLAUDE.md is pure prefix on its every turn (20k tokens on a large one).
+ * MD_AGENT_ORCH_PROJECT_INSTRUCTIONS=1 loads it anyway.
+ */
+const ORCH_SETTING_SOURCES = /^(1|true|on|yes)$/i.test(process.env.MD_AGENT_ORCH_PROJECT_INSTRUCTIONS ?? "") ? undefined : "user";
 
 /**
  * P4 — launch-time readiness probe. Spawn the agent CLI with a trivial prompt and a
@@ -181,7 +187,8 @@ function probeProvider(p: Provider): Promise<{ ok: boolean; detail: string; usag
     }
     const tail = (s: string) => {
       const t = s.trim().replace(/\s+/g, " ");
-      return t.length > 300 ? "…" + t.slice(-300) : t;
+      // Both ends: the reason usually sits in the middle of a JSON envelope.
+      return t.length > 600 ? `${t.slice(0, 200)} … ${t.slice(-380)}` : t;
     };
     const timer = setTimeout(() => {
       try {
@@ -299,6 +306,7 @@ function createOrchSession(systemPrompt: string, runDir: string): AgentSession {
     logPath: logPath(runDir, ORCH),
     disallowedTools: orchDisallowedTools(),
     ...(full ? {} : { tools: ORCH_TOOLS, noMcp: true, noSkills: true }),
+    settingSources: ORCH_SETTING_SOURCES,
     noPersist: true,
   });
 }
@@ -392,6 +400,8 @@ function buildOrchSystem(state: RunState, runDir: string | null): string {
     "- A seat whose verify keeps failing is STUCK, not slow. After two failures on the same work, do not send it back a third time unchanged: route the failing output to a different seat (a reviewer, or one on a stronger tier) for a diagnosis, re-scope the ask, or split it. An idle reviewer while a worker loops on verify is the wrong shape.",
     "- Roles report concise STATUS, not full deliverables; their detailed work lives in shared files. Coordinate on those summaries — never ask a role to echo a large artifact back through you.",
     "- Don't paste one role's output into another's message — summarize the relevant decision and point to the file.",
+    "- SEQUENCE DEPENDENCIES: when you ask seat A for something seat B needs (a commit, a file, a branch), dispatch B only AFTER A's reply lands — a dispatch that depends on a reply still pending is a wasted turn. Hold it in '## Plan' as 'after <A>'.",
+    "- Seats' work lives in their own worktrees under runs/<run>/workspaces/<seat> and, once verified, on branch md-agent/<run>/<seat>; the harness commits verified replies. Tell a seat the sibling's branch or path when it must read another seat's output — it is NOT in its own tree.",
     "- The literal single-word message `exit` is sent to all roles when the user terminates the run.",
     "",
     "TIME & SCOPING:",
@@ -412,6 +422,7 @@ function buildOrchSystem(state: RunState, runDir: string | null): string {
           "When the goal is fully achieved AND every role is idle AND all work is committed/written to its artifact, do NOT sit idle waiting for a checkpoint or the budget. End the run: emit your final updated ledger, NO TO: blocks, and — on its own line, outside the ledger — exactly:",
           "  [[PHASE-COMPLETE]] <one-line reason>",
           "End only when the work is genuinely done — never to escape a hard problem. If you are blocked, keep working or surface the blocker; do not emit the completion sentinel to bail out. Once emitted, the run tears down cleanly and (in a journey) hands off to the next phase.",
+          "Before the sentinel: every reviewer/challenger verdict in your ledger (a strike, a correction) is either APPLIED to the deliverable or listed in it as open, and your '## Artifacts produced' line says how much was independently checked (e.g. 'challenged 10/27'). Do not request completion in the same turn you dispatch a seat to apply verdicts — wait for its reply.",
         ].join("\n")
       : "",
     state.teams
@@ -821,6 +832,9 @@ export async function launchRun(setup: RunSetup): Promise<void> {
   // P4: fail fast if a configured agent isn't authed/responsive — before the
   // bootstrap turn, the run dir, or any role spawn.
   const preflight = await preflightAgents(roles, setup.fallback);
+  if (roles.some((r) => normalizeProvider(r.provider) === "agy") && setup.budget?.usd && !setup.budget.tokens) {
+    console.warn("[budget] agy seats report no cost and no plan windows — only claude spend counts toward budget.usd. Add budget.tokens to bound agy seats.");
+  }
   // Turns taken before the run dir exists are booked once it does, so the
   // run's Σ (and its journal) carries what the setup actually cost.
   const earlyUsage: { who: string; u: Usage }[] = preflight.usage.map((u) => ({ who: "preflight", u }));
@@ -1179,6 +1193,18 @@ export async function resumeOrchestrator(
     if (pre.healed) await updateState(runDir, { roles });
   }
 
+  // A seat that stopped itself out of quota is revived once the window it
+  // recorded has passed — resume is the common post-rate-limit path, and a
+  // stop that outlives its own reset is a seat lost for nothing.
+  let revived = 0;
+  for (const r of roles) {
+    if (r.stopped && !r.stopped.handoffTo && r.stopped.resetsAt && r.stopped.resetsAt * 1000 <= Date.now() && /exhausted|quota|limit/i.test(r.stopped.reason ?? "")) {
+      console.log(`[orchestrator] seat "${r.name}" stopped itself out of quota, and that window has reset — reviving it`);
+      delete r.stopped;
+      revived++;
+    }
+  }
+  if (revived) await updateState(runDir, { roles });
   // A seat the user stopped stays stopped across a resume; the orchestrator is
   // told about it in its system prompt and refused if it dispatches there.
   const children = roles.map((r) => (r.stopped ? null : spawnRole(r.name, runDir, true)));
@@ -1310,7 +1336,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   // When set, the next dispatch appends this text VERBATIM to every TO: body —
   // used to hand a failing verify command's output to the fixing role without
   // the orchestrator paraphrasing it (telephone-game guard).
-  let attachToDispatch: string | null = null;
+  let attachToDispatch: { roles: string[]; tail: string } | null = null;
   // Orchestrator-progress watchdog state (logic armed with the role watchdog below).
   // The orchestrator only advances when something posts an event (a role reply, user
   // input, a team result, a checkpoint WITH input, or a watchdog nudge) — the
@@ -1318,6 +1344,13 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
   // dispatch and no role pending leaves nothing to re-invoke it: a silent deadlock.
   // These track the orchestrator's own liveness so the watchdog can break it.
   let orchBusy = false; // an orchestrator turn is currently in flight
+  // The DCFS run stalled 10 min per idle turn: an orchestrator turn that ends
+  // with no dispatch and no seat pending has nothing to re-invoke it but the
+  // watchdog. Under autoComplete, re-invoke it promptly instead (bounded).
+  let lastTurnDispatched = false;
+  let idleReinvokes = 0;
+  const IDLE_REINVOKE_MS = 5_000;
+  const IDLE_REINVOKE_MAX = 3;
   let lastOrchTurnAt = Date.now(); // ms of the last completed orchestrator turn
   let orchStallNudges = 0; // consecutive progress nudges that produced no real progress
 
@@ -1392,7 +1425,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
       }
       if (a.limit.soft != null && a.value >= a.limit.soft) {
         const note = `${a.label} ${a.fmt(a.value)} ≥ soft ${a.fmt(a.limit.soft)}${a.reset}`;
-        budgetSoftNote = note;
+        budgetSoftNote = `${note}. WIND-DOWN RULE: from now on dispatch ONLY turns that finish the deliverable (commit what exists, apply open verdicts, then request completion) — start nothing new, and write one line in '## Decisions' saying why each post-soft turn was necessary.`;
         dash.setBudgetNote(`⚠ ${note}`);
         if (!budgetSoftAnnounced.has(a.label)) {
           budgetSoftAnnounced.add(a.label);
@@ -1435,6 +1468,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
    */
   async function orchTurn(eventText: string): Promise<string> {
     orchBusy = true;
+    lastTurnDispatched = false;
     try {
       const ledger = await readLedger(runDir);
       dash.orchThinking();
@@ -1509,6 +1543,19 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     } finally {
       orchBusy = false;
       lastOrchTurnAt = Date.now(); // a completed turn resets the idle clock
+      if (autoComplete && !stopping && !verifying && !lastTurnDispatched && pendingSince.size === 0 && teamOwner.size === 0) {
+        setTimeout(() => {
+          if (orchBusy || stopping || verifying || pendingSince.size > 0 || teamOwner.size > 0 || lastTurnDispatched) return;
+          if (idleReinvokes >= IDLE_REINVOKE_MAX) return; // the watchdog's nudges take over from here
+          idleReinvokes++;
+          console.log(`[orchestrator] turn ended with nothing dispatched and no seat busy — re-invoking now (${idleReinvokes}/${IDLE_REINVOKE_MAX})`);
+          void postEvent(
+            "[SYSTEM] Your last turn dispatched nothing and no seat is working. Either dispatch the next step now, or — if the goal is met and every artifact is committed — finalize with [[PHASE-COMPLETE]]. Do not end a turn idle."
+          );
+        }, IDLE_REINVOKE_MS);
+      } else if (lastTurnDispatched) {
+        idleReinvokes = 0;
+      }
     }
   }
 
@@ -1562,14 +1609,18 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
         out += b.toString("utf8");
         if (out.length > 8000) out = out.slice(-8000); // keep a bounded tail
       };
-      const child = spawn(spec.cmd, { shell: true, cwd: spec.cwd ?? process.cwd() });
+      const detached = process.platform !== "win32";
+      const child = spawn(spec.cmd, { shell: true, cwd: spec.cwd ?? process.cwd(), detached });
       child.stdout?.on("data", cap);
       child.stderr?.on("data", cap);
       const timer = setTimeout(() => {
+        // Kill the whole process group: the shell's child (the actual test
+        // runner) would otherwise outlive the shell and keep the tree busy.
         try {
-          child.kill();
+          if (detached && child.pid) process.kill(-child.pid, "SIGTERM");
+          else child.kill();
         } catch {
-          // already gone
+          try { child.kill(); } catch { /* already gone */ }
         }
         resolve({ ok: false, tail: `(timed out after ${timeoutSec}s)\n` + out.slice(-1500) });
       }, timeoutSec * 1000);
@@ -1637,12 +1688,31 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
    * The LLM does the fixing — this decides "done" and breaks the loop deterministically.
    */
   async function handleGatedCompletion(reason: string): Promise<void> {
-    if (!verify || stopping || verifying) return;
+    if (!verify || stopping) return;
+    if (verifying) {
+      // Silently dropping a second request left the orchestrator waiting on
+      // nothing; say so, and it re-emits once the running check has answered.
+      await postEvent("[SYSTEM/verify] A verification is already running for a previous completion request; wait for its result before emitting [[PHASE-COMPLETE]] again.");
+      return;
+    }
     verifying = true;
-    dash.setStatus(`verifying: ${verify.cmd}`);
-    console.log(`[verify] running: ${verify.cmd}`);
-    let result: { ok: boolean; tail: string };
+    let result: { ok: boolean; tail: string; failed: string[] };
     try {
+      // A seat mid-turn may still commit into the tree the gate is about to
+      // judge (a run once ended three minutes before its reviewer's last
+      // commit landed). Wait for outstanding dispatches, bounded by the
+      // longest turn cap in play, before judging.
+      if (pendingSince.size > 0) {
+        const busy = [...pendingSince.keys()];
+        const capSec = Math.max(...busy.map((n) => roles.find((r) => r.name === n)?.turnTimeoutSec ?? 600), 60);
+        const deadline = Date.now() + capSec * 1000;
+        console.log(`[verify] completion requested while ${busy.join(", ")} still working — waiting for their replies (up to ${capSec}s) before the gate`);
+        dash.setStatus(`gate: waiting for ${busy.join(", ")}`);
+        while (pendingSince.size > 0 && !stopping && Date.now() < deadline) await new Promise((r) => setTimeout(r, 2000));
+        if (pendingSince.size > 0) console.warn(`[verify] ${[...pendingSince.keys()].join(", ")} did not reply in time — judging the tree as it is`);
+      }
+      dash.setStatus(`verifying: ${verify.cmd}`);
+      console.log(`[verify] running: ${verify.cmd}`);
       result = await runGate();
     } finally {
       verifying = false;
@@ -1668,7 +1738,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
         await appendTranscript(transcript, "ESCALATION", `verify failed ${verifyFailures}× — roles upgraded to ${tier}; retrying`);
         await escalateRolesTo(tier);
         verifyFailures = 0;
-        attachToDispatch = result.tail; // fixer gets the failure verbatim
+        attachToDispatch = { roles: result.failed, tail: result.tail }; // fixer gets the failure verbatim
         await postEvent(
           `[SYSTEM/escalation] \`${verify.cmd}\` still failing after ${max} attempts. The team has been upgraded to model tier "${tier}" — re-attempt the failing work, then it will be re-verified. The failing output will be attached verbatim to whatever you dispatch this turn.`
         );
@@ -1681,7 +1751,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
       );
       return;
     }
-    attachToDispatch = result.tail; // fixer gets the failure verbatim
+    attachToDispatch = { roles: result.failed, tail: result.tail }; // fixer gets the failure verbatim
     await postEvent(
       `[SYSTEM/verify] Completion BLOCKED — \`${verify.cmd}\` exited non-zero (attempt ${verifyFailures}/${max}). ` +
         `Do NOT emit [[PHASE-COMPLETE]] again until it passes — fix the cause first, then it will be re-checked. ` +
@@ -1747,7 +1817,18 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     dash.flow("orch", role);
     await appendTranscript(transcript, `→ ${role} (team)`, message);
     await safeWrite(path.join(runDir, "inbox", `${role}.txt`), message);
-    return reply;
+    // A member that crashes mid-huddle must not deadlock the run: past twice
+    // its turn cap the huddle proceeds with a timeout note instead of waiting forever.
+    const capMs = ((roles.find((r) => r.name === role)?.turnTimeoutSec ?? 600) * 2) * 1000;
+    const timeout = new Promise<string>((res) =>
+      setTimeout(() => {
+        if (pendingTeamReply.get(role)) {
+          pendingTeamReply.delete(role);
+          res(`[HUDDLE TIMEOUT] ${role} did not reply within ${Math.round(capMs / 1000)}s — proceed without it or report BLOCKED.`);
+        }
+      }, capMs)
+    );
+    return Promise.race([reply, timeout]);
   }
 
   async function appendChannel(team: string, who: string, msg: string): Promise<void> {
@@ -1994,13 +2075,29 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
           console.log(`[verify] ${r.name}'s reply: workspace unchanged — not verified`);
         } else {
           dash.setStatus(`verifying ${r.name}: ${seatVerify.cmd}`);
-          const res = await verifyWorkspace(seatVerify, ws);
+          verifying = true; // a slow per-reply check is not an idle orchestrator
+          let res: { ok: boolean; tail: string };
+          try {
+            res = await verifyWorkspace(seatVerify, ws);
+          } finally {
+            verifying = false;
+          }
           dash.setStatus("running");
           if (res.ok) {
             seatVerifyFails.delete(r.name);
             resetPingPong();
             console.log(`[verify] ${r.name}'s reply: PASS in ${where}`);
-            event = `[verify PASS in ${where}: \`${seatVerify.cmd}\`]\n${event}`;
+            let committed = "";
+            if (ws) {
+              const firstLine = content.split("\n").find((l) => l.trim())?.trim().slice(0, 60) ?? "verified reply";
+              const sha = await commitWorkspace(ws, `md-agent(${r.name}): ${firstLine}`);
+              if (sha) {
+                const branch = workspaceBranch(path.basename(runDir), r.name);
+                committed = ` — committed ${sha} on ${branch}`;
+                console.log(`[verify] committed ${r.name}'s workspace as ${sha} on ${branch}`);
+              }
+            }
+            event = `[verify PASS in ${where}: \`${seatVerify.cmd}\`${committed}]\n${event}`;
           } else {
             const n = (seatVerifyFails.get(r.name) ?? 0) + 1;
             seatVerifyFails.set(r.name, n);
@@ -2075,9 +2172,12 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
 
   /** A reply that presents itself as finished — the only kind verify-on-reply bounces. */
   function claimsDone(reply: string): boolean {
+    if (/^\s*VERIFY-READY\s*$/m.test(reply)) return true;
     return (
       /\b(done|complete|completed|finished|ready for review|all set)\b/i.test(reply) &&
-      !/\b(not (yet )?(done|complete)|blocked|cannot|can't|unable|question)\b/i.test(reply)
+      !/\b(not (yet )?(done|complete)|blocked|cannot|can't|unable|question)\b/i.test(reply) &&
+      // A seat reporting a slice, notes or an interim state is not claiming the deliverable.
+      !/\b(slice \d+|interim|partial|in progress|not the deliverable|notes? (only|file|at)|next (slice|turn)|continuing)\b/i.test(reply)
     );
   }
 
@@ -2095,7 +2195,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
    * changed its workspace must pass; an untouched workspace is not judged. With
    * no isolated changes at all the shared tree is checked, as before.
    */
-  async function runGate(): Promise<{ ok: boolean; tail: string }> {
+  async function runGate(): Promise<{ ok: boolean; tail: string; failed: string[] }> {
     const spec = verify!;
     const dirty: { name: string; dir: string; spec: VerifySpec }[] = [];
     for (const r of roles) {
@@ -2105,12 +2205,18 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
       const dir = seatWorkspaceDir(r.name);
       if (dir && (await workspaceHasChanges(dir))) dirty.push({ name: r.name, dir, spec: own });
     }
-    if (!dirty.length) return verifyWorkspace(spec, undefined);
+    if (!dirty.length) return { ...(await verifyWorkspace(spec, undefined)), failed: [] };
+    // Commit first, so the branch head IS the tree being judged and a sibling
+    // (or the user) can reach exactly what passed.
+    for (const d of dirty) {
+      const sha = await commitWorkspace(d.dir, `md-agent(${d.name}): at the completion gate`);
+      if (sha) console.log(`[verify] committed ${d.name}'s workspace as ${sha} on ${workspaceBranch(path.basename(runDir), d.name)}`);
+    }
     // Independent trees, independent processes: judge them at once.
     const results = await Promise.all(dirty.map(async (d) => ({ ...d, res: await verifyWorkspace(d.spec, d.dir) })));
     const ok = results.every((r) => r.res.ok);
     const tails = results.map((r) => `--- ${r.name} (${r.dir}): ${r.res.ok ? "PASS" : "FAIL"}${r.res.ok ? "" : `\n${r.res.tail}`}`);
-    return { ok, tail: tails.join("\n") };
+    return { ok, tail: tails.join("\n"), failed: results.filter((r) => !r.res.ok).map((r) => r.name) };
   }
 
   // User interjection via stdin — feed to orchestrator only; it decides
@@ -2795,10 +2901,13 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     }
     const attach = attachToDispatch;
     attachToDispatch = null;
+    if (byRole.size) lastTurnDispatched = true;
     for (const [role, bodies] of byRole) {
       let body = bodies.join("\n\n---\n\n");
-      if (attach) {
-        body += `\n\n[verify output — attached verbatim by the harness]\n\`\`\`\n${attach}\n\`\`\``;
+      // The failure output goes only to a seat whose workspace failed (or to
+      // everyone when the shared tree failed) — never to an unrelated seat.
+      if (attach && (attach.roles.length === 0 || attach.roles.includes(role))) {
+        body += `\n\n[verify output — attached verbatim by the harness]\n\`\`\`\n${attach.tail}\n\`\`\``;
       }
       await sendToRole({ role, body });
     }

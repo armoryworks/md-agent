@@ -1,7 +1,7 @@
 import path from "node:path";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { ClaudeSession, ProviderExhaustedError, type AgentSession } from "./claude.js";
+import { ClaudeSession, ProviderExhaustedError, TurnCappedError, type AgentSession } from "./claude.js";
 import { applyFallback, identity, nextRung } from "./heal.js";
 import { AgySession } from "./agy.js";
 import { provisionWorkspace, workspaceBranch } from "./workspace.js";
@@ -135,15 +135,26 @@ export async function runRole(
   // seat that runs a different command, or edits the repo root from a
   // worktree, is the failure both of these lines exist to prevent.
   const verifySpec = me.verify === false ? undefined : (me.verify ?? state.verify);
+  const isolated = (state.isolation ?? DEFAULT_ISOLATION) === "worktree" && !me.cwd;
+  const siblingsDir = path.join(runDir, "workspaces");
   const placeLines = workspaceDir
     ? [
         `Your workspace: ${workspaceDir}` +
-          ((state.isolation ?? DEFAULT_ISOLATION) === "worktree" && !me.cwd ? ` (git branch ${workspaceBranch(runName, roleName)}, a worktree of ${repoDir})` : "") +
+          (isolated ? ` (git branch ${workspaceBranch(runName, roleName)}, a worktree of ${repoDir})` : "") +
           `. Every file you read or edit and every command you run is there. Never edit ${repoDir} itself.`,
+        ...(isolated
+          ? [
+              `Other seats' work: each seat has its own worktree under ${siblingsDir}/<seat> (read-only for you — never edit another seat's tree) and, once verified, its commits on branch md-agent/${runName}/<seat> in the shared repo. Read a sibling's file directly from its worktree, or \`git show md-agent/${runName}/<seat>:<path>\` from yours. Nothing appears in your own tree until you merge it.`,
+              `Your verified replies are committed on your branch by the harness; you may also commit yourself.`,
+            ]
+          : []),
       ]
     : [];
   const verifyLines = verifySpec
-    ? [`The run's check is exactly: \`${verifySpec.cmd}\` — run that (in your workspace) before reporting done; it is what your reply will be judged by.`]
+    ? [
+        `The run's check is exactly: \`${verifySpec.cmd}\` — run that (in your workspace) before reporting done; it is what your reply will be judged by.`,
+        "When a reply is READY to be judged by that check — the deliverable is in place — end it with the line VERIFY-READY on its own. An interim status (a slice done, notes written, a question) must not carry that line; it is reported as-is and never bounced.",
+      ]
     : me.verify === false
       ? ["This seat produces no artifact the run's verify command checks; report findings, not passes."]
       : [];
@@ -260,8 +271,11 @@ export async function runRole(
       onSessionId,
       tools: me.tools ?? DEFAULT_SEAT_TOOLS,
       noMcp: (me.mcp ?? "none") === "none",
+      noSkills: me.skills !== true,
       maxBudgetUsd: me.turnBudgetUsd,
       fallbackModel: me.fallbackModel,
+      addDirs: isolated ? [siblingsDir] : undefined,
+      settingSources: me.projectInstructions === false ? "user" : undefined,
       ...common,
     });
   };
@@ -491,6 +505,10 @@ export async function runRole(
       }
     } catch (err) {
       console.error(`[role:${roleName}] error:`, err);
+      // A turn that failed still spent: book what the CLI reported so the run's
+      // Σ is the truth (a $3 capped turn was invisible before this).
+      turnsSinceSpawn++;
+      await logTurn().catch(() => {});
       // A silent seat strands the orchestrator until the watchdog gives up on
       // it; a seat that says what went wrong lets it re-plan now.
       if (err instanceof ProviderExhaustedError) {
@@ -498,6 +516,16 @@ export async function runRole(
         return;
       }
       try {
+        if (err instanceof TurnCappedError) {
+          const where = workspaceDir ? ` in ${workspaceDir}` : "";
+          await safeWrite(
+            outbox,
+            `[TURN CAPPED] ${roleName} (${provider}/${model}) was stopped by its ${err.kind === "budget" ? "per-turn budget" : err.kind === "timeout" ? "turn time cap" : "turn cap"}: ${err.message.split("\n")[0].slice(0, 300)}. ` +
+              `This is NOT a failure of the work — the seat was mid-task. Any files it wrote before the cap are on disk${where} (possibly partial, uncommitted). ` +
+              `Re-dispatch it with a SMALLER ask (one slice), telling it to check what it already wrote first; or raise the cap.`
+          );
+          return;
+        }
         await safeWrite(
           outbox,
           `[ROLE ERROR] ${roleName} (${provider}/${model}) could not complete this turn: ${(err as Error).message.split("\n")[0].slice(0, 300)}. ` +

@@ -32,8 +32,12 @@ const AGY_OK = [
   '{"event":"step_update","step_update":{"conversation_id":"c-1","step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"pong\\n"}}',
   '{"event":"result","result":{"conversation_id":"c-1","status":"SUCCESS","response":"pong\\n","duration_seconds":1,"num_turns":1,"usage":{"input_tokens":10,"output_tokens":1,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":11}}}',
 ].join("\n");
+// The real shape (seen live 2026-09-05): a non-SUCCESS status with the quota text in `error`.
 const AGY_QUOTA =
-  '{"event":"result","result":{"conversation_id":"c-2","status":"SUCCESS","response":"Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 164h48m.","usage":{"input_tokens":0,"output_tokens":0}}}';
+  '{"event":"result","result":{"conversation_id":"c-2","status":"ERROR","response":"","error":"Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 164h48m.","usage":{"input_tokens":0,"output_tokens":0}}}';
+// A seat whose own REPORT mentions quota on a SUCCESS envelope is not out of quota (S3, 09-04).
+const AGY_MENTIONS_QUOTA =
+  '{"event":"result","result":{"conversation_id":"c-5","status":"SUCCESS","response":"Finding 3: the client shows \'quota reached\' when the API rate limit exceeded; resets in 5m per the docs.","usage":{"input_tokens":1,"output_tokens":1}}}';
 // Per-step usage is per call; the envelope is cumulative for the conversation.
 const AGY_STEPS = [
   '{"event":"init","conversation_id":"c-3","init":{"model":"gemini-3.8-flash-low"}}',
@@ -93,6 +97,19 @@ async function main(): Promise<void> {
     check("provider is agy", e?.provider === "agy");
     const expect = Math.floor(Date.now() / 1000) + 164 * 3600 + 48 * 60;
     check("reset time parsed from 'Resets in 164h48m'", !!e?.resetsAt && Math.abs(e.resetsAt - expect) < 5, String(e?.resetsAt));
+  }
+
+  fake("agy", `cat <<'EOF'\n${AGY_MENTIONS_QUOTA}\nEOF`);
+  {
+    const s = new AgySession({ model: "x" });
+    let err: unknown;
+    let reply = "";
+    try {
+      reply = await s.send("ping");
+    } catch (e) {
+      err = e;
+    }
+    check("a SUCCESS reply that merely mentions quota is a reply, not an exhaustion", !err && /Finding 3/.test(reply), String(err));
   }
 
   fake("agy", `cat <<'EOF'\n${AGY_STEPS}\nEOF`);
