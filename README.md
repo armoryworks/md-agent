@@ -138,6 +138,26 @@ each with its goal, spend, recency and status (`running`, `unfinished`,
    `md-agent.launch.json`, or **adjust it by hand** (the wizard, prefilled). A
    plan costs roughly a dollar's worth of tokens and takes under a minute.
 
+### Which tier for which seat (measured)
+
+Five runs of one three-angle code review on 2026-09-05, same seats otherwise,
+scored against the opus run's 20 challenger-verified findings:
+
+| Reviewer shape | Cost | Baseline hits | False positives the challenger passed |
+|---|---|---|---|
+| opus, all angles | $9.78 | 19–20 | 0 |
+| opus correctness + sonnet drift | $5.00 | 8 | 1 |
+| sonnet correctness + sonnet drift | $3.71 | 3 | 1 |
+| sonnet, all angles | $4.57 | ~2.5 | 3 |
+
+So: **every seat that judges runs on opus** — review, challenge, audit,
+drift or gap analysis, anything whose output is a conclusion. Split judging
+work across parallel opus seats for wall-clock, never down-tier it for cost.
+Sonnet and haiku take the work a command checks: enumeration, extraction,
+applying a known change, citation checking. A sonnet challenger verifies
+citations, not conclusions; put the challenger on opus when the conclusions
+matter. `md-agent init`, the planner and the skill all encode this.
+
 ### `md-agent init`
 
 Writes a starter `md-agent.launch.json` into the current repo — a cheap seat
@@ -199,6 +219,13 @@ bounces on failure. A reply without it that still reads as finished ("done",
 event rather than bounced.
 
 ### Verify where the work is
+
+**The verify command is dry-run at launch.** It is expected to fail (the
+deliverable does not exist yet); what refuses the launch is a shell error or a
+malformed comparison (`test -ge 10` with no left operand — what an unquoted
+heredoc leaves behind when it eats `$(…)`), because every seat reply would then
+bounce on a check that can never pass. Three runs spent $3.56 that way before
+this check existed.
 
 With a `verify` command set, **every seat reply that changed its workspace is
 checked there** before the orchestrator sees it (an isolated workspace with no

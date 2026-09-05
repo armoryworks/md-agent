@@ -163,7 +163,7 @@ Reply with ONE JSON object and nothing else — no preamble, no fence:
   "rationale": ["short bullets: why this many seats, why each provider/tier, why this verify command"],
   "openQuestions": ["anything the goal or repo leaves undecided that the user should settle before launching"]
 }
-Rules: propose the FEWEST seats that cover the goal; include a claude reviewer when work can be quietly wrong; a verify command only if one can actually prove the result here (else null and say so in openQuestions); isolation "worktree" whenever the target is a git repo and seats edit files; pin agy seats with escalate:false; never put confidential or health data on agy.
+Rules: propose the FEWEST seats that cover the goal; include a claude reviewer when work can be quietly wrong; TIERS ARE MEASURED, NOT GUESSED: every seat that JUDGES (review, challenge, audit, drift or gap analysis, anything whose output is a conclusion) is claude opus — on the same review sonnet found 15–25% of what opus found and a sonnet challenger passed false positives opus struck; sonnet and haiku only for work a command checks (enumeration, extraction, applying a known change, tables); split judging work across PARALLEL opus seats for wall-clock, never down-tier it for cost; the challenger is opus when the deliverable's conclusions matter, sonnet when only citations are being checked; a verify command only if one can actually prove the result here (else null and say so in openQuestions); isolation "worktree" whenever the target is a git repo and seats edit files; pin agy seats with escalate:false; never put confidential or health data on agy.
 `.trim();
 
 /** Ask the planner for a team. Reads the repo (read-only tools) to ground the verify command. */

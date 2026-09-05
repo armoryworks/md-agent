@@ -238,6 +238,53 @@ function probeProvider(p: Provider): Promise<{ ok: boolean; detail: string; usag
 }
 
 /**
+ * Dry-run a verify command at launch. It is EXPECTED to fail (the deliverable does
+ * not exist yet); what must not happen is a shell error — a command that a
+ * generator gutted (`test  -ge 10`), a tool that is not installed — because every
+ * seat reply would then bounce on a check that can never pass, and the run would
+ * spend its budget on a config bug. Three runs did exactly that before this.
+ */
+function dryRunVerify(cmd: string, cwd: string): Promise<{ code: number | null; tail: string }> {
+  return new Promise((resolve) => {
+    let out = "";
+    const child = spawn(cmd, { shell: true, cwd });
+    const cap = (b: Buffer) => { out += b.toString("utf8"); if (out.length > 4000) out = out.slice(-4000); };
+    child.stdout?.on("data", cap);
+    child.stderr?.on("data", cap);
+    const timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } resolve({ code: null, tail: out.slice(-600) }); }, 120_000);
+    child.on("exit", (code) => { clearTimeout(timer); resolve({ code, tail: out.slice(-600) }); });
+    child.on("error", (e) => { clearTimeout(timer); resolve({ code: 127, tail: (e as Error).message }); });
+  });
+}
+
+const SHELL_ERROR = /command not found|syntax error|unexpected (token|EOF)|unary operator expected|binary operator expected|integer expression expected|No such file or directory: .*\.sh|not recognized as an internal/i;
+
+/** Every distinct verify command a launch will run, dry-run once; a shell error refuses the launch. */
+async function preflightVerify(specs: (VerifySpec | undefined)[], cwd: string): Promise<void> {
+  const seen = new Set<string>();
+  for (const spec of specs) {
+    if (!spec?.cmd || seen.has(spec.cmd)) continue;
+    seen.add(spec.cmd);
+    // A gutted `$(…)` leaves `test -ge 10` with no left operand; the dry run
+    // may never reach it (an earlier `&&` short-circuits), so catch it statically too.
+    if (/\btest\s+-(?:ge|le|gt|lt|eq|ne)\b/.test(spec.cmd) || /\$\(\s*\)/.test(spec.cmd)) {
+      throw new Error(
+        `[preflight] verify command is malformed — a comparison with no left operand (a generated config lost its $(…), usually to an unquoted heredoc):\n  cmd: ${spec.cmd}\nEvery seat reply would bounce on it. Fix the command or set MD_AGENT_SKIP_PREFLIGHT=1.`
+      );
+    }
+    const r = await dryRunVerify(spec.cmd, spec.cwd ?? cwd);
+    if (SHELL_ERROR.test(r.tail) || r.code === 127 || r.code === 2 && /test:|\[:/.test(r.tail)) {
+      throw new Error(
+        `[preflight] verify command is broken — it fails with a shell error, not a test failure:\n` +
+          `  cmd:  ${spec.cmd}\n  tail: ${r.tail.trim().replace(/\s+/g, " ").slice(-300)}\n` +
+          `Every seat reply would bounce on it. Fix the command (a generated config often loses $(…) to an unquoted heredoc) or set MD_AGENT_SKIP_PREFLIGHT=1.`
+      );
+    }
+    console.log(`[preflight] verify dry-run: exit ${r.code ?? "timeout"} (a missing deliverable is expected before the run) — \`${spec.cmd.slice(0, 80)}${spec.cmd.length > 80 ? "…" : ""}\``);
+  }
+}
+
+/**
  * Probe every agent CLI the run will use (orchestrator's claude + any role
  * providers), failing fast with a readable reason rather than an empty-ledger crash
  * mid-run. Skip with MD_AGENT_SKIP_PREFLIGHT=1 (offline / fast iteration). Resolves
@@ -832,6 +879,9 @@ export async function launchRun(setup: RunSetup): Promise<void> {
   // P4: fail fast if a configured agent isn't authed/responsive — before the
   // bootstrap turn, the run dir, or any role spawn.
   const preflight = await preflightAgents(roles, setup.fallback);
+  if (!/^(1|true|on|yes)$/i.test(process.env.MD_AGENT_SKIP_PREFLIGHT ?? "")) {
+    await preflightVerify([setup.verify, ...roles.map((r) => (r.verify || undefined))], process.cwd());
+  }
   if (roles.some((r) => normalizeProvider(r.provider) === "agy") && setup.budget?.usd && !setup.budget.tokens) {
     console.warn("[budget] agy seats report no cost and no plan windows — only claude spend counts toward budget.usd. Add budget.tokens to bound agy seats.");
   }
