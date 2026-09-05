@@ -104,6 +104,58 @@ export async function commitWorkspace(dir: string, message: string): Promise<str
   }
 }
 
+/** Result of merging every changed seat branch into one scratch tree. */
+export interface MergedWorkspace {
+  /** The scratch worktree (`<runDir>/workspaces/.merged`), detached at the base HEAD. */
+  dir: string;
+  /** Branches merged cleanly, in order. */
+  merged: string[];
+  /** Branches that conflicted, with the conflicting paths; each was aborted and skipped. */
+  conflicts: { role: string; branch: string; files: string[] }[];
+}
+
+/**
+ * The gate judges each seat's tree alone; two seats can each pass and still
+ * not combine (a rename here, an edit of the same line there). Merge every
+ * changed seat branch into one scratch worktree cut from the base HEAD, so the
+ * run's verify can be run once on what the user would actually get by merging
+ * them all. A conflict is a finding in itself: reported per branch with the
+ * paths, the branch aborted, the rest still merged.
+ */
+export async function mergeWorkspaces(opts: {
+  repoDir: string;
+  runDir: string;
+  runName: string;
+  roles: string[];
+}): Promise<MergedWorkspace> {
+  const dir = path.join(opts.runDir, "workspaces", ".merged");
+  await removeMergedWorkspace(opts.repoDir, dir);
+  await mkdir(path.dirname(dir), { recursive: true });
+  const head = await git(opts.repoDir, ["rev-parse", "HEAD"]);
+  await git(opts.repoDir, ["worktree", "add", "--detach", dir, head]);
+  const out: MergedWorkspace = { dir, merged: [], conflicts: [] };
+  const ident = ["-c", "user.name=md-agent", "-c", "user.email=md-agent@armoryworks.local"];
+  for (const role of opts.roles) {
+    const branch = workspaceBranch(opts.runName, role);
+    try {
+      await git(dir, [...ident, "merge", "--no-ff", "--no-edit", "-m", `md-agent: merge ${branch}`, branch]);
+      out.merged.push(branch);
+    } catch {
+      const files = (await git(dir, ["diff", "--name-only", "--diff-filter=U"]).catch(() => "")).split("\n").filter(Boolean);
+      await git(dir, ["merge", "--abort"]).catch(() => undefined);
+      out.conflicts.push({ role, branch, files });
+    }
+  }
+  return out;
+}
+
+/** Drop the scratch merged worktree (idempotent). */
+export async function removeMergedWorkspace(repoDir: string, dir: string): Promise<void> {
+  if (!existsSync(dir)) return;
+  await git(repoDir, ["worktree", "remove", "--force", dir]).catch(() => undefined);
+  await git(repoDir, ["worktree", "prune"]).catch(() => undefined);
+}
+
 /** One role's workspace and what it changed, for the end-of-run audit. */
 export interface WorkspaceReport {
   role: string;

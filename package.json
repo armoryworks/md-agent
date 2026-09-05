@@ -21,7 +21,7 @@
     "dev": "tsx src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "tsx smoke-team.ts && tsx smoke-providers.ts && tsx smoke-heal.ts",
+    "test": "tsx smoke-team.ts && tsx smoke-providers.ts && tsx smoke-heal.ts && tsx smoke-workspace.ts && tsx smoke-script.ts",
     "prepublishOnly": "npm run build && npm test",
     "smoke:agy": "tsx smoke-agy.ts"
   },

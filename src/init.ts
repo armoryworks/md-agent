@@ -27,6 +27,8 @@ export async function runInit(cwd = process.cwd()): Promise<void> {
       roles: "One seat per role. provider: claude for judgement/review/anything that can be quietly wrong; agy for enumeration, extraction, repeated known edits behind a verifier (content goes to Google). model: opus|sonnet|haiku, or a concrete id.",
       escalate: "false pins a seat at its tier so a verify failure elsewhere can't promote it — keep the cheap seat cheap.",
       fallback: "Auto-heal: where a seat moves when its provider runs dry (quota, rate limit, not ready at preflight). A ladder of {provider, model}; the seat is reseeded there and the orchestrator is told. Per seat, or run-level as the default.",
+      setup: "A shell command run once in each seat's fresh worktree before it starts (npm ci, dotnet restore) and in the gate's merged tree — what the verify command needs that a checkout does not carry.",
+      script: "Script mode: path to a JS module exporting `async (h) => reason`; h.dispatch(seat, ask) / h.read(seat, path) / h.note(line). Order, phases and completion become code; no orchestrator model turns.",
       readOnly: "A judging seat: Read/Grep/Glob only, no shell, no writes — it cannot dump files or run suites by accident, which is where most re-read tokens go. It can still read the other seats' worktrees.",
       turnBudgetUsd: "USD cap on one claude turn. Unset = the tier default (opus 5, sonnet 2.5, haiku 1); 0 = none. A capped turn reports [TURN CAPPED] with its partial work on disk.",
       verify: "A shell command that proves the result (tests, build, lint). Exit 0 = pass. Gates completion AND judges each seat's worktree at teardown.",

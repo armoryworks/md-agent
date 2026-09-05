@@ -60,7 +60,10 @@ export class AgySession implements AgentSession {
     turnMaxSteps?: number;
     /** `--effort low|medium|high`. */
     effort?: string;
+    /** USD per million tokens by class; unset → cost 0 (see BudgetSpec.agyUsdPerMTokens). */
+    pricing?: { input?: number; output?: number; cacheRead?: number };
   }) {
+    this.pricing = opts.pricing ?? null;
     this.systemPrompt = opts.systemPrompt ?? null;
     this.model = opts.model ?? null;
     this.permissionMode = opts.permissionMode ?? null;
@@ -255,7 +258,7 @@ export class AgySession implements AgentSession {
         if (lineBuf.trim()) this.log?.raw(lineBuf.trim());
         const obj = this.parseResult(out);
         const turnUsage: Usage | null = sawStepUsage
-          ? { inputTokens: stepSum.input, outputTokens: stepSum.output, cacheReadTokens: stepSum.cacheRead, cacheCreationTokens: 0, costUsd: 0 }
+          ? { inputTokens: stepSum.input, outputTokens: stepSum.output, cacheReadTokens: stepSum.cacheRead, cacheCreationTokens: 0, costUsd: this.price({ inputTokens: stepSum.input, outputTokens: stepSum.output, cacheReadTokens: stepSum.cacheRead }) }
           : obj
             ? this.extractUsage(obj)
             : null;
@@ -388,15 +391,24 @@ export class AgySession implements AgentSession {
    * is folded into output because that is how reasoning tokens bill; cost is
    * not computed here (no price table).
    */
+  private readonly pricing: { input?: number; output?: number; cacheRead?: number } | null;
+
+  /** Estimated USD for a turn from the configured per-million prices; 0 when none. */
+  private price(u: { inputTokens: number; outputTokens: number; cacheReadTokens: number }): number {
+    const p = this.pricing;
+    if (!p) return 0;
+    return (u.inputTokens * (p.input ?? 0) + u.outputTokens * (p.output ?? 0) + u.cacheReadTokens * (p.cacheRead ?? 0)) / 1_000_000;
+  }
+
   private extractUsage(obj: Record<string, any> | null): Usage {
     const u = obj?.usage ?? {};
     const n = (v: unknown) => Number(v ?? 0) || 0;
-    return {
+    const base = {
       inputTokens: n(u.input_tokens),
       outputTokens: n(u.output_tokens) + n(u.thinking_tokens),
       cacheReadTokens: n(u.cache_read_tokens),
       cacheCreationTokens: 0,
-      costUsd: 0,
     };
+    return { ...base, costUsd: this.price(base) };
   }
 }

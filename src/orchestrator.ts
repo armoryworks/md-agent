@@ -8,7 +8,8 @@ import crossSpawn from "cross-spawn";
 import readline from "node:readline";
 import { checkbox, confirm, input, number, select } from "@inquirer/prompts";
 import { ClaudeSession, type AgentSession } from "./claude.js";
-import { commitWorkspace, reportWorkspaces, workspaceBranch, workspaceHasChanges } from "./workspace.js";
+import { commitWorkspace, mergeWorkspaces, removeMergedWorkspace, reportWorkspaces, workspaceBranch, workspaceHasChanges } from "./workspace.js";
+import { ScriptSession } from "./script.js";
 import {
   appendTranscript,
   clearFile,
@@ -258,6 +259,20 @@ function dryRunVerify(cmd: string, cwd: string): Promise<{ code: number | null; 
 }
 
 const SHELL_ERROR = /command not found|syntax error|unexpected (token|EOF)|unary operator expected|binary operator expected|integer expression expected|No such file or directory: .*\.sh|not recognized as an internal/i;
+
+/** Run a worktree's setup command; bounded, tailed, never throws. */
+export function runSetup(cmd: string, cwd: string, timeoutSec = 900): Promise<{ ok: boolean; tail: string }> {
+  return new Promise((resolve) => {
+    let out = "";
+    const cap = (b: Buffer) => { out += b.toString("utf8"); if (out.length > 8000) out = out.slice(-8000); };
+    const child = spawn(cmd, { shell: true, cwd });
+    child.stdout?.on("data", cap);
+    child.stderr?.on("data", cap);
+    const timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } resolve({ ok: false, tail: `(setup timed out after ${timeoutSec}s)\n` + out.slice(-1500) }); }, timeoutSec * 1000);
+    child.on("exit", (code) => { clearTimeout(timer); resolve({ ok: code === 0, tail: out.slice(-1500) }); });
+    child.on("error", (e) => { clearTimeout(timer); resolve({ ok: false, tail: (e as Error).message }); });
+  });
+}
 
 /** Every distinct verify command a launch will run, dry-run once; a shell error refuses the launch. */
 async function preflightVerify(specs: (VerifySpec | undefined)[], cwd: string): Promise<void> {
@@ -858,6 +873,10 @@ export interface RunSetup {
   budget?: BudgetSpec;
   /** Default auto-heal ladder for seats without their own `fallback`. */
   fallback?: FallbackRung | FallbackRung[];
+  /** Absolute path of a script that drives the run instead of a model orchestrator. */
+  script?: string;
+  /** Per-worktree setup command. */
+  setup?: string;
   /** Journal settings for this run, over the global config. */
   journal?: JournalConfig;
   /** What the planner turn cost, when one ran — booked into the run once it has a dir. */
@@ -882,8 +901,8 @@ export async function launchRun(setup: RunSetup): Promise<void> {
   if (!/^(1|true|on|yes)$/i.test(process.env.MD_AGENT_SKIP_PREFLIGHT ?? "")) {
     await preflightVerify([setup.verify, ...roles.map((r) => (r.verify || undefined))], process.cwd());
   }
-  if (roles.some((r) => normalizeProvider(r.provider) === "agy") && setup.budget?.usd && !setup.budget.tokens) {
-    console.warn("[budget] agy seats report no cost and no plan windows — only claude spend counts toward budget.usd. Add budget.tokens to bound agy seats.");
+  if (roles.some((r) => normalizeProvider(r.provider) === "agy") && setup.budget?.usd && !setup.budget.tokens && !setup.budget.agyUsdPerMTokens) {
+    console.warn("[budget] agy seats report tokens but no price — they count $0 toward budget.usd. Set budget.agyUsdPerMTokens {input, output, cacheRead} to estimate them, or budget.tokens to bound them.");
   }
   // Turns taken before the run dir exists are booked once it does, so the
   // run's Σ (and its journal) carries what the setup actually cost.
@@ -1004,8 +1023,11 @@ export async function launchRun(setup: RunSetup): Promise<void> {
     journey: setup.journey,
     budget: setup.budget,
     fallback: setup.fallback,
+    script: setup.script,
+    setup: setup.setup,
     journal: setup.journal,
   };
+  if (state.script) state.autoComplete = true; // the script decides when the run is done
   await writeFile(path.join(runDir, "state.json"), JSON.stringify(state, null, 2), "utf8");
 
   // A large shared-context brief is persisted for the orchestrator to read on
@@ -1018,7 +1040,10 @@ export async function launchRun(setup: RunSetup): Promise<void> {
   // The orchestrator runs STATELESS: each turn it gets the ledger + new event,
   // so resident context stays bounded and cache expiry between slow role turns
   // becomes cheap rather than catastrophic.
-  const orch = createOrchSession(buildOrchSystem(state, runDir), runDir);
+  const orch = state.script
+    ? new ScriptSession(state.script, { roles: state.roles.map((r) => r.name), runDir, runName: path.basename(runDir), repoDir: process.cwd(), isolation: state.isolation ?? DEFAULT_ISOLATION })
+    : createOrchSession(buildOrchSystem(state, runDir), runDir);
+  if (state.script) console.log(`[orchestrator] script mode: ${state.script} drives dispatch; no orchestrator model turns`);
 
   // The ledger is the orchestrator's externalized memory; it starts empty and
   // the orchestrator populates it on its first turn. It is also what makes a
@@ -1123,6 +1148,8 @@ export async function runFromConfig(configPath: string): Promise<void> {
     journey: cfg.journey,
     budget: cfg.budget,
     fallback: cfg.fallback,
+    script: cfg.script ? path.resolve(baseDir, cfg.script) : undefined,
+    setup: cfg.setup,
     journal: cfg.journal,
   });
 }
@@ -1224,7 +1251,10 @@ export async function resumeOrchestrator(
   ) {
     await writeFile(contextFilePath(runDir), state.context, "utf8");
   }
-  const orch = createOrchSession(buildOrchSystem(state, runDir), runDir);
+  const orch = state.script
+    ? new ScriptSession(state.script, { roles: state.roles.map((r) => r.name), runDir, runName: path.basename(runDir), repoDir: process.cwd(), isolation: state.isolation ?? DEFAULT_ISOLATION })
+    : createOrchSession(buildOrchSystem(state, runDir), runDir);
+  if (state.script) console.log(`[orchestrator] script mode: ${state.script} drives dispatch; no orchestrator model turns`);
 
   // Clear stale inbox/outbox so freshly spawned roles don't reprocess leftover
   // content (notably the `exit` sentinel written on a prior clean shutdown).
@@ -2016,6 +2046,7 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
                 : "  every seat passed verification."
             );
             if (passing.length) console.log(`  safe to merge: ${passing.join(", ")}`);
+            if (mergedVerdict) console.log(`  merged together: ${mergedVerdict}${mergedVerdict === "PASS" ? " — the branches combine and the check passes on the result" : ""}`);
           }
           console.log("  keep: git merge <branch>     drop: git worktree remove <dir>\n");
         }
@@ -2264,10 +2295,46 @@ async function runLoop(ctx: LoopCtx): Promise<void> {
     }
     // Independent trees, independent processes: judge them at once.
     const results = await Promise.all(dirty.map(async (d) => ({ ...d, res: await verifyWorkspace(d.spec, d.dir) })));
-    const ok = results.every((r) => r.res.ok);
+    let ok = results.every((r) => r.res.ok);
     const tails = results.map((r) => `--- ${r.name} (${r.dir}): ${r.res.ok ? "PASS" : "FAIL"}${r.res.ok ? "" : `\n${r.res.tail}`}`);
-    return { ok, tail: tails.join("\n"), failed: results.filter((r) => !r.res.ok).map((r) => r.name) };
+    const failed = results.filter((r) => !r.res.ok).map((r) => r.name);
+    // Each tree passing alone says nothing about the trees together. Merge
+    // every changed branch into one scratch tree cut from the base and run the
+    // run's check there once; a conflict is a FAIL naming the paths.
+    if (ok && dirty.length > 1) {
+      const runName = path.basename(runDir);
+      let m: Awaited<ReturnType<typeof mergeWorkspaces>> | null = null;
+      try {
+        m = await mergeWorkspaces({ repoDir: process.cwd(), runDir, runName, roles: dirty.map((d) => d.name) });
+        if (m.conflicts.length) {
+          ok = false;
+          for (const c of m.conflicts) failed.push(c.role);
+          tails.push(`--- merged tree: CONFLICT\n${m.conflicts.map((c) => `${c.branch}: ${c.files.join(", ") || "(merge failed)"}`).join("\n")}`);
+          mergedVerdict = `CONFLICT (${m.conflicts.map((c) => c.role).join(", ")})`;
+        } else {
+          if (setupCmd) {
+            const su = await runSetup(setupCmd, m.dir);
+            if (!su.ok) tails.push(`--- merged tree: setup failed\n${su.tail}`);
+          }
+          const res = await verifyWorkspace(spec, m.dir);
+          ok = res.ok;
+          tails.push(`--- merged tree (${m.merged.length} branches): ${res.ok ? "PASS" : "FAIL"}${res.ok ? "" : `\n${res.tail}`}`);
+          mergedVerdict = res.ok ? "PASS" : "FAIL";
+          if (!res.ok) failed.push(...dirty.map((d) => d.name).filter((n) => !failed.includes(n)));
+        }
+      } catch (e) {
+        tails.push(`--- merged tree: could not build (${(e as Error).message.split("\n")[0]})`);
+        mergedVerdict = "not built";
+      } finally {
+        if (m) await removeMergedWorkspace(process.cwd(), m.dir).catch(() => undefined);
+      }
+      console.log(`[verify] merged tree: ${mergedVerdict}`);
+    }
+    return { ok, tail: tails.join("\n"), failed };
   }
+  /** What the gate found when it merged every changed branch together; shown at teardown. */
+  let mergedVerdict: string | null = null;
+  const setupCmd: string | undefined = await readState(runDir).then((st) => st.setup).catch(() => undefined);
 
   // User interjection via stdin — feed to orchestrator only; it decides
   // whether/how to propagate to roles.

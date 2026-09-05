@@ -2,6 +2,7 @@ import path from "node:path";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { ClaudeSession, ProviderExhaustedError, TurnCappedError, type AgentSession } from "./claude.js";
+import { runSetup } from "./orchestrator.js";
 import { applyFallback, identity, nextRung } from "./heal.js";
 import { AgySession } from "./agy.js";
 import { provisionWorkspace, workspaceBranch } from "./workspace.js";
@@ -152,6 +153,22 @@ export async function runRole(
     }));
   if (workspaceDir) console.log(`[role:${roleName}] workspace: ${workspaceDir}`);
 
+  // One-time setup of a fresh worktree (dependencies the checkout does not
+  // inherit). Marked per seat in sessions/ so a resume or respawn skips it.
+  let setupNote: string | null = null;
+  const setupMark = path.join(runDir, "sessions", `${roleName}.setup`);
+  if (state.setup && workspaceDir && !me.cwd && !existsSync(setupMark)) {
+    console.log(`[role:${roleName}] setup: ${state.setup}`);
+    const su = await runSetup(state.setup, workspaceDir);
+    await safeWrite(setupMark, `${new Date().toISOString()} ${su.ok ? "ok" : "FAILED"}\n${su.tail}`);
+    if (!su.ok) {
+      setupNote = `[ROLE ERROR] ${roleName}: the worktree setup command failed (\`${state.setup}\`) — its checks may fail for that reason. Tail:\n${su.tail.slice(-600)}`;
+      console.warn(`[role:${roleName}] setup FAILED — ${su.tail.split("\n").slice(-3).join(" | ")}`);
+    } else {
+      console.log(`[role:${roleName}] setup ok`);
+    }
+  }
+
   // The seat is told the same check the gate runs and where its tree is — a
   // seat that runs a different command, or edits the repo root from a
   // worktree, is the failure both of these lines exist to prevent.
@@ -289,7 +306,7 @@ export async function runRole(
     };
     const onSessionId = (id: string) => noteSession(id, gen);
     if (provider === "agy") {
-      return new AgySession({ systemPrompt: `${marker}\n${prompt}`, resumeId, onSessionId, turnMaxSteps: me.turnMaxSteps, ...common });
+      return new AgySession({ systemPrompt: `${marker}\n${prompt}`, resumeId, onSessionId, turnMaxSteps: me.turnMaxSteps, pricing: state.budget?.agyUsdPerMTokens, ...common });
     }
     const sessionId = resumeId ? undefined : mintSessionId(runName, roleName, gen);
     if (sessionId) noteSession(sessionId, gen);
@@ -318,6 +335,7 @@ export async function runRole(
   let closeWatcher: () => Promise<void> = async () => {};
 
   console.log(`[role:${roleName}] ready. Watching ${inbox}`);
+  if (setupNote) await safeWrite(outbox, setupNote);
 
   const logTurn = async (): Promise<void> => {
     const u = session.lastUsage;

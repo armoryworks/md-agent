@@ -285,6 +285,13 @@ export interface BudgetSpec {
   tokens?: Limit;
   fiveHourPct?: Limit;
   sevenDayPct?: Limit;
+  /**
+   * Antigravity reports tokens but no price, so an agy seat is invisible to
+   * `usd` unless you say what its tokens cost. USD per million tokens by
+   * class; an agy turn's cost is then estimated (`≈`) and counts toward `usd`.
+   * Unset → agy turns cost $0 and only `tokens` bounds them (a warning says so).
+   */
+  agyUsdPerMTokens?: { input?: number; output?: number; cacheRead?: number };
 }
 
 /** The plan-window utilization a claude turn reports, as md-agent stores it. */
@@ -312,6 +319,10 @@ export interface RunState {
   roles: RoleSpec[];
   /** Default auto-heal ladder (see LaunchConfig.fallback); seats read it at heal time. */
   fallback?: FallbackRung | FallbackRung[];
+  /** Absolute path of the script driving this run (script mode), when one does. */
+  script?: string;
+  /** Per-worktree setup command (see LaunchConfig.setup). */
+  setup?: string;
   context?: string;
   /**
    * Set (ISO timestamp) when the user marks the run complete from the home
@@ -419,6 +430,21 @@ export interface LaunchConfig {
   budget?: BudgetSpec;
   /** Default auto-heal ladder for every seat without its own `fallback`. */
   fallback?: FallbackRung | FallbackRung[];
+  /**
+   * Script mode: path (relative to this config) to a JS module whose default
+   * export `async (harness) => reason` drives the run instead of a model
+   * orchestrator — dispatch order, phases and completion are code. Implies
+   * autoComplete. See README "Script mode".
+   */
+  script?: string;
+  /**
+   * A shell command run ONCE inside each provisioned worktree before its seat
+   * starts (and in the gate's merged tree before its check): `npm ci`, `pip
+   * install -e .`, `dotnet restore` — whatever the verify command needs that a
+   * fresh worktree does not inherit. Failure is reported to the orchestrator
+   * as a [ROLE ERROR] and the seat still starts.
+   */
+  setup?: string;
   /** Journal settings for this run, over the global ~/.config/md-agent/config.json. */
   journal?: { remote?: string; autoPush?: boolean; ask?: boolean };
   /** Set by the journey driver; recorded into state.json for home-screen resume. */

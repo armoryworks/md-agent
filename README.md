@@ -220,6 +220,13 @@ event rather than bounced.
 
 ### Verify where the work is
 
+**The merged tree is judged too.** When more than one seat changed its
+workspace, the gate merges every changed branch into a scratch worktree cut
+from the base HEAD and runs the run's check there once. A conflict fails the
+gate naming the branch and the paths; a merged FAIL fails it with the output.
+Teardown prints `merged together: PASS | FAIL | CONFLICT (…)` under the
+per-seat lines, so "safe to merge" means safe to merge *all of them*.
+
 **The verify command is dry-run at launch.** It is expected to fail (the
 deliverable does not exist yet); what refuses the launch is a shell error or a
 malformed comparison (`test -ge 10` with no left operand — what an unquoted
@@ -270,6 +277,10 @@ session carries all of it into the next turn. Three things hold that down:
   by default (opus 5, sonnet 2.5, haiku 1; `roles[].turnBudgetUsd`, 0 = none,
   `MD_AGENT_TURN_BUDGET_USD` for all) — a capped turn keeps its work on disk
   and comes back as `[TURN CAPPED]`.
+- **agy under `budget.usd`** — Antigravity reports tokens, not a price, so an
+  agy seat counts $0 toward `usd` unless `budget.agyUsdPerMTokens: { input,
+  output, cacheRead }` gives it one; its turns are then estimated and bound.
+  Without it, `budget.tokens` is what bounds an agy seat, and launch says so.
 - **A lean prefix** — every model call re-reads the CLI's fixed prefix (tool
   schemas, MCP servers, skills: ~23k tokens on a typical machine). Seats get the
   built-in tools they need (`roles[].tools`, default Bash/Read/Edit/Write/Glob/
@@ -613,6 +624,47 @@ and the run tears down cleanly instead of idling until the budget/a checkpoint.
 Off by default for the interactive wizard (the run stays alive for more work);
 journey phases default it **on** so a finished phase advances the journey
 without a human typing `exit`.
+
+### Script mode (a deterministic driver in the orchestrator's chair)
+
+Every sequencing failure seen in the field runs was a model deciding order: a
+consumer dispatched before its producer replied, a completion requested in
+the same turn as a verdict was sent out to be applied. Script mode removes
+the class. `"script": "./drive.mjs"` in the launch config replaces the model
+orchestrator with a JS function; the run loop, verify, auto-commit, heal,
+budgets and teardown are unchanged, and the orchestrator's cost is zero.
+
+```js
+// drive.mjs
+export default async function run(h) {
+  const tables = await h.dispatch("sweeper", "Produce the three tables … VERIFY-READY when done.");
+  const [correct, drift] = await Promise.all([
+    h.dispatch("reviewer-correctness", "Angle 1 …"),
+    h.dispatch("reviewer-drift", "Angles 2 and 3, from the sweeper's committed tables …"),
+  ]);
+  const verdicts = await h.dispatch("challenger", "Check every finding in both reports …");
+  await h.dispatch("reviewer-correctness", "Apply these verdicts, then VERIFY-READY:\n" + verdicts);
+  h.note("docs/review.md — challenged and corrected");
+  return "review complete";           // the completion reason; the gate runs next
+}
+```
+
+`h.dispatch(seat, ask)` resolves with the seat's full reply — any `[verify …]`
+line first, then its text (which may open with `[SEAT HEALED]`, `[TURN
+CAPPED]` or `[ROLE ERROR]`; the script decides what to do). Asks made in the
+same tick go out as one turn. `h.read(seat, path)` reads a sibling's file
+from its worktree or branch; `h.note(line)` adds to the ledger's artifacts;
+`h.roles` lists the seats. The script's resolved string is the completion
+reason. A thrown error fails the turn loudly and the watchdog halts the run.
+`autoComplete` is implied. Resume restarts the script from the top.
+
+### Per-worktree setup
+
+`"setup": "npm ci"` runs once inside each seat's fresh worktree before the
+seat starts, and in the gate's merged tree before its check — for repos whose
+verify command needs installed dependencies the checkout does not carry. A
+failure is reported to the orchestrator as a `[ROLE ERROR]` and the seat still
+starts; `sessions/<seat>.setup` records the outcome so a resume skips it.
 
 ### Journeys (templated multi-phase runs)
 
